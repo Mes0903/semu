@@ -56,8 +56,8 @@ static inline uint64_t get_ticks(struct timespec *ts, double freq)
     return ts->tv_sec * freq + mult_frac(ts->tv_nsec, freq, 1000000000ULL);
 }
 
-/* Measure how long a single 'clock_gettime' takes, to scale real time in order
- * to set the emulator time.
+/* Measure how long it takes for the high resolution timer to update once, to
+ * scale real time in order to set the emulator time.
  */
 static void measure_bogomips_ns(uint64_t target_loop)
 {
