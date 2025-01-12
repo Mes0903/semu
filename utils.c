@@ -109,21 +109,20 @@ static uint64_t semu_timer_clocksource(semu_timer_t *timer)
     struct timespec emulator_time;
     clock_gettime(CLOCKID, &emulator_time);
 
-    if (!boot_complete) {
+    if (!boot_complete)
         return get_ticks(&emulator_time, timer->freq * scale_factor);
-    } else {
-        if (first_switch) {
-            first_switch = false;
-            uint64_t real_ticks = get_ticks(&emulator_time, timer->freq);
-            uint64_t scaled_ticks =
-                get_ticks(&emulator_time, timer->freq * scale_factor);
 
-            offset = (int64_t) (real_ticks - scaled_ticks);
-        }
+    if (first_switch) {
+        first_switch = false;
+        uint64_t real_ticks = get_ticks(&emulator_time, timer->freq);
+        uint64_t scaled_ticks =
+            get_ticks(&emulator_time, timer->freq * scale_factor);
 
-        uint64_t real_freq_ticks = get_ticks(&emulator_time, timer->freq);
-        return real_freq_ticks - offset;
+        offset = (int64_t) (real_ticks - scaled_ticks);
     }
+
+    uint64_t real_freq_ticks = get_ticks(&emulator_time, timer->freq);
+    return real_freq_ticks - offset;
 #elif defined(HAVE_MACH_TIMER)
     static mach_timebase_info_data_t emulator_time;
     if (emulator_time.denom == 0)
@@ -131,39 +130,36 @@ static uint64_t semu_timer_clocksource(semu_timer_t *timer)
 
     uint64_t now = mach_absolute_time();
     uint64_t ns = mult_frac(now, emulator_time.numer, emulator_time.denom);
-    if (!boot_complete) {
+    if (!boot_complete)
         return mult_frac(ns, (uint64_t) (timer->freq * scale_factor),
                          1000000000ULL);
-    } else {
-        if (first_switch) {
-            first_switch = false;
-            uint64_t real_ticks = mult_frac(ns, timer->freq, 1000000000ULL);
-            uint64_t scaled_ticks = mult_frac(
-                ns, (uint64_t) (timer->freq * scale_factor), 1000000000ULL);
-            offset = (int64_t) (real_ticks - scaled_ticks);
-        }
 
-        uint64_t real_freq_ticks = mult_frac(ns, timer->freq, 1000000000ULL);
-        return real_freq_ticks - offset;
+    if (first_switch) {
+        first_switch = false;
+        uint64_t real_ticks = mult_frac(ns, timer->freq, 1000000000ULL);
+        uint64_t scaled_ticks = mult_frac(
+            ns, (uint64_t) (timer->freq * scale_factor), 1000000000ULL);
+        offset = (int64_t) (real_ticks - scaled_ticks);
     }
+
+    uint64_t real_freq_ticks = mult_frac(ns, timer->freq, 1000000000ULL);
+    return real_freq_ticks - offset;
 #else
     time_t now_sec = time(0);
 
-    if (!boot_complete) {
+    if (!boot_complete)
         return ((uint64_t) now_sec) * (uint64_t) (timer->freq * scale_factor);
-    } else {
-        if (first_switch) {
-            first_switch = false;
-            uint64_t real_val = ((uint64_t) now_sec) * (uint64_t) (timer->freq);
-            uint64_t scaled_val =
-                ((uint64_t) now_sec) * (uint64_t) (timer->freq * scale_factor);
-            offset = (int64_t) real_val - (int64_t) scaled_val;
-        }
 
-        uint64_t real_freq_val =
-            ((uint64_t) now_sec) * (uint64_t) (timer->freq);
-        return real_freq_val - offset;
+    if (first_switch) {
+        first_switch = false;
+        uint64_t real_val = ((uint64_t) now_sec) * (uint64_t) (timer->freq);
+        uint64_t scaled_val =
+            ((uint64_t) now_sec) * (uint64_t) (timer->freq * scale_factor);
+        offset = (int64_t) real_val - (int64_t) scaled_val;
     }
+
+    uint64_t real_freq_val = ((uint64_t) now_sec) * (uint64_t) (timer->freq);
+    return real_freq_val - offset;
 #endif
 }
 
