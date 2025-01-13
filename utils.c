@@ -43,57 +43,89 @@ static inline uint64_t mult_frac(uint64_t x, double n, uint64_t d)
     return q * n + r * n / d;
 }
 
-/* Use timespec and frequency to calculate how many ticks to increment. For
- * example, if the frequency is set to 65,000,000, then there are 65,000,000
+/* For a given struct timespec 'ts' and freq, compute the total
+ * emulated ticks = sec * freq + nsec * freq / 1e9.
+ *
+ * For example, if the frequency is set to 65,000,000, then there are 65,000,000
  * ticks per second. Respectively, if the time is set to 1 second, then there
  * are 65,000,000 ticks.
- *
- * Thus, by seconds * frequency + nanoseconds * frequency / 1,000,000,000, we
- * can get the number of ticks.
  */
 static inline uint64_t get_ticks(struct timespec *ts, double freq)
 {
     return ts->tv_sec * freq + mult_frac(ts->tv_nsec, freq, 1000000000ULL);
 }
 
-/* Measure how long it takes for the high resolution timer to update once, to
- * scale real time in order to set the emulator time.
+/* On POSIX => use clock_gettime().
+ * On macOS => use mach_absolute_time().
+ * Else => fallback to time(0) in seconds, convert to ns.
+ *
+ * Now, the POSIX/macOS logic can be clearly reused. Meanwhile, the fallback
+ * path might just do a coarser approach with time(0).
+ */
+static inline uint64_t host_time_ns()
+{
+#if defined(HAVE_POSIX_TIMER)
+    struct timespec ts;
+    clock_gettime(CLOCKID, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+
+#elif defined(HAVE_MACH_TIMER)
+    static mach_timebase_info_data_t ts = {0};
+    if (ts.denom == 0)
+        (void) mach_timebase_info(&ts);
+
+    uint64_t now = mach_absolute_time();
+    // convert to nanoseconds: (now * t.numer / t.denom)
+    return mult_frac(now, (double) ts.numer, (uint64_t) ts.denom);
+
+#else
+    /* Minimal fallback: time(0) in seconds => convert to ns. */
+    time_t now_sec = time(0);
+    return (uint64_t) now_sec * 1000000000ULL;
+#endif
+}
+
+/* Measure the overhead of a high-resolution timer call, typically
+ * 'clock_gettime()' on POSIX or 'mach_absolute_time()' on macOS.
+ *
+ * 1) Times how long it takes to call 'host_time_ns()' repeatedly (target_loop).
+ * 2) Derives an average overhead per call => ns_per_call.
+ * 3) Because semu_timer_clocksource is ~10% of boot overhead, and called ~2e8
+ *    times * SMP, we get predict_sec = ns_per_call * SMP * 2. Then set
+ *    'scale_factor' so the entire boot completes in SEMU_BOOT_TARGET_TIME
+ *    seconds.
  */
 static void measure_bogomips_ns(uint64_t target_loop)
 {
-    struct timespec start, end;
-    clock_gettime(CLOCKID, &start);
+    /* Mark start time in ns */
+    uint64_t start_ns = host_time_ns();
 
+    /* Perform 'target_loop' times calling the host HRT. */
     for (uint64_t loops = 0; loops < target_loop; loops++)
-        clock_gettime(CLOCKID, &end);
+        (void) host_time_ns();
 
-    int64_t sec_diff = end.tv_sec - start.tv_sec;
-    int64_t nsec_diff = end.tv_nsec - start.tv_nsec;
-    double ns_per_call = (sec_diff * 1e9 + nsec_diff) / target_loop;
+    /* Mark end time in ns */
+    uint64_t end_ns = host_time_ns();
 
-    /* Based on simple statistics, 'semu_timer_clocksource' accounts for
-     * approximately 10% of the boot process execution time. Since the logic
-     * inside 'semu_timer_clocksource' is relatively simple, it can be assumed
-     * that its execution time is roughly equivalent to that of a
-     * 'clock_gettime' call.
-     *
-     * Similarly, based on statistics, 'semu_timer_clocksource' is called
-     * approximately 2*1e8 times. Therefore, we can roughly estimate that the
-     * boot process will take '(ns_per_call/1e9) * SEMU_SMP * 2 * 1e8 *
-     * (100%/10%)' seconds.
+    /* Calculate average overhead per call */
+    double ns_per_call = (double) (end_ns - start_ns) / (double) target_loop;
+
+    /* 'semu_timer_clocksource' is called ~2e8 times per SMP. Each call's
+     * overhead ~ ns_per_call. The total overhead is ~ ns_per_call * SMP * 2e8.
+     * That overhead is about 10% of the entire boot, so effectively:
+     *   predict_sec = ns_per_call * SMP * 2
+     * Then scale_factor = (desired_time) / (predict_sec).
      */
-    double predict_sec = ns_per_call * SEMU_SMP * 2;
+    double predict_sec = ns_per_call * SEMU_SMP * 2.0;
     scale_factor = SEMU_BOOT_TARGET_TIME / predict_sec;
 }
 
-void semu_timer_init(semu_timer_t *timer, uint64_t freq)
-{
-    measure_bogomips_ns(freq); /* Measure the time taken by 'clock_gettime' */
-
-    timer->freq = freq;
-    semu_timer_rebase(timer, 0);
-}
-
+/* The main function that returns the "emulated time" in ticks.
+ *
+ * Before the boot completes, we scale time by 'scale_factor' for a "fake
+ * increments" approach. After boot completes, we switch to real time
+ * with an offset bridging so that there's no big jump.
+ */
 static uint64_t semu_timer_clocksource(semu_timer_t *timer)
 {
     /* After boot process complete, the timer will switch to real time. Thus,
@@ -105,62 +137,63 @@ static uint64_t semu_timer_clocksource(semu_timer_t *timer)
     static int64_t offset = 0;
     static bool first_switch = true;
 
-#if defined(HAVE_POSIX_TIMER)
-    struct timespec emulator_time;
-    clock_gettime(CLOCKID, &emulator_time);
+#if defined(HAVE_POSIX_TIMER) || defined(HAVE_MACH_TIMER)
+    uint64_t now_ns = host_time_ns();
+
+    /* real_ticks => (now_ns * freq) / 1e9 */
+    uint64_t real_ticks =
+        mult_frac(now_ns, (double) timer->freq, 1000000000ULL);
+
+    /* scaled_ticks => (now_ns * (freq*scale_factor)) / 1e9 */
+    uint64_t scaled_ticks =
+        mult_frac(now_ns, (double) (timer->freq * scale_factor), 1000000000ULL);
 
     if (!boot_complete)
-        return get_ticks(&emulator_time, timer->freq * scale_factor);
+        return scaled_ticks; /* Return scaled ticks in the boot phase. */
 
+    /* The boot is done => switch to real freq with an offset bridging. */
     if (first_switch) {
         first_switch = false;
-        uint64_t real_ticks = get_ticks(&emulator_time, timer->freq);
-        uint64_t scaled_ticks =
-            get_ticks(&emulator_time, timer->freq * scale_factor);
-
         offset = (int64_t) (real_ticks - scaled_ticks);
     }
+    return (uint64_t) ((int64_t) real_ticks - offset);
 
-    uint64_t real_freq_ticks = get_ticks(&emulator_time, timer->freq);
-    return real_freq_ticks - offset;
 #elif defined(HAVE_MACH_TIMER)
-    static mach_timebase_info_data_t emulator_time;
-    if (emulator_time.denom == 0)
-        (void) mach_timebase_info(&emulator_time);
-
-    uint64_t now = mach_absolute_time();
-    uint64_t ns = mult_frac(now, emulator_time.numer, emulator_time.denom);
-    if (!boot_complete)
-        return mult_frac(ns, (uint64_t) (timer->freq * scale_factor),
-                         1000000000ULL);
-
-    if (first_switch) {
-        first_switch = false;
-        uint64_t real_ticks = mult_frac(ns, timer->freq, 1000000000ULL);
-        uint64_t scaled_ticks = mult_frac(
-            ns, (uint64_t) (timer->freq * scale_factor), 1000000000ULL);
-        offset = (int64_t) (real_ticks - scaled_ticks);
-    }
-
-    uint64_t real_freq_ticks = mult_frac(ns, timer->freq, 1000000000ULL);
-    return real_freq_ticks - offset;
-#else
+    /* Because we don't rely on sub-second calls to 'host_time_ns()' here,
+     * we directly use time(0). This means the time resolution is coarse (1
+     * second), but the logic is the same: we do a scaled approach pre-boot,
+     * then real freq with an offset post-boot.
+     */
     time_t now_sec = time(0);
 
+    /* Before boot done, scale time. */
     if (!boot_complete)
-        return ((uint64_t) now_sec) * (uint64_t) (timer->freq * scale_factor);
+        return (uint64_t) now_sec * (uint64_t) (timer->freq * scale_factor);
 
     if (first_switch) {
         first_switch = false;
-        uint64_t real_val = ((uint64_t) now_sec) * (uint64_t) (timer->freq);
+        uint64_t real_val = (uint64_t) now_sec * (uint64_t) timer->freq;
         uint64_t scaled_val =
-            ((uint64_t) now_sec) * (uint64_t) (timer->freq * scale_factor);
-        offset = (int64_t) real_val - (int64_t) scaled_val;
+            (uint64_t) now_sec * (uint64_t) (timer->freq * scale_factor);
+        offset = (int64_t) (real_val - scaled_val);
     }
 
-    uint64_t real_freq_val = ((uint64_t) now_sec) * (uint64_t) (timer->freq);
+    /* Return real freq minus offset. */
+    uint64_t real_freq_val = (uint64_t) now_sec * (uint64_t) timer->freq;
     return real_freq_val - offset;
 #endif
+}
+
+void semu_timer_init(semu_timer_t *timer, uint64_t freq)
+{
+    /* Measure how long each call to 'host_time_ns()' roughly takes,
+     * then use that to pick 'scale_factor'. For example, pass freq
+     * as the loop count or some large number to get a stable measure.
+     */
+    measure_bogomips_ns(freq);
+
+    timer->freq = freq;
+    semu_timer_rebase(timer, 0);
 }
 
 uint64_t semu_timer_get(semu_timer_t *timer)
