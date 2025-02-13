@@ -1,7 +1,7 @@
 include mk/common.mk
 
 CC ?= gcc
-CFLAGS := -O2 -g -Wall -Wextra
+CFLAGS := -O2 -g -Wall -Wextra -pg
 CFLAGS += -include common.h
 
 # clock frequency
@@ -77,8 +77,10 @@ DTC ?= dtc
 E :=
 S := $E $E
 
+STOP_BOGOMIPS ?= 0
 SMP ?= 1
 CFLAGS += -D SEMU_BOOT_TARGET_TIME=10
+CFLAGS += -D STOP_BOGOMIPS=$(STOP_BOGOMIPS)
 .PHONY: riscv-harts.dtsi
 riscv-harts.dtsi:
 	$(Q)python3 scripts/gen-hart-dts.py $@ $(SMP) $(CLOCK_FREQ)
@@ -99,7 +101,7 @@ ext4.img:
 
 check: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DATA) $(DISKIMG_FILE)
 	@$(call notice, Ready to launch Linux kernel. Please be patient.)
-	$(Q)./$(BIN) -k $(KERNEL_DATA) -c $(SMP) -b minimal.dtb -i $(INITRD_DATA) -n $(NETDEV) $(OPTS)
+	# $(Q)./$(BIN) -k $(KERNEL_DATA) -c $(SMP) -b minimal.dtb -i $(INITRD_DATA) -n $(NETDEV) $(OPTS)
 
 build-image:
 	scripts/build-image.sh

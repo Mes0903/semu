@@ -1,6 +1,9 @@
-#include <time.h>
-
 #include "utils.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
 
 #if defined(__APPLE__)
 #define HAVE_MACH_TIMER
@@ -21,6 +24,12 @@
 
 bool boot_complete = false;
 static double scale_factor;
+
+/* for testing */
+uint64_t count = 0;
+struct timespec boot_begin, boot_end;
+double TEST_ns_per_call, TEST_predict_sec;
+static int G_n_harts = 0;
 
 /* Calculate "x * n / d" without unnecessary overflow or loss of precision.
  *
@@ -87,8 +96,11 @@ static inline uint64_t host_time_ns()
  *    made (~2e8 times * SMP). This allows scaling the emulator clock to meet
  *    the target boot time (`SEMU_BOOT_TARGET_TIME`).
  */
+// __attribute__((optimize("O0")))
 static void measure_bogomips_ns(uint64_t iterations, int n_harts)
 {
+    G_n_harts = n_harts;
+
     /* Perform 'iterations' times calling the host HRT.
      *
      * Assuming the cost of loop overhead is 'e' and the cost of 'host_time_ns'
@@ -134,6 +146,14 @@ static void measure_bogomips_ns(uint64_t iterations, int n_harts)
      */
     const double predict_sec = ns_per_call * n_harts * 2.0;
     scale_factor = SEMU_BOOT_TARGET_TIME / predict_sec;
+
+    /* for testing */
+    TEST_ns_per_call = ns_per_call;
+    TEST_predict_sec = predict_sec;
+
+#if STOP_BOGOMIPS == 0
+    exit(0);
+#endif
 }
 
 /* The function that returns the "emulated time" in ticks.
@@ -144,6 +164,14 @@ static void measure_bogomips_ns(uint64_t iterations, int n_harts)
  */
 static uint64_t semu_timer_clocksource(semu_timer_t *timer)
 {
+    static uint64_t cnt = 0;
+    static uint64_t time_1 = 0, time_2 = 0;
+    static bool start_count = false;
+    static FILE *time_log_file = NULL;
+
+    count++;
+    cnt++;
+
     /* After boot process complete, the timer will switch to real time. Thus,
      * there is an offset between the real time and the emulator time.
      *
@@ -153,8 +181,19 @@ static uint64_t semu_timer_clocksource(semu_timer_t *timer)
     static int64_t offset = 0;
     static bool first_switch = true;
 
+    /* for testing */
+    static volatile uint64_t local_total_ns = 0;
+    static volatile uint64_t local_start;
+    static volatile uint64_t local_end;
+    static volatile uint64_t total_clocksource_ns = 0;
+
 #if defined(HAVE_POSIX_TIMER) || defined(HAVE_MACH_TIMER)
     uint64_t now_ns = host_time_ns();
+    local_start = now_ns;
+    if (!start_count) {
+        start_count = true;
+        time_1 = now_ns;
+    }
 
     /* real_ticks = (now_ns * freq) / 1e9 */
     uint64_t real_ticks = mult_frac(now_ns, timer->freq, 1e9);
@@ -162,15 +201,80 @@ static uint64_t semu_timer_clocksource(semu_timer_t *timer)
     /* scaled_ticks = (now_ns * (freq*scale_factor)) / 1e9
      *              = ((now_ns * freq) / 1e9) * scale_factor
      */
-    uint64_t scaled_ticks = real_ticks * scale_factor;
+    uint64_t scaled_ticks = real_ticks * 0.001;
 
-    if (!boot_complete)
+    if (!boot_complete) {
+        local_end = host_time_ns();
+        if (local_end > local_start) {
+            total_clocksource_ns += local_end - local_start;
+            local_total_ns += local_end - local_start;
+        }
+
+        struct stat st = {0};
+        if (stat("./time_log", &st) == -1) {
+            mkdir("./time_log", 0700);
+        }
+
+        char filename[50];
+        snprintf(filename, sizeof(filename), "./time_log/time_log_%d.txt",
+                 G_n_harts);
+
+        if (cnt % 1000000 == 0) {
+            time_2 = now_ns;
+            uint64_t diff = (time_2 > time_1) ? (time_2 - time_1) : 1;
+            time_log_file = fopen(filename, "a");
+            fprintf(time_log_file, "diff: %lu, total: %lu\n", diff,
+                    local_total_ns);
+            fclose(time_log_file);
+
+            cnt = 0;
+            start_count = false;
+            local_total_ns = 0;
+        }
         return scaled_ticks; /* Return scaled ticks in the boot phase. */
+    }
 
     /* The boot is done => switch to real freq with an offset bridging. */
     if (first_switch) {
         first_switch = false;
         offset = (int64_t) (real_ticks - scaled_ticks);
+
+        /* for testing */
+        local_end = host_time_ns();
+        if (local_end > local_start) {
+            total_clocksource_ns += local_end - local_start;
+            local_total_ns += local_end - local_start;
+        }
+        clock_gettime(CLOCK_REALTIME, &boot_end);
+
+        double boot_time = (boot_end.tv_sec - boot_begin.tv_sec) +
+                           (boot_end.tv_nsec - boot_begin.tv_nsec) / 1e9;
+        printf(
+            "\033[1;31m[SEMU LOG]: Real boot time: %.5f seconds, called %lu "
+            "times semu_timer_clocksource\033[0m\n",
+            boot_time, count);
+
+        printf(
+            "\033[1;31m[SEMU LOG]: ns_per_call = %.5f, predict_sec = %.5f, "
+            "scale_factor = %.5f\033[0m\n",
+            TEST_ns_per_call, TEST_predict_sec, scale_factor);
+
+        printf(
+            "\033[1;31m[SEMU LOG]: total_clocksource_ns = %lu, "
+            "percentage = %.5f\033[0m\n",
+            total_clocksource_ns,
+            ((double) total_clocksource_ns / 2) /
+                (((boot_end.tv_sec - boot_begin.tv_sec) * 1e9 +
+                  boot_end.tv_nsec - boot_begin.tv_nsec) -
+                 (total_clocksource_ns / 2)));
+
+        printf(
+            "\033[1;31m[SEMU LOG]: real_ns_per_call = %.5f, diff_ns_per_call = "
+            "%.5f\033[0m\n",
+            ((double) total_clocksource_ns / 2) / count,
+            (((double) total_clocksource_ns / 2) / count) - TEST_ns_per_call);
+
+        exit(0);
     }
     return (uint64_t) ((int64_t) real_ticks - offset);
 
@@ -184,13 +288,13 @@ static uint64_t semu_timer_clocksource(semu_timer_t *timer)
 
     /* Before boot done, scale time. */
     if (!boot_complete)
-        return (uint64_t) now_sec * (uint64_t) (timer->freq * scale_factor);
+        return (uint64_t) now_sec * timer->freq * 0.001;
 
     if (first_switch) {
         first_switch = false;
-        uint64_t real_val = (uint64_t) now_sec * (uint64_t) timer->freq;
+        uint64_t real_val = (uint64_t) now_sec * timer->freq;
         uint64_t scaled_val =
-            (uint64_t) now_sec * (uint64_t) (timer->freq * scale_factor);
+            (uint64_t) now_sec * (uint64_t) (timer->freq * 0.001);
         offset = (int64_t) (real_val - scaled_val);
     }
 
@@ -202,6 +306,14 @@ static uint64_t semu_timer_clocksource(semu_timer_t *timer)
 
 void semu_timer_init(semu_timer_t *timer, uint64_t freq, int n_harts)
 {
+#if defined(HAVE_POSIX_TIMER)
+    printf("\033[1;31m[SEMU LOG]: Use clock_gettime\033[0m\n");
+#elif defined(HAVE_MACH_TIMER)
+    printf("\033[1;31m[SEMU LOG]: Use mach_absolute_time\033[0m\n");
+#else
+    printf("\033[1;31m[SEMU LOG]: Use time\033[0m\n");
+#endif
+
     /* Measure how long each call to 'host_time_ns()' roughly takes,
      * then use that to pick 'scale_factor'. For example, pass freq
      * as the loop count or some large number to get a stable measure.

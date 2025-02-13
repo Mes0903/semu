@@ -11,3 +11,10 @@ rootfs.cpio
 
 # intermediate
 riscv-harts.dtsi
+
+# testing
+statistic/profile-*
+test.*
+utils_bak.c
+logs
+time_log
