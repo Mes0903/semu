@@ -27,6 +27,7 @@
 #include "mini-gdbstub/include/gdbstub.h"
 #include "riscv.h"
 #include "riscv_private.h"
+#include "virgl.h"
 #include "window.h"
 
 #define PRIV(x) ((emu_state_t *) x->priv)
@@ -34,6 +35,7 @@
 /* Forward declarations for coroutine support */
 static void wfi_handler(hart_t *hart);
 static void hart_exec_loop(void *arg);
+extern const struct window_backend g_window;
 
 /* Define fetch separately since it is simpler (fixed width, already checked
  * alignment, only main RAM is executable).
@@ -899,18 +901,22 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     if (!virtio_fs_init(&(emu->vfs), "myfs", shared_dir))
         fprintf(stderr, "No virtio-fs functioned\n");
 #endif
-#if SEMU_HAS(VIRTIOGPU)
-    emu->vgpu.ram = emu->ram;
-    virtio_gpu_init(&(emu->vgpu));
-    virtio_gpu_add_scanout(&(emu->vgpu), 1024, 768);
-    window_init();
-#endif
 #if SEMU_HAS(VIRTIOINPUT)
     emu->vkeyboard.ram = emu->ram;
     virtio_input_init(&(emu->vkeyboard));
 
     emu->vmouse.ram = emu->ram;
     virtio_input_init(&(emu->vmouse));
+#endif
+#if SEMU_HAS(VIRTIOGPU)
+    emu->vgpu.ram = emu->ram;
+    virtio_gpu_init(&(emu->vgpu));
+    virtio_gpu_add_scanout(&(emu->vgpu), 1024, 768);
+
+    g_window.window_init();
+#endif
+#if SEMU_HAS(VIRGL)
+    semu_virgl_init(&(emu->vgpu));
 #endif
 
     emu->peripheral_update_ctr = 0;
@@ -1071,6 +1077,12 @@ static int semu_step(emu_state_t *emu)
      */
     for (uint32_t i = 0; i < vm->n_hart; i++) {
         emu_tick_peripherals(emu);
+
+#if SEMU_HAS(VIRGL)
+            semu_virgl_fence_poll();
+#endif
+        }
+>>>>>>> 4e9f962 (buildroot.config: Enable libdrm)
 
         emu_update_timer_interrupt(vm->hart[i]);
         emu_update_swi_interrupt(vm->hart[i]);
