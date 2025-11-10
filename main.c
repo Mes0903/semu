@@ -1077,12 +1077,9 @@ static int semu_step(emu_state_t *emu)
      */
     for (uint32_t i = 0; i < vm->n_hart; i++) {
         emu_tick_peripherals(emu);
-
 #if SEMU_HAS(VIRGL)
-            semu_virgl_fence_poll();
+        semu_virgl_fence_poll();
 #endif
-        }
->>>>>>> 4e9f962 (buildroot.config: Enable libdrm)
 
         emu_update_timer_interrupt(vm->hart[i]);
         emu_update_swi_interrupt(vm->hart[i]);
