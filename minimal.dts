@@ -95,4 +95,5 @@
             interrupts = <7>;
         };       
 #endif
+    };
 };

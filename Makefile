@@ -15,7 +15,7 @@ OBJS_EXTRA :=
 # command line option
 OPTS :=
 
-LDFLAGS := -lm -lpthread
+LDFLAGS := -lpthread
 
 # virtio-blk
 ENABLE_VIRTIOBLK ?= 1
@@ -153,7 +153,7 @@ virtio-snd.o: CFLAGS += -Wno-unused-parameter
 endif
 
 # Set libm as the last dependency so that no need to set -lm seperately.
-# LDFLAGS += -lm
+LDFLAGS += -lm
 
 # .DEFAULT_GOAL should be set to all since the very first target is not all
 # after git submodule.
@@ -185,8 +185,9 @@ ifeq ($(ENABLE_VIRTIOGPU),1)
     OBJS_EXTRA += virtio-gpu.o
     OBJS_EXTRA += virtio-gpu-sw.o
     OBJS_EXTRA += window-sw.o
-		$(call set-feature, VIRTIOGPU)
 endif
+
+$(call set-feature, VIRTIOGPU)
 
 BIN = semu
 all: $(BIN) minimal.dtb
