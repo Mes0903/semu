@@ -2,7 +2,6 @@
 
 #if SEMU_HAS(VIRTIOGPU)
 
-#include "virgl.h"
 #include "virtio.h"
 
 #define VGPU_CMD_UNDEF virtio_gpu_cmd_undefined_handler
@@ -15,7 +14,6 @@ struct vgpu_scanout_info {
 
 typedef struct {
     struct vgpu_scanout_info scanouts[VIRTIO_GPU_MAX_SCANOUTS];
-    virgl_data_t virgl_data;
 } virtio_gpu_data_t;
 
 struct vgpu_resource_2d {

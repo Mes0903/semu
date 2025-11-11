@@ -15,7 +15,6 @@
 #include "riscv.h"
 #include "riscv_private.h"
 #include "utils.h"
-#include "virgl.h"
 #include "virtio-gpu.h"
 #include "virtio.h"
 #include "window.h"
@@ -25,7 +24,6 @@
 #define VIRTIO_F_VERSION_1 1
 
 #define VIRTIO_GPU_EVENT_DISPLAY (1 << 0)
-#define VIRTIO_GPU_F_VIRGL (1 << 0)
 #define VIRTIO_GPU_F_EDID (1 << 1)
 #define VIRTIO_GPU_F_CONTEXT_INIT (1 << 4)
 #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
@@ -510,10 +508,6 @@ static bool virtio_gpu_reg_read(virtio_gpu_state_t *vgpu,
             *value = VIRTIO_F_VERSION_1;
         } else { /* [31:0] */
             *value = VIRTIO_GPU_F_EDID;
-#if SEMU_HAS(VIRGL)
-            *value |= VIRTIO_GPU_F_VIRGL;
-            //*value |= VIRTIO_GPU_F_CONTEXT_INIT;
-#endif
         }
         return true;
     case _(QueueNumMax):
@@ -559,11 +553,7 @@ static bool virtio_gpu_reg_read(virtio_gpu_state_t *vgpu,
             return true;
         }
         case offsetof(struct vgpu_config, num_capsets): {
-#if SEMU_HAS(VIRGL)
-            *value = semu_virgl_get_num_capsets();
-#else
             *value = 0;
-#endif
             return true;
         }
         default:

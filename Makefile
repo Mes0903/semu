@@ -153,29 +153,14 @@ virtio-snd.o: CFLAGS += -Wno-unused-parameter
 endif
 
 # Set libm as the last dependency so that no need to set -lm seperately.
-LDFLAGS += -lm
+# LDFLAGS += -lm
 
 # .DEFAULT_GOAL should be set to all since the very first target is not all
 # after git submodule.
 .DEFAULT_GOAL := all
 
-# virtio-input
-ENABLE_VIRTIOINPUT ?= 1
-ifneq ($(UNAME_S),Linux)
-    ENABLE_VIRTIOINPUT := 0
-endif
-$(call set-feature, VIRTIOINPUT)
-ifeq ($(call has, VIRTIOINPUT), 1)
-    OBJS_EXTRA += virtio-input.o
-endif
-
 # virtio-gpu
 ENABLE_VIRTIOGPU ?= 1
-
-# Enable 3D acceleration for virtio-gpu using virglrenderer.
-# When set to 1, virtio-gpu uses the virglrenderer backend instead of the software
-# renderer.
-ENABLE_VIRGL ?= 1
 
 # SDL2
 ENABLE_SDL ?= 1
@@ -187,9 +172,8 @@ ifeq ($(ENABLE_SDL),1)
     CFLAGS += $(shell sdl2-config --cflags)
     LDFLAGS += $(shell sdl2-config --libs)
 else
-    # Disable virtio-gpu and virgl if SDL is not set
+    # Disable virtio-gpu if SDL is not set
     override ENABLE_VIRTIOGPU := 0
-    override ENABLE_VIRGL := 0
 endif
 
 # virtio-gpu
@@ -199,25 +183,10 @@ endif
 ifeq ($(ENABLE_VIRTIOGPU),1)
     OBJS_EXTRA += window-events.o
     OBJS_EXTRA += virtio-gpu.o
-else
-    override ENABLE_VIRGL := 0
-endif
-
-# VirGL
-ifeq ($(ENABLE_VIRGL),1)
-    CFLAGS += $(shell pkg-config virglrenderer gl egl epoxy --cflags)
-    LDFLAGS += $(shell pkg-config virglrenderer gl egl epoxy --libs)
-    OBJS_EXTRA += virgl.o
-    OBJS_EXTRA += window-gl.o
-else
-ifeq ($(ENABLE_VIRTIOGPU),1)
     OBJS_EXTRA += virtio-gpu-sw.o
     OBJS_EXTRA += window-sw.o
+		$(call set-feature, VIRTIOGPU)
 endif
-endif
-
-$(call set-feature, VIRTIOGPU)
-$(call set-feature, VIRGL)
 
 BIN = semu
 all: $(BIN) minimal.dtb

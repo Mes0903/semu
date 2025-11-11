@@ -27,7 +27,6 @@
 #include "mini-gdbstub/include/gdbstub.h"
 #include "riscv.h"
 #include "riscv_private.h"
-#include "virgl.h"
 #include "window.h"
 
 #define PRIV(x) ((emu_state_t *) x->priv)
@@ -115,28 +114,6 @@ static void emu_update_vgpu_interrupts(vm_t *vm)
         data->plic.active |= IRQ_VGPU_BIT;
     else
         data->plic.active &= ~IRQ_VGPU_BIT;
-    plic_update_interrupts(vm, &data->plic);
-}
-#endif
-
-#if SEMU_HAS(VIRTIOINPUT)
-static void emu_update_vinput_keyboard_interrupts(vm_t *vm)
-{
-    emu_state_t *data = PRIV(vm->hart[0]);
-    if (data->vkeyboard.InterruptStatus)
-        data->plic.active |= IRQ_VINPUT_KEYBOARD_BIT;
-    else
-        data->plic.active &= ~IRQ_VINPUT_KEYBOARD_BIT;
-    plic_update_interrupts(vm, &data->plic);
-}
-
-static void emu_update_vinput_mouse_interrupts(vm_t *vm)
-{
-    emu_state_t *data = PRIV(vm->hart[0]);
-    if (data->vmouse.InterruptStatus)
-        data->plic.active |= IRQ_VINPUT_MOUSE_BIT;
-    else
-        data->plic.active &= ~IRQ_VINPUT_MOUSE_BIT;
     plic_update_interrupts(vm, &data->plic);
 }
 #endif
@@ -240,12 +217,6 @@ static inline void emu_tick_peripherals(emu_state_t *emu)
         if (emu->vgpu.InterruptStatus)
             emu_update_vgpu_interrupts(vm);
 #endif
-#if SEMU_HAS(VIRTIOINPUT)
-        if (emu->vkeyboard.InterruptStatus)
-            emu_update_vinput_keyboard_interrupts(vm);
-        if (emu->vmouse.InterruptStatus)
-            emu_update_vinput_mouse_interrupts(vm);
-#endif
     }
 }
 
@@ -311,18 +282,6 @@ static void mem_load(hart_t *hart,
         case 0x49: /* virtio-gpu */
             virtio_gpu_read(hart, &data->vgpu, addr & 0xFFFFF, width, value);
             emu_update_vgpu_interrupts(hart->vm);
-            return;
-#endif
-#if SEMU_HAS(VIRTIOINPUT)
-        case 0x50: /* virtio-input keyboard */
-            virtio_input_read(hart, &data->vkeyboard, addr & 0xFFFFF, width,
-                              value);
-            emu_update_vinput_keyboard_interrupts(hart->vm);
-            return;
-        case 0x51: /* virtio-input mouse */
-            virtio_input_read(hart, &data->vmouse, addr & 0xFFFFF, width,
-                              value);
-            emu_update_vinput_mouse_interrupts(hart->vm);
             return;
 #endif
         }
@@ -401,18 +360,6 @@ static void mem_store(hart_t *hart,
         case 0x49: /* virtio-gpu */
             virtio_gpu_write(hart, &data->vgpu, addr & 0xFFFFF, width, value);
             emu_update_vgpu_interrupts(hart->vm);
-            return;
-#endif
-#if SEMU_HAS(VIRTIOINPUT)
-        case 0x50: /* virtio-input */
-            virtio_input_write(hart, &data->vkeyboard, addr & 0xFFFFF, width,
-                               value);
-            emu_update_vinput_keyboard_interrupts(hart->vm);
-            return;
-        case 0x51: /* virtio-input mouse */
-            virtio_input_write(hart, &data->vmouse, addr & 0xFFFFF, width,
-                               value);
-            emu_update_vinput_mouse_interrupts(hart->vm);
             return;
 #endif
         }
@@ -901,22 +848,12 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     if (!virtio_fs_init(&(emu->vfs), "myfs", shared_dir))
         fprintf(stderr, "No virtio-fs functioned\n");
 #endif
-#if SEMU_HAS(VIRTIOINPUT)
-    emu->vkeyboard.ram = emu->ram;
-    virtio_input_init(&(emu->vkeyboard));
-
-    emu->vmouse.ram = emu->ram;
-    virtio_input_init(&(emu->vmouse));
-#endif
 #if SEMU_HAS(VIRTIOGPU)
     emu->vgpu.ram = emu->ram;
     virtio_gpu_init(&(emu->vgpu));
     virtio_gpu_add_scanout(&(emu->vgpu), 1024, 768);
 
     g_window.window_init();
-#endif
-#if SEMU_HAS(VIRGL)
-    semu_virgl_init(&(emu->vgpu));
 #endif
 
     emu->peripheral_update_ctr = 0;
@@ -1077,9 +1014,6 @@ static int semu_step(emu_state_t *emu)
      */
     for (uint32_t i = 0; i < vm->n_hart; i++) {
         emu_tick_peripherals(emu);
-#if SEMU_HAS(VIRGL)
-        semu_virgl_fence_poll();
-#endif
 
         emu_update_timer_interrupt(vm->hart[i]);
         emu_update_swi_interrupt(vm->hart[i]);

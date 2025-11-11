@@ -76,12 +76,6 @@
 
 #define VIRTIO_GPU_MAX_SCANOUTS 16
 
-#define VIRTIO_GPU_CAPSET_VIRGL 1
-#define VIRTIO_GPU_CAPSET_VIRGL2 2
-#define VIRTIO_GPU_CAPSET_GFXSTREAM 3
-#define VIRTIO_GPU_CAPSET_VENUS 4
-#define VIRTIO_GPU_CAPSET_CROSS_DOMAIN 5
-
 /* VirtIO MMIO registers */
 #define VIRTIO_REG_LIST                  \
     _(MagicValue, 0x000)        /* R */  \

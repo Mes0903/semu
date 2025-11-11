@@ -21,15 +21,4 @@ struct window_backend {
 
 int window_events_thread(void *data);
 
-#if SEMU_HAS(VIRGL)
-#include <SDL.h>
-#include <SDL_opengl.h>
-#include <virglrenderer.h>
-
-virgl_renderer_gl_context sdl_create_context(
-    int scanout_id,
-    struct virgl_renderer_gl_ctx_param *params);
-void sdl_destroy_context(SDL_GLContext ctx);
-int sdl_make_context_current(int scanout_id, virgl_renderer_gl_context ctx);
-#endif
 #endif
