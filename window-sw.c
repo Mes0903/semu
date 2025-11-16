@@ -207,7 +207,7 @@ static bool virtio_gpu_to_sdl_format(uint32_t virtio_gpu_format,
     }
 }
 
-static void cursor_clear(int scanout_id)
+static void cursor_clear_sw(int scanout_id)
 {
     /* Reset cursor information */
     struct display_info *display = &displays[scanout_id];
@@ -335,6 +335,7 @@ const struct window_backend g_window = {
     .window_set_scanout = NULL,
     .window_clear = window_clear_sw,
     .window_flush = window_flush_sw,
+    .cursor_clear = cursor_clear_sw,
     .cursor_update = cursor_update_sw,
     .cursor_move = cursor_move_sw,
 };
