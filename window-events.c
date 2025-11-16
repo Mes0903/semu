@@ -142,26 +142,26 @@ int window_events_thread(void *data)
             }
             case SDL_KEYDOWN: {
                 linux_key = sdl_key_to_linux_key(e.key.keysym.sym);
-                // virtio_input_update_key(linux_key, 1);
+                virtio_input_update_key(linux_key, 1);
                 break;
             }
             case SDL_KEYUP: {
                 linux_key = sdl_key_to_linux_key(e.key.keysym.sym);
-                // virtio_input_update_key(linux_key, 0);
+                virtio_input_update_key(linux_key, 0);
                 break;
             }
             case SDL_MOUSEBUTTONDOWN: {
                 linux_key = sdl_key_to_linux_key(e.button.button);
-                // virtio_input_update_mouse_button_state(linux_key, true);
+                virtio_input_update_mouse_button_state(linux_key, true);
                 break;
             }
             case SDL_MOUSEBUTTONUP: {
                 linux_key = sdl_key_to_linux_key(e.button.button);
-                // virtio_input_update_mouse_button_state(linux_key, false);
+                virtio_input_update_mouse_button_state(linux_key, false);
                 break;
             }
             case SDL_MOUSEMOTION: {
-                // virtio_input_update_cursor(e.motion.x, e.motion.y);
+                virtio_input_update_cursor(e.motion.x, e.motion.y);
                 break;
             }
             }

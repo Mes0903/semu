@@ -189,6 +189,16 @@ endif
 
 $(call set-feature, VIRTIOGPU)
 
+# virtio-input
+ENABLE_VIRTIOINPUT ?= 1
+ifneq ($(UNAME_S),Linux)
+    ENABLE_VIRTIOINPUT := 0
+endif
+$(call set-feature, VIRTIOINPUT)
+ifeq ($(call has, VIRTIOINPUT), 1)
+    OBJS_EXTRA += virtio-input.o
+endif
+
 BIN = semu
 all: $(BIN) minimal.dtb
 
