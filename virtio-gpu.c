@@ -136,7 +136,7 @@ int vgpu_destory_resource_2d(uint32_t resource_id)
     return 0;
 }
 
-void *vgpu_mem_host_to_guest(virtio_gpu_state_t *vgpu, uint32_t addr)
+void *vgpu_mem_guest_to_host(virtio_gpu_state_t *vgpu, uint32_t addr)
 {
     return (void *) ((uintptr_t) vgpu->ram + addr);
 }
@@ -145,7 +145,7 @@ uint32_t virtio_gpu_write_response(virtio_gpu_state_t *vgpu,
                                    uint64_t addr,
                                    uint32_t type)
 {
-    struct vgpu_ctrl_hdr *response = vgpu_mem_host_to_guest(vgpu, addr);
+    struct vgpu_ctrl_hdr *response = vgpu_mem_guest_to_host(vgpu, addr);
 
     memset(response, 0, sizeof(*response));
     response->type = type;
@@ -201,7 +201,7 @@ void virtio_gpu_set_response_fencing(virtio_gpu_state_t *vgpu,
                                      struct vgpu_ctrl_hdr *request,
                                      uint64_t addr)
 {
-    struct vgpu_ctrl_hdr *response = vgpu_mem_host_to_guest(vgpu, addr);
+    struct vgpu_ctrl_hdr *response = vgpu_mem_guest_to_host(vgpu, addr);
 
     if (request->flags & VIRTIO_GPU_FLAG_FENCE) {
         response->flags = VIRTIO_GPU_FLAG_FENCE;
@@ -215,7 +215,7 @@ void virtio_gpu_get_display_info_handler(virtio_gpu_state_t *vgpu,
 {
     /* Write display infomation */
     struct vgpu_resp_disp_info *response =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[1].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[1].addr);
 
     memset(response, 0, sizeof(*response));
     response->hdr.type = VIRTIO_GPU_RESP_OK_DISPLAY_INFO;
@@ -337,7 +337,7 @@ void virtio_gpu_get_edid_handler(virtio_gpu_state_t *vgpu,
 
     /* Write EDID response */
     struct vgpu_resp_edid *response =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[1].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[1].addr);
     memcpy(response, &edid, sizeof(*response));
 
     /* return write length */
@@ -349,7 +349,7 @@ void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
                                       uint32_t *plen)
 {
     struct vgpu_ctrl_hdr *header =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[0].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[0].addr);
 
     fprintf(stderr, "%s(): unsupported VirtIO-GPU command %d.", __func__,
             header->type);
@@ -384,7 +384,7 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
 
     /* Process the header */
     struct vgpu_ctrl_hdr *header =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[0].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[0].addr);
 
     /* Process the command */
     switch (header->type) {

@@ -4,6 +4,7 @@
 
 #include "virtio.h"
 
+#define VIRTIO_GPU_MAX_SCANOUTS 16
 #define VGPU_CMD_UNDEF virtio_gpu_cmd_undefined_handler
 
 struct vgpu_scanout_info {
@@ -330,7 +331,7 @@ struct vgpu_resource_2d *vgpu_create_resource_2d(int resource_id);
 struct vgpu_resource_2d *vgpu_get_resource_2d(uint32_t resource_id);
 int vgpu_destory_resource_2d(uint32_t resource_id);
 
-void *vgpu_mem_host_to_guest(virtio_gpu_state_t *vgpu, uint32_t addr);
+void *vgpu_mem_guest_to_host(virtio_gpu_state_t *vgpu, uint32_t addr);
 uint32_t virtio_gpu_write_response(virtio_gpu_state_t *vgpu,
                                    uint64_t addr,
                                    uint32_t type);

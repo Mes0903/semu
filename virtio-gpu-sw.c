@@ -16,7 +16,7 @@ static void virtio_gpu_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
 {
     /* Read request */
     struct vgpu_res_create_2d *request =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[0].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[0].addr);
 
     /* Resource ID should not be zero */
     if (request->resource_id == 0) {
@@ -103,7 +103,7 @@ static void virtio_gpu_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
 {
     /* Read request */
     struct vgpu_res_unref *request =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[0].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[0].addr);
 
     /* Destroy 2D resource */
     int result = vgpu_destory_resource_2d(request->resource_id);
@@ -126,7 +126,7 @@ static void virtio_gpu_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
 {
     /* Read request */
     struct vgpu_set_scanout *request =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[0].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[0].addr);
 
     /* Resource ID 0 to stop displaying */
     if (request->resource_id == 0) {
@@ -160,7 +160,7 @@ static void virtio_gpu_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
 {
     /* Read request */
     struct vgpu_res_flush *request =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[0].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[0].addr);
 
     /* Retrieve 2D resource */
     struct vgpu_resource_2d *res_2d =
@@ -220,7 +220,7 @@ static void virtio_gpu_cmd_transfer_to_host_2d_handler(
 {
     /* Read request */
     struct vgpu_trans_to_host_2d *req =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[0].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[0].addr);
 
     /* Retrieve 2D resource */
     struct vgpu_resource_2d *res_2d = vgpu_get_resource_2d(req->resource_id);
@@ -269,9 +269,9 @@ static void virtio_gpu_cmd_resource_attach_backing_handler(
 {
     /* Read request */
     struct vgpu_res_attach_backing *backing_info =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[0].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[0].addr);
     struct vgpu_mem_entry *pages =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[1].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[1].addr);
 
     /* Retrieve 2D resource */
     struct vgpu_resource_2d *res_2d =
@@ -297,7 +297,7 @@ static void virtio_gpu_cmd_resource_attach_backing_handler(
     for (size_t i = 0; i < backing_info->nr_entries; i++) {
         /* Attach address and length of i-th page to the 2D resource */
         res_2d->iovec[i].iov_base =
-            vgpu_mem_host_to_guest(vgpu, mem_entries[i].addr);
+            vgpu_mem_guest_to_host(vgpu, mem_entries[i].addr);
         res_2d->iovec[i].iov_len = mem_entries[i].length;
 
         /* Corrupted page address */
@@ -323,7 +323,7 @@ static void virtio_gpu_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
 {
     /* Read request */
     struct virtio_gpu_update_cursor *cursor =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[0].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[0].addr);
 
     /* Update cursor image */
     struct vgpu_resource_2d *res_2d = vgpu_get_resource_2d(cursor->resource_id);
@@ -352,7 +352,7 @@ static void virtio_gpu_cmd_move_cursor_handler(virtio_gpu_state_t *vgpu,
 {
     /* Read request */
     struct virtio_gpu_update_cursor *cursor =
-        vgpu_mem_host_to_guest(vgpu, vq_desc[0].addr);
+        vgpu_mem_guest_to_host(vgpu, vq_desc[0].addr);
 
     /* Move cursor to new position */
     g_window.cursor_move(cursor->pos.scanout_id, cursor->pos.x, cursor->pos.y);
