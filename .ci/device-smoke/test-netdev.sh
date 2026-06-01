@@ -3,7 +3,7 @@
 # Source common functions and settings
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SCRIPT_DIR
-source "${SCRIPT_DIR}/common.sh"
+source "${SCRIPT_DIR}/../common.sh"
 
 # Override timeout for netdev tests
 # Network tests need different timeout: 30s for Linux, 900s for macOS
@@ -22,11 +22,8 @@ esac
 # Clean up any existing semu processes before starting tests
 cleanup
 
-# Platform detection
-UNAME_S=$(uname -s)
-
 # Check if running on macOS
-if [[ ${UNAME_S} == "Darwin" ]]; then
+if [[ ${OS_TYPE} == "Darwin" ]]; then
     IS_MACOS=1
 else
     IS_MACOS=0
@@ -123,7 +120,7 @@ else
     fi
 fi
 
-echo "Platform: ${UNAME_S}"
+echo "Platform: ${OS_TYPE}"
 echo "Network devices to test: ${NETWORK_DEVICES[@]}"
 
 for NETDEV in "${NETWORK_DEVICES[@]}"; do
