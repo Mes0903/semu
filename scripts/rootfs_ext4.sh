@@ -62,10 +62,10 @@ if [ -n "$EXTRA_ABS" ]; then
     echo "[*] Applying extra files: $EXTRA_DIR"
 fi
 # -E lazy_*_init=0: do all init at mkfs time so the first guest mount does
-#   not pay the lazy-init cost. Stripping the journal (-O ^has_journal)
-#   would also speed mount, but the prebuilt Linux Image is built with
-#   CONFIG_EXT4_USE_FOR_EXT2=n and refuses to mount a no-journal image.
-fakeroot bash -c '
+# not pay the lazy-init cost. Stripping the journal (-O ^has_journal)
+# would also speed mount, but the prebuilt Linux Image is built with
+# CONFIG_EXT4_USE_FOR_EXT2=n and refuses to mount a no-journal image.
+fakeroot /bin/sh -c '
         set -e
         stage="$1"
         src_cpio="$2"

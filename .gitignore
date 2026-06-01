@@ -9,13 +9,15 @@ Image
 ext4.img
 test-tools.img
 rootfs.cpio
+Image.bz2
+rootfs.cpio.bz2
+test-tools.img.bz2
 prebuilt.sha1
+.stamps/
+.semu-buildroot.lock
 
 # intermediate
 riscv-harts.dtsi
-.smp_stamp
-.dtb-config.stamp
-.build-config.stamp
 
 # Build directories
 buildroot/
