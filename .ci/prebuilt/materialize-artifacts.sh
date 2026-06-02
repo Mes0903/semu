@@ -34,7 +34,7 @@ download_release_class() {
     local artifact
 
     while IFS= read -r artifact; do
-        scripts/prebuilt/download-release-artifact.sh "$artifact" || {
+        scripts/prebuilt/download-release-artifact.sh "$artifact" "$recipe_key" || {
             echo "[!] Failed to materialize $class from release" >&2
             exit 1
         }
@@ -82,7 +82,6 @@ parse_resolver_output() {
                 ;;
             platform_action_cache_tag|\
             ci_cache_schema_tag|\
-            release_manifest_available|\
             release_needs_update)
                 continue
                 ;;

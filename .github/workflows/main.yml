@@ -317,6 +317,8 @@ jobs:
       - semu-linux-initramfs
       - semu-macOS
       - coding_style
+    # This gate follows resolver release drift: artifact recipe keys plus any
+    # release-contract checks the resolver explicitly enforces.
     if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.guest-artifact-build.outputs.release_needs_update == 'true'
     runs-on: ubuntu-24.04
     permissions:

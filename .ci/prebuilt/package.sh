@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # Compress raw prebuilt guest artifacts and write prebuilt.sha1.
-# This script does not publish anything to a remote service.  The manifest
-# contains recipe-key virtual entries only.  Resolver/materializer decisions are
-# based on recipe state, not archive byte checksums.
+# This script does not publish anything to a remote service. The manifest records
+# both archive byte checksums for transport integrity and recipe-key virtual
+# entries for resolver freshness decisions.
 #
 # Inputs (in cwd):
 #   raw guest artifacts listed by .ci/prebuilt/artifact-inputs.sh
@@ -11,9 +11,9 @@
 #
 # Outputs (in cwd):
 #   <artifact>.bz2 for each raw guest artifact
-#   prebuilt.sha1   -- recipe manifest in sha1sum format. *.recipe-key
-#                      lines record the source recipe fingerprint for each
-#                      artifact class.
+#   prebuilt.sha1   -- sha1sum-format manifest. <artifact>.bz2 lines record
+#                      archive bytes; *.recipe-key lines record the source
+#                      recipe fingerprint for each artifact class.
 #
 set -euo pipefail
 
@@ -84,7 +84,16 @@ compress_class_artifacts() {
     done < <(source_artifact_class_outputs "$class")
 }
 
-write_manifest_entries_for_class() {
+write_archive_checksum_entries_for_class() {
+    local class=$1
+    local artifact
+
+    while IFS= read -r artifact; do
+        prebuilt_sha1sum "${artifact}.bz2"
+    done < <(source_artifact_class_outputs "$class")
+}
+
+write_recipe_key_entries_for_class() {
     local class=$1
     local recipe_key=$2
     local entry
@@ -97,14 +106,18 @@ write_manifest_entries_for_class() {
 require_raw_artifacts
 require_source_inputs
 
-# Package raw artifacts first, then write the recipe-key manifest from the same
-# class registry so archive names and manifest entries stay aligned.
+# Package raw artifacts first, then write archive checksums and recipe-key
+# entries from the same class registry so archive names and manifest entries stay
+# aligned.
 while IFS= read -r class; do
     compress_class_artifacts "$class"
 done < <(source_artifact_classes)
 
 {
     while IFS= read -r class; do
-        write_manifest_entries_for_class "$class" "$(prebuilt_class_recipe_key "$class")"
+        write_archive_checksum_entries_for_class "$class"
+    done < <(source_artifact_classes)
+    while IFS= read -r class; do
+        write_recipe_key_entries_for_class "$class" "$(prebuilt_class_recipe_key "$class")"
     done < <(source_artifact_classes)
 } > prebuilt.sha1

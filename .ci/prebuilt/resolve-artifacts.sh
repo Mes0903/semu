@@ -46,30 +46,35 @@ trap 'rm -rf "$tmpdir"' EXIT
 # partial network fetches never touch workspace artifacts.
 manifest=$tmpdir/prebuilt.sha1
 manifest_url=
-release_manifest_available=false
 release_manifest_http_code=
 
 while IFS= read -r class; do
     prebuilt_plan_set_class_var "$class" release_recipe_key ''
 done < <(source_artifact_classes)
 
-# prebuilt.sha1 stores recipe keys as virtual sha1sum entries such as
-# Image.recipe-key. Those entries describe source/recipe state, not archive
-# content, and are the only release state the resolver uses for decisions. A
-# class is considered release-matched only when every artifact entry in that
-# class exists and all entries carry the same recipe key.
+# prebuilt.sha1 stores archive checksum entries plus recipe-key virtual entries
+# such as Image.recipe-key. The resolver uses recipe keys for freshness decisions
+# and requires archive checksum entries to be present; manifests that lack them
+# are outside the current release contract and resolve as stale.
+manifest_entry_value() {
+    local entry=$1
+
+    awk -v f="$entry" '$2 == f {print $1; found = 1; exit} END {exit !found}' "$manifest"
+}
+
 manifest_class_recipe_key() {
     local class=$1
     local artifact
-    local entry
     local next
     local recipe_key=
     local have_key=false
 
     while IFS= read -r artifact; do
-        entry=${artifact}.recipe-key
-        next=$(awk -v f="$entry" '$2 == f {print $1; exit}' "$manifest")
-        if [ -z "$next" ]; then
+        if ! manifest_entry_value "${artifact}.bz2" >/dev/null; then
+            printf '\n'
+            return
+        fi
+        if ! next=$(manifest_entry_value "${artifact}.recipe-key"); then
             printf '\n'
             return
         fi
@@ -97,13 +102,15 @@ fetch_release_manifest() {
     manifest_url="${PREBUILT_URL}/prebuilt.sha1"
     if http_code=$(curl --fail --silent --show-error --retry 3 --retry-delay 1 \
         --write-out '%{http_code}' -L -o "$manifest" "$manifest_url" 2>"$curl_err"); then
-        release_manifest_available=true
         release_manifest_http_code=$http_code
         while IFS= read -r class; do
             prebuilt_plan_set_class_var "$class" release_recipe_key "$(manifest_class_recipe_key "$class")"
         done < <(source_artifact_classes)
     else
         release_manifest_http_code=$http_code
+        # Forks and mirrors may bootstrap only when the rolling release has not
+        # been created yet. Network failures and other HTTP errors stay fatal so
+        # external release or network problems remain visible.
         if [ "$bootstrap_on_404" = false ] || [ "$release_manifest_http_code" != 404 ]; then
             cat "$curl_err" >&2
         fi
@@ -270,6 +277,5 @@ prebuilt_plan_print_class_values action
 prebuilt_plan_print_class_values current_recipe_key
 printf 'platform_action_cache_tag=%s\n' "$platform_action_cache_tag"
 printf 'ci_cache_schema_tag=%s\n' "$ci_cache_schema_tag"
-printf 'release_manifest_available=%s\n' "$release_manifest_available"
 printf 'requires_build=%s\n' "$requires_build"
 printf 'release_needs_update=%s\n' "$release_needs_update"
