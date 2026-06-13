@@ -10,6 +10,7 @@
 #include <virglrenderer.h>
 
 #include "vgpu-renderer.h"
+#include "virtio-gpu-virgl-poll.h"
 
 struct vgpu_virgl_debug_stats {
     uint32_t pending_fences;

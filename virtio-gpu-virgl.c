@@ -506,6 +506,13 @@ static void vgpu_virgl_request_poll_locked(void)
     debug_poll_requests_dropped++;
 }
 
+void vgpu_virgl_request_poll(void)
+{
+    pthread_mutex_lock(&vgpu_virgl_lock);
+    vgpu_virgl_request_poll_locked();
+    pthread_mutex_unlock(&vgpu_virgl_lock);
+}
+
 static bool vgpu_virgl_take_next_completed_fence(
     bool context_fence,
     uint32_t ctx_id,
@@ -1058,6 +1065,12 @@ static void vgpu_virgl_execute_ctrl_request(
         response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
     }
+    case VIRTIO_GPU_CMD_SET_SCANOUT:
+        response_type = vgpu_virgl_record_renderer_scanout(payload);
+        break;
+    case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
+        response_type = vgpu_virgl_record_renderer_scanout_blob(payload);
+        break;
     case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB: {
         const struct virtio_gpu_resource_map_blob *cmd =
             &payload->cmd.resource_map_blob;
@@ -1170,12 +1183,6 @@ static void vgpu_virgl_execute_ctrl_request(
         response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
     }
-    case VIRTIO_GPU_CMD_SET_SCANOUT:
-        response_type = vgpu_virgl_record_renderer_scanout(payload);
-        break;
-    case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
-        response_type = vgpu_virgl_record_renderer_scanout_blob(payload);
-        break;
     case VIRTIO_GPU_CMD_RESOURCE_UNREF: {
         const struct virtio_gpu_res_unref *cmd = &payload->cmd.resource_unref;
         struct vgpu_virgl_renderer_resource *res =
