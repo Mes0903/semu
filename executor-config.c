@@ -54,10 +54,10 @@ static const struct semu_executor_virtio_host_io_policy
         {
             .device_name = "virtio-fs",
             .build_enabled = SEMU_HAS(VIRTIOFS),
-            .actor_mode_allowed = false,
+            .actor_mode_allowed = true,
             .actor_mode_policy =
-                "actor or actor+worker pool required; host filesystem calls "
-                "need cancellation or generation bounds",
+                "actor-backed; QueueNotify wakes actor, host filesystem "
+                "operations and FUSE completions run outside vCPU",
         },
         {
             .device_name = "virtio-net",

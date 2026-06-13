@@ -803,7 +803,8 @@ static void UNUSED emu_update_vfs_interrupts(vm_t *vm)
     emu_state_t *data = PRIV(vm->hart[0]);
     bool pending;
 
-    EMU_DEVICE_CALL(data->vfs_lock, pending = data->vfs.InterruptStatus != 0);
+    EMU_DEVICE_CALL(data->vfs_lock,
+                    pending = virtio_fs_irq_pending(&data->vfs));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VFS, pending);
 }
 #endif
@@ -863,7 +864,7 @@ static void io_poll_peripherals(emu_state_t *emu)
 #endif
 
 #if SEMU_HAS(VIRTIOFS)
-    EMU_DEVICE_CALL(emu->vfs_lock, pending = emu->vfs.InterruptStatus != 0);
+    EMU_DEVICE_CALL(emu->vfs_lock, pending = virtio_fs_irq_pending(&emu->vfs));
     emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VFS, pending);
 #endif
 #if SEMU_HAS(VIRTIOINPUT)
@@ -1300,7 +1301,7 @@ static bool semu_mmio_vfs_write(hart_t *hart,
     EMU_DEVICE_CALL(
         data->vfs_lock,
         virtio_fs_write(hart, &data->vfs, (uint32_t) off, width, value);
-        pending = data->vfs.InterruptStatus != 0);
+        pending = virtio_fs_irq_pending(&data->vfs));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VFS, pending);
     return true;
 }
@@ -2430,8 +2431,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     emu->vsnd.ram = emu->ram;
 #endif
 #if SEMU_HAS(VIRTIOFS)
-    emu->vfs.ram = emu->ram;
-    if (!virtio_fs_init(&(emu->vfs), "myfs", shared_dir))
+    if (!virtio_fs_init(&(emu->vfs), emu, "myfs", shared_dir))
         fprintf(stderr, "No virtio-fs functioned\n");
 #endif
 
@@ -2465,6 +2465,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #if SEMU_HAS(VIRTIORNG)
             virtio_rng_destroy(&emu->vrng);
 #endif
+#if SEMU_HAS(VIRTIOFS)
+            virtio_fs_destroy(&emu->vfs);
+#endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
         }
@@ -2491,6 +2494,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #endif
 #if SEMU_HAS(VIRTIORNG)
             virtio_rng_destroy(&emu->vrng);
+#endif
+#if SEMU_HAS(VIRTIOFS)
+            virtio_fs_destroy(&emu->vfs);
 #endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
@@ -3419,6 +3425,9 @@ int main(int argc, char **argv)
 #if SEMU_HAS(VIRTIORNG)
             virtio_rng_destroy(&emu.vrng);
 #endif
+#if SEMU_HAS(VIRTIOFS)
+            virtio_fs_destroy(&emu.vfs);
+#endif
             g_window.window_cleanup();
             return 1;
         }
@@ -3460,6 +3469,9 @@ int main(int argc, char **argv)
 #endif
 #if SEMU_HAS(VIRTIORNG)
     virtio_rng_destroy(&emu.vrng);
+#endif
+#if SEMU_HAS(VIRTIOFS)
+    virtio_fs_destroy(&emu.vfs);
 #endif
 
 #ifdef MMU_CACHE_STATS

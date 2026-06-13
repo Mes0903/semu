@@ -481,12 +481,15 @@ bool virtio_snd_init(virtio_snd_state_t *vsnd);
 #if SEMU_HAS(VIRTIOFS)
 #define IRQ_VFS 6
 #define IRQ_VFS_BIT (1 << IRQ_VFS)
+#define VFS_NUM_QUEUES 3
 
 typedef struct inode_map_entry {
     uint64_t ino;
     char *path;
     struct inode_map_entry *next;
 } inode_map_entry;
+
+typedef struct virtio_fs_handle_entry virtio_fs_handle_entry;
 
 typedef struct {
     uint32_t QueueNum;
@@ -498,6 +501,10 @@ typedef struct {
 } virtio_fs_queue_t;
 
 typedef struct {
+    struct virtio_device_common common;
+    struct virtio_actor actor;
+    bool actor_initialized;
+
     /* feature negotiation */
     uint32_t DeviceFeaturesSel;
     uint32_t DriverFeatures;
@@ -505,7 +512,7 @@ typedef struct {
 
     /* queue config */
     uint32_t QueueSel;
-    virtio_fs_queue_t queues[3];
+    virtio_fs_queue_t queues[VFS_NUM_QUEUES];
 
     /* status */
     uint32_t Status;
@@ -518,6 +525,8 @@ typedef struct {
     char *shared_dir;
 
     inode_map_entry *inode_map;
+    virtio_fs_handle_entry *handles;
+    uint64_t next_handle_id;
 
     /* optional implementation-specific */
     void *priv;
@@ -536,7 +545,12 @@ void virtio_fs_write(hart_t *core,
                      uint8_t width,
                      uint32_t value);
 
-bool virtio_fs_init(virtio_fs_state_t *vfs, char *mtag, char *dir);
+bool virtio_fs_irq_pending(virtio_fs_state_t *vfs);
+bool virtio_fs_init(virtio_fs_state_t *vfs,
+                    emu_state_t *emu,
+                    char *mtag,
+                    char *dir);
+void virtio_fs_destroy(virtio_fs_state_t *vfs);
 
 #endif /* SEMU_HAS(VIRTIOFS) */
 
