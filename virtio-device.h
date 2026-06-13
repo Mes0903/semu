@@ -47,6 +47,12 @@ struct virtio_queue_common {
     guest_paddr_t device_addr;
 };
 
+struct virtio_device_shm_region {
+    uint32_t id;
+    uint64_t base;
+    uint64_t length;
+};
+
 struct virtio_device_common {
     uint32_t device_id;
     uint32_t vendor_id;
@@ -55,8 +61,10 @@ struct virtio_device_common {
     uint32_t device_features_sel;
     uint32_t driver_features_sel;
     uint32_t queue_sel;
+    uint32_t shm_sel;
     struct virtq *queues;
     uint16_t num_queues;
+    uint16_t required_ready_queues;
     atomic_uint status;
     struct virtio_irq irq;
     uint32_t config_generation;
@@ -70,10 +78,12 @@ struct virtio_device_common {
     const struct virtio_device_ops *ops;
     void *opaque;
     struct virtio_queue_common *queue_cfgs;
+    struct virtio_device_shm_region shm_region;
     bool initialized;
     bool irq_initialized;
     bool activated;
     bool reset_in_progress;
+    bool has_shm_region;
 };
 
 struct virtio_device_common_config {
@@ -86,8 +96,10 @@ struct virtio_device_common_config {
     uint64_t required_features;
     const uint16_t *queue_max_sizes;
     uint16_t num_queues;
+    uint16_t required_ready_queues;
     const struct virtio_device_ops *ops;
     void *opaque;
+    const struct virtio_device_shm_region *shm_region;
 };
 
 int virtio_device_common_init(struct virtio_device_common *common,

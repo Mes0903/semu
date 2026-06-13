@@ -30,6 +30,9 @@
 #if SEMU_HAS(VIRTIOGPU)
 #include "vgpu-display.h"
 #endif
+#if SEMU_HAS(VIRTIOGPU) && SEMU_HAS(VIRGL)
+#include "virtio-gpu-virgl.h"
+#endif
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
 #include "window.h"
 #endif
@@ -1417,6 +1420,30 @@ static bool semu_mmio_vgpu_write(hart_t *hart,
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VGPU, pending);
     return true;
 }
+
+#if SEMU_HAS(VIRGL)
+static bool semu_mmio_vgpu_hostmem_read(hart_t *hart,
+                                        void *opaque,
+                                        uint64_t off,
+                                        uint8_t width,
+                                        uint32_t *value)
+{
+    (void) hart;
+    (void) opaque;
+    return vgpu_virgl_hostmem_read(off, width, value);
+}
+
+static bool semu_mmio_vgpu_hostmem_write(hart_t *hart,
+                                         void *opaque,
+                                         uint64_t off,
+                                         uint8_t width,
+                                         uint32_t value)
+{
+    (void) hart;
+    (void) opaque;
+    return vgpu_virgl_hostmem_write(off, width, value);
+}
+#endif
 #endif
 
 static void semu_configure_runtime_mmio(
@@ -1497,6 +1524,13 @@ static void semu_configure_runtime_mmio(
         semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_vgpu_read,
                                         semu_mmio_vgpu_write);
         break;
+#if SEMU_HAS(VIRGL)
+    case SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque,
+                                        semu_mmio_vgpu_hostmem_read,
+                                        semu_mmio_vgpu_hostmem_write);
+        break;
+#endif
 #endif
     default:
         break;

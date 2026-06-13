@@ -89,6 +89,12 @@ static const struct semu_platform_device fixed_devices[] = {
         .size = SEMU_PLATFORM_MMIO_REGION_SIZE,
         .irq_source = SEMU_PLATFORM_IRQ_VGPU,
     },
+    {
+        .name = "virtio-gpu-hostmem",
+        .base = SEMU_PLATFORM_MMIO_VGPU_HOSTMEM_BASE,
+        .size = SEMU_PLATFORM_VGPU_HOSTMEM_SIZE,
+        .irq_source = SEMU_PLATFORM_IRQ_NONE,
+    },
 };
 
 _Static_assert(PLATFORM_ARRAY_SIZE(fixed_devices) == SEMU_PLATFORM_DEVICE_COUNT,

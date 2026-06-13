@@ -35,6 +35,8 @@ bool vgpu_virgl_submit_fence(uint64_t generation,
 void vgpu_virgl_execute_renderer_request(
     const struct vgpu_renderer_request *request);
 void vgpu_virgl_debug_snapshot(struct vgpu_virgl_debug_stats *stats);
+bool vgpu_virgl_hostmem_read(uint64_t off, uint8_t width, uint32_t *value);
+bool vgpu_virgl_hostmem_write(uint64_t off, uint8_t width, uint32_t value);
 
 virgl_renderer_gl_context vgpu_window_virgl_create_context(
     int scanout_idx,
