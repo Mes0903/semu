@@ -31,12 +31,27 @@ struct vgpu_display_payload {
      */
 };
 
+enum vgpu_display_publish_result {
+    VGPU_DISPLAY_PUBLISH_OK = 0,
+    VGPU_DISPLAY_PUBLISH_UNAVAILABLE,
+    VGPU_DISPLAY_PUBLISH_QUEUE_FULL,
+    VGPU_DISPLAY_PUBLISH_BACKPRESSURE,
+};
+
+static inline bool vgpu_display_lifecycle_publish_succeeded(
+    enum vgpu_display_publish_result result)
+{
+    return result == VGPU_DISPLAY_PUBLISH_OK ||
+           result == VGPU_DISPLAY_PUBLISH_UNAVAILABLE;
+}
+
 /* Runtime display commands published by the GPU backend and consumed by the
  * window backend. 'PRIMARY_*' updates the main scanout image, while 'CURSOR_*'
  * updates or moves the separate cursor plane.
  *
  * Clear commands are reliable generation changes, frame/move commands are lossy
- * SPSC queue entries.
+ * SPSC queue entries. A failed frame publish leaves payload ownership with the
+ * caller so producer-side dirty state can be retained and retried.
  */
 enum vgpu_display_cmd_type {
     VGPU_DISPLAY_CMD_PRIMARY_SET = 0,
@@ -73,8 +88,12 @@ struct vgpu_display_cmd {
 };
 
 void vgpu_display_set_scanout_count(uint32_t scanout_count);
-void vgpu_display_publish_primary_clear(uint32_t scanout_id);
-void vgpu_display_publish_cursor_clear(uint32_t scanout_id);
+uint32_t vgpu_display_primary_generation(uint32_t scanout_id);
+uint32_t vgpu_display_advance_primary_generation(uint32_t scanout_id);
+enum vgpu_display_publish_result vgpu_display_publish_primary_clear(
+    uint32_t scanout_id);
+enum vgpu_display_publish_result vgpu_display_publish_cursor_clear(
+    uint32_t scanout_id);
 
 void vgpu_display_release_cmd(struct vgpu_display_cmd *cmd);
 bool vgpu_display_pop_cmd(struct vgpu_display_cmd *cmd);
@@ -85,14 +104,15 @@ void vgpu_display_set_unavailable(void);
  */
 void vgpu_display_shutdown_after_producer_stopped(void);
 bool vgpu_display_can_publish(void);
-void vgpu_display_publish_primary_set(uint32_t scanout_id,
-                                      struct vgpu_display_payload *payload);
-void vgpu_display_publish_cursor_set(uint32_t scanout_id,
-                                     struct vgpu_display_payload *payload,
-                                     int32_t x,
-                                     int32_t y,
-                                     uint32_t hot_x,
-                                     uint32_t hot_y);
-void vgpu_display_publish_cursor_move(uint32_t scanout_id,
-                                      int32_t x,
-                                      int32_t y);
+enum vgpu_display_publish_result vgpu_display_publish_primary_set(
+    uint32_t scanout_id,
+    struct vgpu_display_payload *payload);
+enum vgpu_display_publish_result vgpu_display_publish_cursor_set(
+    uint32_t scanout_id,
+    struct vgpu_display_payload *payload,
+    int32_t x,
+    int32_t y,
+    uint32_t hot_x,
+    uint32_t hot_y);
+enum vgpu_display_publish_result
+vgpu_display_publish_cursor_move(uint32_t scanout_id, int32_t x, int32_t y);

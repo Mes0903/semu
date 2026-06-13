@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "device.h"
+#include "vgpu-rect.h"
 #include "virtio.h"
 
 #define VIRTIO_GPU_MAX_SCANOUTS 16
@@ -32,6 +33,7 @@ struct virtio_gpu_scanout_info {
     uint32_t primary_resource_id;
     uint32_t cursor_resource_id;
     uint32_t src_x, src_y, src_w, src_h;
+    struct vgpu_scanout_dirty_state primary_dirty;
 };
 
 typedef struct {
