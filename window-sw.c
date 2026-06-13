@@ -248,7 +248,7 @@ static SDL_Texture *sdl_plane_info_create_texture(
 {
     SDL_Texture *texture =
         SDL_CreateTexture(renderer, sdl_format, SDL_TEXTUREACCESS_STREAMING,
-                          frame->width, frame->height);
+                          frame->texture_width, frame->texture_height);
     if (!texture) {
         fprintf(stderr, "%s(): failed to create texture: %s\n", __func__,
                 SDL_GetError());
@@ -265,6 +265,32 @@ static SDL_Texture *sdl_plane_info_create_texture(
     return texture;
 }
 
+
+static bool sdl_frame_rect_to_sdl(const struct vgpu_display_cpu_payload *frame,
+                                  SDL_Rect *rect)
+{
+    if (frame->dst_x > (uint32_t) INT_MAX ||
+        frame->dst_y > (uint32_t) INT_MAX ||
+        frame->dst_width > (uint32_t) INT_MAX ||
+        frame->dst_height > (uint32_t) INT_MAX)
+        return false;
+
+    rect->x = (int) frame->dst_x;
+    rect->y = (int) frame->dst_y;
+    rect->w = (int) frame->dst_width;
+    rect->h = (int) frame->dst_height;
+    return true;
+}
+
+static bool sdl_frame_rect_fits_plane(
+    const struct vgpu_display_cpu_payload *frame,
+    const struct sdl_plane_info *plane)
+{
+    return frame->dst_x < plane->width && frame->dst_y < plane->height &&
+           frame->dst_width <= plane->width - frame->dst_x &&
+           frame->dst_height <= plane->height - frame->dst_y;
+}
+
 static bool sdl_plane_info_update_texture(
     SDL_Renderer *renderer,
     struct sdl_plane_info *plane,
@@ -276,37 +302,83 @@ static bool sdl_plane_info_update_texture(
     if (!sdl_plane_info_get_sdl_format(plane, payload, &sdl_format))
         return false;
 
-    bool reuse_texture = plane->texture && plane->width == frame->width &&
-                         plane->height == frame->height &&
+    if (frame->width == 0 || frame->height == 0 || frame->texture_width == 0 ||
+        frame->texture_height == 0 || frame->dst_width == 0 ||
+        frame->dst_height == 0 || frame->dst_width != frame->width ||
+        frame->dst_height != frame->height ||
+        frame->dst_x >= frame->texture_width ||
+        frame->dst_y >= frame->texture_height ||
+        frame->dst_width > frame->texture_width - frame->dst_x ||
+        frame->dst_height > frame->texture_height - frame->dst_y) {
+        fprintf(stderr,
+                "%s(): invalid %s frame metadata payload=%ux%u dst=%u,%u "
+                "%ux%u\n",
+                __func__, plane_name, frame->width, frame->height, frame->dst_x,
+                frame->dst_y, frame->dst_width, frame->dst_height);
+        return false;
+    }
+
+    bool full_update = vgpu_display_cpu_payload_is_full_texture_update(frame);
+    bool reuse_texture = plane->texture &&
+                         plane->width == frame->texture_width &&
+                         plane->height == frame->texture_height &&
                          plane->sdl_format == sdl_format;
     SDL_Texture *texture = plane->texture;
+    SDL_Rect rect;
+    SDL_Rect *update_rect = NULL;
 
-    if (!reuse_texture) {
-        texture =
-            sdl_plane_info_create_texture(renderer, plane, frame, sdl_format);
-        if (!texture)
+    if (full_update) {
+        if (!reuse_texture) {
+            texture = sdl_plane_info_create_texture(renderer, plane, frame,
+                                                    sdl_format);
+            if (!texture)
+                return false;
+        }
+    } else {
+        if (!plane->texture) {
+            fprintf(stderr,
+                    "%s(): rejecting partial %s update without texture\n",
+                    __func__, plane_name);
             return false;
+        }
+        if (plane->sdl_format != sdl_format ||
+            plane->width != frame->texture_width ||
+            plane->height != frame->texture_height) {
+            fprintf(stderr,
+                    "%s(): rejecting partial %s update with texture mismatch\n",
+                    __func__, plane_name);
+            return false;
+        }
+        if (!sdl_frame_rect_fits_plane(frame, plane) ||
+            !sdl_frame_rect_to_sdl(frame, &rect)) {
+            fprintf(stderr,
+                    "%s(): rejecting partial %s update outside texture\n",
+                    __func__, plane_name);
+            return false;
+        }
+        update_rect = &rect;
     }
 
     /* Keep the retained plane state unchanged until the new pixels are known
      * to be uploaded successfully.
      */
-    if (SDL_UpdateTexture(texture, NULL, frame->pixels, frame->stride) != 0) {
+    if (SDL_UpdateTexture(texture, update_rect, frame->pixels, frame->stride) !=
+        0) {
         fprintf(stderr, "%s(): failed to update %s texture: %s\n", __func__,
                 plane_name, SDL_GetError());
-        if (!reuse_texture)
+        if (full_update && !reuse_texture)
             SDL_DestroyTexture(texture);
         return false;
     }
 
-    if (!reuse_texture) {
+    if (full_update && !reuse_texture) {
         if (plane->texture)
             SDL_DestroyTexture(plane->texture);
         plane->texture = texture;
+        plane->width = frame->texture_width;
+        plane->height = frame->texture_height;
+        plane->sdl_format = sdl_format;
     }
-    plane->width = frame->width;
-    plane->height = frame->height;
-    plane->sdl_format = sdl_format;
     return true;
 }
 

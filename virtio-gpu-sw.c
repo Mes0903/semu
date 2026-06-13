@@ -435,11 +435,32 @@ static void vgpu_sw_accumulate_primary_dirty(
 
 static struct vgpu_display_payload *vgpu_sw_create_window_payload(
     const struct vgpu_sw_resource_2d *res_2d,
-    const struct virtio_gpu_scanout_info *scanout,
+    const struct vgpu_rect_update *update,
+    uint32_t texture_width,
+    uint32_t texture_height,
     const char *plane_name)
 {
     if (!res_2d || !res_2d->image) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): missing %s image\n",
+                __func__, plane_name);
+        return NULL;
+    }
+
+    if (!update ||
+        !vgpu_dirty_rect_fits(res_2d->width, res_2d->height, &update->src)) {
+        fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid %s source rect\n",
+                __func__, plane_name);
+        return NULL;
+    }
+
+    if (texture_width == 0 || texture_height == 0 ||
+        update->dst.width != update->src.width ||
+        update->dst.height != update->src.height ||
+        update->dst.x >= texture_width || update->dst.y >= texture_height ||
+        update->dst.width > texture_width - update->dst.x ||
+        update->dst.height > texture_height - update->dst.y) {
+        fprintf(stderr,
+                VIRTIO_GPU_LOG_PREFIX "%s(): invalid %s destination rect\n",
                 __func__, plane_name);
         return NULL;
     }
@@ -451,25 +472,10 @@ static struct vgpu_display_payload *vgpu_sw_create_window_payload(
     }
 
     size_t bytes_per_pixel = res_2d->bits_per_pixel / 8;
-    uint32_t src_x = 0;
-    uint32_t src_y = 0;
-    uint32_t width = res_2d->width;
-    uint32_t height = res_2d->height;
-    if (scanout) {
-        /* Primary scanouts can expose only a sub-rectangle of the resource.
-         * Record that view before snapshotting it.
-         */
-        src_x = scanout->src_x;
-        src_y = scanout->src_y;
-        width = scanout->src_w;
-        height = scanout->src_h;
-    }
-
-    if (width == 0 || height == 0) {
-        fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid %s size %ux%u\n",
-                __func__, plane_name, width, height);
-        return NULL;
-    }
+    uint32_t src_x = update->src.x;
+    uint32_t src_y = update->src.y;
+    uint32_t width = update->src.width;
+    uint32_t height = update->src.height;
 
     size_t row_bytes = (size_t) width * bytes_per_pixel;
     if (row_bytes / width != bytes_per_pixel) {
@@ -518,19 +524,14 @@ static struct vgpu_display_payload *vgpu_sw_create_window_payload(
     payload->cpu.height = height;
     payload->cpu.stride = (uint32_t) row_bytes;
     payload->cpu.bits_per_pixel = res_2d->bits_per_pixel;
-    payload->cpu.texture_width = width;
-    payload->cpu.texture_height = height;
-    payload->cpu.dst_x = 0;
-    payload->cpu.dst_y = 0;
-    payload->cpu.dst_width = width;
-    payload->cpu.dst_height = height;
+    payload->cpu.texture_width = texture_width;
+    payload->cpu.texture_height = texture_height;
+    payload->cpu.dst_x = update->dst.x;
+    payload->cpu.dst_y = update->dst.y;
+    payload->cpu.dst_width = update->dst.width;
+    payload->cpu.dst_height = update->dst.height;
     payload->cpu.pixels = (uint8_t *) (payload + 1);
 
-    /* The cropped view is contiguous only when the source stride matches this
-     * snapshot's row size. Otherwise each source row still carries padding or
-     * untouched pixels outside the requested view, so the snapshot must be
-     * packed row by row.
-     */
     const uint8_t *src_pixels = (const uint8_t *) res_2d->image +
                                 (size_t) src_y * res_2d->stride +
                                 (size_t) src_x * bytes_per_pixel;
@@ -553,6 +554,8 @@ static enum vgpu_display_publish_result vgpu_sw_publish_pending_primary_dirty(
     const struct vgpu_sw_resource_2d *res_2d)
 {
     struct vgpu_scanout_dirty_state *dirty = &scanout->primary_dirty;
+    struct vgpu_dirty_rect scanout_src = vgpu_sw_scanout_src_rect(scanout);
+    struct vgpu_rect_update update;
 
     if (!dirty->dirty)
         return VGPU_DISPLAY_PUBLISH_OK;
@@ -563,11 +566,21 @@ static enum vgpu_display_publish_result vgpu_sw_publish_pending_primary_dirty(
         return VGPU_DISPLAY_PUBLISH_OK;
     }
 
+    if (dirty->needs_full_resync) {
+        if (!vgpu_rect_compute_full_update(&scanout_src, &update))
+            return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
+    } else if (!vgpu_rect_compute_update(&scanout_src, &dirty->rect, &update)) {
+        dirty->needs_full_resync = true;
+        dirty->rect = scanout_src;
+        if (!vgpu_rect_compute_full_update(&scanout_src, &update))
+            return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
+    }
+
     if (!vgpu_sw_can_publish_command(vgpu))
         return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
 
-    struct vgpu_display_payload *payload =
-        vgpu_sw_create_window_payload(res_2d, scanout, "primary");
+    struct vgpu_display_payload *payload = vgpu_sw_create_window_payload(
+        res_2d, &update, scanout_src.width, scanout_src.height, "primary");
     if (!payload)
         return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
 
@@ -1580,6 +1593,19 @@ static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
+    struct vgpu_dirty_rect cursor_src = {
+        .x = 0,
+        .y = 0,
+        .width = res_2d->width,
+        .height = res_2d->height,
+    };
+    struct vgpu_rect_update update;
+    if (!vgpu_rect_compute_full_update(&cursor_src, &update)) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
     /* Cursor commands have no response. If publication would drop this frame,
      * keep 'cursor_resource_id' unchanged because it tracks the cursor that is
      * still visible and is used by RESOURCE_UNREF to decide whether to publish
@@ -1590,8 +1616,8 @@ static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
-    struct vgpu_display_payload *payload =
-        vgpu_sw_create_window_payload(res_2d, NULL, "cursor");
+    struct vgpu_display_payload *payload = vgpu_sw_create_window_payload(
+        res_2d, &update, res_2d->width, res_2d->height, "cursor");
     if (!payload) {
         /* Allocation failure has the same visible result as a dropped
          * publication: keep the old cursor binding.
