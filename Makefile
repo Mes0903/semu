@@ -239,8 +239,8 @@ ifeq ($(call has, VIRTIOGPU), 1)
     OBJS_EXTRA += virtio-gpu-sw.o
     OBJS_EXTRA += vgpu-display.o
     OBJS_EXTRA += vgpu-rect.o
-    OBJS_EXTRA += vgpu-renderer.o
     ifeq ($(call has, VIRGL), 1)
+        OBJS_EXTRA += vgpu-renderer.o
         OBJS_EXTRA += virtio-gpu-virgl.o
     endif
 endif
