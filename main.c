@@ -719,7 +719,8 @@ static void UNUSED emu_update_vblk_interrupts(vm_t *vm)
     emu_state_t *data = PRIV(vm->hart[0]);
     bool pending;
 
-    EMU_DEVICE_CALL(data->vblk_lock, pending = data->vblk.InterruptStatus != 0);
+    EMU_DEVICE_CALL(data->vblk_lock,
+                    pending = virtio_blk_irq_pending(&data->vblk));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VBLK, pending);
 }
 #endif
@@ -843,7 +844,8 @@ static void io_poll_peripherals(emu_state_t *emu)
 #endif
 
 #if SEMU_HAS(VIRTIOBLK)
-    EMU_DEVICE_CALL(emu->vblk_lock, pending = emu->vblk.InterruptStatus != 0);
+    EMU_DEVICE_CALL(emu->vblk_lock,
+                    pending = virtio_blk_irq_pending(&emu->vblk));
     emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VBLK, pending);
 #endif
 
@@ -1092,7 +1094,7 @@ static bool semu_mmio_vblk_write(hart_t *hart,
     EMU_DEVICE_CALL(
         data->vblk_lock,
         virtio_blk_write(hart, &data->vblk, (uint32_t) off, width, value);
-        pending = data->vblk.InterruptStatus != 0);
+        pending = virtio_blk_irq_pending(&data->vblk));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VBLK, pending);
     return true;
 }
@@ -2409,8 +2411,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     }
 #endif
 #if SEMU_HAS(VIRTIOBLK)
-    emu->vblk.ram = emu->ram;
-    emu->disk = virtio_blk_init(&(emu->vblk), disk_file);
+    emu->disk = virtio_blk_init(&(emu->vblk), emu, disk_file);
 #endif
 #if SEMU_HAS(VIRTIORNG)
     virtio_rng_init(&emu->vrng, emu);
@@ -2458,6 +2459,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             virtio_gpu_destroy(&emu->vgpu);
             vgpu_display_shutdown_after_producer_stopped();
 #endif
+#if SEMU_HAS(VIRTIOBLK)
+            virtio_blk_destroy(&emu->vblk);
+#endif
 #if SEMU_HAS(VIRTIORNG)
             virtio_rng_destroy(&emu->vrng);
 #endif
@@ -2481,6 +2485,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #if SEMU_HAS(VIRTIOGPU)
             virtio_gpu_destroy(&emu->vgpu);
             vgpu_display_shutdown_after_producer_stopped();
+#endif
+#if SEMU_HAS(VIRTIOBLK)
+            virtio_blk_destroy(&emu->vblk);
 #endif
 #if SEMU_HAS(VIRTIORNG)
             virtio_rng_destroy(&emu->vrng);
@@ -3406,6 +3413,9 @@ int main(int argc, char **argv)
             virtio_gpu_destroy(&emu.vgpu);
             vgpu_display_shutdown_after_producer_stopped();
 #endif
+#if SEMU_HAS(VIRTIOBLK)
+            virtio_blk_destroy(&emu.vblk);
+#endif
 #if SEMU_HAS(VIRTIORNG)
             virtio_rng_destroy(&emu.vrng);
 #endif
@@ -3445,6 +3455,9 @@ int main(int argc, char **argv)
     g_window.window_cleanup();
 #endif
 
+#if SEMU_HAS(VIRTIOBLK)
+    virtio_blk_destroy(&emu.vblk);
+#endif
 #if SEMU_HAS(VIRTIORNG)
     virtio_rng_destroy(&emu.vrng);
 #endif

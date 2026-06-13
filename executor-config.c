@@ -46,10 +46,10 @@ static const struct semu_executor_virtio_host_io_policy
         {
             .device_name = "virtio-blk",
             .build_enabled = SEMU_HAS(VIRTIOBLK),
-            .actor_mode_allowed = false,
+            .actor_mode_allowed = true,
             .actor_mode_policy =
-                "actor or actor+worker pool required; flush/drain runs outside "
-                "lifecycle/transport locks",
+                "actor-backed; QueueNotify wakes actor, "
+                "disk I/O and virtqueue completion run outside vCPU",
         },
         {
             .device_name = "virtio-fs",

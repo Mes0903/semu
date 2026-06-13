@@ -158,25 +158,9 @@ bool virtio_net_init(virtio_net_state_t *vnet, const char *name);
 #define IRQ_VBLK_BIT (1 << IRQ_VBLK)
 
 typedef struct {
-    uint32_t QueueNum;
-    uint32_t QueueDesc;
-    uint32_t QueueAvail;
-    uint32_t QueueUsed;
-    uint16_t last_avail;
-    bool ready;
-} virtio_blk_queue_t;
-
-typedef struct {
-    /* feature negotiation */
-    uint32_t DeviceFeaturesSel;
-    uint32_t DriverFeatures;
-    uint32_t DriverFeaturesSel;
-    /* queue config */
-    uint32_t QueueSel;
-    virtio_blk_queue_t queues[2];
-    /* status */
-    uint32_t Status;
-    uint32_t InterruptStatus;
+    struct virtio_device_common common;
+    struct virtio_actor actor;
+    bool actor_initialized;
     /* supplied by environment */
     uint32_t *ram;
     uint32_t *disk;
@@ -196,7 +180,11 @@ void virtio_blk_write(hart_t *vm,
                       uint8_t width,
                       uint32_t value);
 
-uint32_t *virtio_blk_init(virtio_blk_state_t *vblk, char *disk_file);
+bool virtio_blk_irq_pending(virtio_blk_state_t *vblk);
+uint32_t *virtio_blk_init(virtio_blk_state_t *vblk,
+                          emu_state_t *emu,
+                          char *disk_file);
+void virtio_blk_destroy(virtio_blk_state_t *vblk);
 #endif /* SEMU_HAS(VIRTIOBLK) */
 
 /* VirtIO-RNG */

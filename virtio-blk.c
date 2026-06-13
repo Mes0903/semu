@@ -14,18 +14,19 @@
 #include "ram_access.h"
 #include "riscv.h"
 #include "riscv_private.h"
+#include "virtio-irq.h"
+#include "virtio-mmio.h"
 #include "virtio.h"
+#include "virtq.h"
 
 #define DISK_BLK_SIZE 512
 
 #define VBLK_DEV_CNT_MAX 1
-
-#define VBLK_FEATURES_0 0
-#define VBLK_FEATURES_1 1 /* VIRTIO_F_VERSION_1 */
+#define VIRTIO_BLK_F_VERSION_1 (UINT64_C(1) << 32)
 #define VBLK_QUEUE_NUM_MAX 1024
-#define VBLK_QUEUE (vblk->queues[vblk->QueueSel])
+#define VBLK_QUEUE 0
 
-#define PRIV(x) ((struct virtio_blk_config *) x->priv)
+#define PRIV(x) ((struct virtio_blk_config *) (x)->priv)
 
 PACKED(struct virtio_blk_config {
     uint64_t capacity;
@@ -62,7 +63,6 @@ PACKED(struct vblk_req_header {
     uint32_t type;
     uint32_t reserved;
     uint64_t sector;
-    uint8_t status;
 });
 
 static struct virtio_blk_config vblk_configs[VBLK_DEV_CNT_MAX];
@@ -90,334 +90,576 @@ static void virtio_blk_sync_all(void)
     }
 }
 
+static inline unsigned virtio_blk_status_load(virtio_blk_state_t *vblk)
+{
+    return atomic_load_explicit(&vblk->common.status, memory_order_acquire);
+}
+
 static void virtio_blk_set_fail(virtio_blk_state_t *vblk)
 {
-    vblk->Status |= VIRTIO_STATUS__DEVICE_NEEDS_RESET;
-    if (vblk->Status & VIRTIO_STATUS__DRIVER_OK)
-        vblk->InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
+    unsigned status = virtio_blk_status_load(vblk);
+
+    virtio_device_common_set_needs_reset(&vblk->common);
+    if (status & VIRTIO_STATUS__DRIVER_OK)
+        virtio_irq_trigger(&vblk->common.irq, VIRTIO_INT__CONF_CHANGE);
 }
 
-static inline uint32_t vblk_preprocess(virtio_blk_state_t *vblk, uint32_t addr)
+static bool virtio_blk_config_range_valid(uint32_t offset, uint32_t size)
 {
-    if ((addr >= RAM_SIZE) || (addr & 0b11))
-        return virtio_blk_set_fail(vblk), 0;
-
-    return addr >> 2;
+    return size != 0 && offset < sizeof(struct virtio_blk_config) &&
+           size <= sizeof(struct virtio_blk_config) - offset;
 }
 
-static void virtio_blk_update_status(virtio_blk_state_t *vblk, uint32_t status)
+static uint32_t virtio_blk_read_config(void *opaque,
+                                       uint32_t offset,
+                                       uint32_t size)
 {
-    vblk->Status |= status;
-    if (status)
+    virtio_blk_state_t *vblk = opaque;
+    uint32_t value = 0;
+
+    if (!vblk || !virtio_blk_config_range_valid(offset, size))
+        return 0;
+
+    memcpy(&value, (uint8_t *) PRIV(vblk) + offset, size);
+    return value;
+}
+
+static void virtio_blk_write_config(void *opaque,
+                                    uint32_t offset,
+                                    uint32_t size,
+                                    uint32_t value)
+{
+    virtio_blk_state_t *vblk = opaque;
+
+    if (!vblk || !virtio_blk_config_range_valid(offset, size))
         return;
 
-    /* Reset */
-    uint32_t *ram = vblk->ram;
-    uint32_t *disk = vblk->disk;
-    void *priv = vblk->priv;
-    uint32_t capacity = PRIV(vblk)->capacity;
-    memset(vblk, 0, sizeof(*vblk));
-    vblk->ram = ram;
-    vblk->disk = disk;
-    vblk->priv = priv;
-    PRIV(vblk)->capacity = capacity;
+    memcpy((uint8_t *) PRIV(vblk) + offset, &value, size);
 }
 
-static void virtio_blk_write_handler(virtio_blk_state_t *vblk,
-                                     uint64_t sector,
-                                     uint64_t desc_addr,
-                                     uint32_t len)
+static int virtio_blk_queue_available(virtio_blk_state_t *vblk,
+                                      struct virtq *queue,
+                                      uint16_t *available)
 {
-    void *dest = (void *) ((uintptr_t) vblk->disk + sector * DISK_BLK_SIZE);
-    const void *src = (void *) ((uintptr_t) vblk->ram + desc_addr);
-    memcpy(dest, src, len);
-}
+    uint16_t avail_idx;
+    uint16_t delta;
 
-static void virtio_blk_read_handler(virtio_blk_state_t *vblk,
-                                    uint64_t sector,
-                                    uint64_t desc_addr,
-                                    uint32_t len)
-{
-    void *dest = (void *) ((uintptr_t) vblk->ram + desc_addr);
-    const void *src =
-        (void *) ((uintptr_t) vblk->disk + sector * DISK_BLK_SIZE);
-    memcpy(dest, src, len);
-}
+    if (!vblk || !queue || !queue->ready || !available)
+        return -EINVAL;
 
-static int virtio_blk_desc_handler(virtio_blk_state_t *vblk,
-                                   const virtio_blk_queue_t *queue,
-                                   uint32_t desc_idx,
-                                   uint32_t *plen)
-{
-    /* A full virtio_blk_req is represented by 3 descriptors, where
-     * the first descriptor contains:
-     *   le32 type
-     *   le32 reserved
-     *   le64 sector
-     * the second descriptor contains:
-     *   u8 data[][512]
-     * the third descriptor contains:
-     *   u8 status
-     */
-    struct virtq_desc vq_desc[3];
+    if (!ram_dma_read(vblk->common.dma, queue->driver_addr + 2, &avail_idx,
+                      sizeof(avail_idx)))
+        return -EFAULT;
 
-    /* Collect the descriptors */
-    for (int i = 0; i < 3; i++) {
-        if (desc_idx >= queue->QueueNum) {
-            virtio_blk_set_fail(vblk);
-            return -1;
-        }
-        /* The size of the `struct virtq_desc` is 4 words */
-        const struct virtq_desc *desc =
-            (struct virtq_desc *) &vblk->ram[queue->QueueDesc + desc_idx * 4];
+    delta = (uint16_t) (avail_idx - queue->last_avail);
+    if (delta > queue->queue_size)
+        return -EINVAL;
 
-        /* Retrieve the fields of current descriptor */
-        vq_desc[i].addr = desc->addr;
-        vq_desc[i].len = desc->len;
-        vq_desc[i].flags = desc->flags;
-        desc_idx = desc->next;
-    }
-
-    /* The next flag for the first and second descriptors should be set,
-     * whereas for the third descriptor is should not be set
-     */
-    if (!(vq_desc[0].flags & VIRTIO_DESC_F_NEXT) ||
-        !(vq_desc[1].flags & VIRTIO_DESC_F_NEXT) ||
-        (vq_desc[2].flags & VIRTIO_DESC_F_NEXT)) {
-        /* since the descriptor list is abnormal, we don't write the status
-         * back here */
-        virtio_blk_set_fail(vblk);
-        return -1;
-    }
-
-    /* Process the header */
-    const struct vblk_req_header *header =
-        (struct vblk_req_header *) ((uintptr_t) vblk->ram + vq_desc[0].addr);
-    uint32_t type = header->type;
-    uint64_t sector = header->sector;
-    uint8_t *status = (uint8_t *) ((uintptr_t) vblk->ram + vq_desc[2].addr);
-
-    /* Check sector index and data length are valid */
-    uint64_t disk_size = (uint64_t) PRIV(vblk)->capacity * DISK_BLK_SIZE;
-    uint64_t offset = sector * DISK_BLK_SIZE;
-    if (sector >= PRIV(vblk)->capacity || vq_desc[1].len > disk_size - offset) {
-        *status = VIRTIO_BLK_S_IOERR;
-        return -1;
-    }
-
-    /* Process the data */
-    switch (type) {
-    case VIRTIO_BLK_T_IN:
-        virtio_blk_read_handler(vblk, sector, vq_desc[1].addr, vq_desc[1].len);
-        break;
-    case VIRTIO_BLK_T_OUT:
-        virtio_blk_write_handler(vblk, sector, vq_desc[1].addr, vq_desc[1].len);
-        break;
-    default:
-        fprintf(stderr, "unsupported virtio-blk operation!\n");
-        *status = VIRTIO_BLK_S_UNSUPP;
-        return -1;
-    }
-
-    /* Return the device status */
-    *status = VIRTIO_BLK_S_OK;
-    *plen = vq_desc[1].len;
-
+    *available = delta;
     return 0;
 }
 
-static void virtio_queue_notify_handler(virtio_blk_state_t *vblk, int index)
+static guest_size_t virtio_blk_iov_bytes(const struct virtq_iov *iov,
+                                         size_t count)
 {
-    uint32_t *ram = vblk->ram;
-    virtio_blk_queue_t *queue = &vblk->queues[index];
-    if (vblk->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
-        return;
+    guest_size_t total = 0;
 
-    if (!((vblk->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready))
-        return virtio_blk_set_fail(vblk);
-
-    /* Check for new buffers */
-    uint16_t new_avail = ram_load_high16_acquire(&ram[queue->QueueAvail]);
-    if (new_avail - queue->last_avail > (uint16_t) queue->QueueNum)
-        return (fprintf(stderr, "size check fail\n"),
-                virtio_blk_set_fail(vblk));
-
-    if (queue->last_avail == new_avail)
-        return;
-
-    /* Process them */
-    uint16_t new_used =
-        ram_load_high16(&ram[queue->QueueUsed]); /* virtq_used.idx (le16) */
-    while (queue->last_avail != new_avail) {
-        /* Obtain the index in the ring buffer */
-        uint16_t queue_idx = queue->last_avail % queue->QueueNum;
-
-        /* Since each buffer index occupies 2 bytes but the memory is aligned
-         * with 4 bytes, and the first element of the available queue is stored
-         * at ram[queue->QueueAvail + 1], to acquire the buffer index, it
-         * requires the following array index calculation and bit shifting.
-         * Check also the `struct virtq_avail` on the spec.
-         */
-        uint16_t buffer_idx =
-            ram_load_w_acquire(&ram[queue->QueueAvail + 1 + queue_idx / 2]) >>
-            (16 * (queue_idx % 2));
-
-        /* Consume request from the available queue and process the data in the
-         * descriptor list.
-         */
-        uint32_t len = 0;
-        int result = virtio_blk_desc_handler(vblk, queue, buffer_idx, &len);
-        if (result != 0)
-            return virtio_blk_set_fail(vblk);
-
-        /* Write used element information (`struct virtq_used_elem`) to the used
-         * queue */
-        uint32_t vq_used_addr =
-            queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2;
-        ram_store_w(&ram[vq_used_addr],
-                    buffer_idx); /* virtq_used_elem.id  (le32) */
-        ram_store_w(&ram[vq_used_addr + 1],
-                    len); /* virtq_used_elem.len (le32) */
-        queue->last_avail++;
-        new_used++;
-    }
-
-    /* Check le32 len field of `struct virtq_used_elem` on the spec  */
-    ram_store_high16_release(&vblk->ram[queue->QueueUsed], new_used);
-
-    /* Send interrupt, unless VIRTQ_AVAIL_F_NO_INTERRUPT is set */
-    if (!(ram_load_w_acquire(&ram[queue->QueueAvail]) & 1))
-        vblk->InterruptStatus |= VIRTIO_INT__USED_RING;
+    for (size_t i = 0; i < count; i++)
+        total += iov[i].len;
+    return total;
 }
 
-static bool virtio_blk_reg_read(virtio_blk_state_t *vblk,
-                                uint32_t addr,
-                                uint32_t *value)
+static bool virtio_blk_write_status(virtio_blk_state_t *vblk,
+                                    const struct virtq_iov *status_iov,
+                                    uint8_t status)
 {
-#define _(reg) VIRTIO_##reg
-    switch (addr) {
-    case _(MagicValue):
-        *value = 0x74726976;
-        return true;
-    case _(Version):
-        *value = 2;
-        return true;
-    case _(DeviceID):
-        *value = 2;
-        return true;
-    case _(VendorID):
-        *value = VIRTIO_VENDOR_ID;
-        return true;
-    case _(DeviceFeatures):
-        *value = vblk->DeviceFeaturesSel == 0
-                     ? VBLK_FEATURES_0
-                     : (vblk->DeviceFeaturesSel == 1 ? VBLK_FEATURES_1 : 0);
-        return true;
-    case _(QueueNumMax):
-        *value = VBLK_QUEUE_NUM_MAX;
-        return true;
-    case _(QueueReady):
-        *value = VBLK_QUEUE.ready ? 1 : 0;
-        return true;
-    case _(InterruptStatus):
-        *value = vblk->InterruptStatus;
-        return true;
-    case _(Status):
-        *value = vblk->Status;
-        return true;
-    case _(ConfigGeneration):
-        *value = 0;
-        return true;
-    default:
-        /* Invalid address which exceeded the range */
-        if (!RANGE_CHECK(addr, _(Config), sizeof(struct virtio_blk_config)))
-            return false;
-
-        /* Read configuration from the corresponding register */
-        *value = ((uint32_t *) PRIV(vblk))[addr - _(Config)];
-
-        return true;
-    }
-#undef _
+    if (!status_iov || status_iov->len < 1)
+        return false;
+    return ram_dma_write(vblk->common.dma, status_iov->addr, &status,
+                         sizeof(status));
 }
 
-static bool virtio_blk_reg_write(virtio_blk_state_t *vblk,
-                                 uint32_t addr,
-                                 uint32_t value)
+static bool virtio_blk_disk_range_valid(virtio_blk_state_t *vblk,
+                                        uint64_t sector,
+                                        guest_size_t len,
+                                        uint64_t *offset)
 {
-#define _(reg) VIRTIO_##reg
-    switch (addr) {
-    case _(DeviceFeaturesSel):
-        vblk->DeviceFeaturesSel = value;
-        return true;
-    case _(DriverFeatures):
-        vblk->DriverFeaturesSel == 0 ? (vblk->DriverFeatures = value) : 0;
-        return true;
-    case _(DriverFeaturesSel):
-        vblk->DriverFeaturesSel = value;
-        return true;
-    case _(QueueSel):
-        if (value < ARRAY_SIZE(vblk->queues))
-            vblk->QueueSel = value;
-        else
+    uint64_t capacity = PRIV(vblk)->capacity;
+    uint64_t disk_size;
+
+    if (sector > UINT64_MAX / DISK_BLK_SIZE)
+        return false;
+    *offset = sector * DISK_BLK_SIZE;
+    if (capacity > UINT64_MAX / DISK_BLK_SIZE)
+        return false;
+    disk_size = capacity * DISK_BLK_SIZE;
+    if (sector >= capacity)
+        return false;
+    return len <= disk_size - *offset;
+}
+
+static bool virtio_blk_read_disk_to_iovs(virtio_blk_state_t *vblk,
+                                         const struct virtq_iov *iov,
+                                         size_t count,
+                                         uint64_t disk_offset)
+{
+    const uint8_t *disk = (const uint8_t *) vblk->disk + disk_offset;
+
+    for (size_t i = 0; i < count; i++) {
+        if (!ram_dma_write(vblk->common.dma, iov[i].addr, disk, iov[i].len))
+            return false;
+        disk += iov[i].len;
+    }
+    return true;
+}
+
+static bool virtio_blk_write_iovs_to_disk(virtio_blk_state_t *vblk,
+                                          const struct virtq_iov *iov,
+                                          size_t count,
+                                          uint64_t disk_offset)
+{
+    uint8_t *disk = (uint8_t *) vblk->disk + disk_offset;
+
+    for (size_t i = 0; i < count; i++) {
+        if (!ram_dma_read(vblk->common.dma, iov[i].addr, disk, iov[i].len))
+            return false;
+        disk += iov[i].len;
+    }
+    return true;
+}
+
+static int virtio_blk_process_chain(virtio_blk_state_t *vblk,
+                                    const struct virtq_chain *chain,
+                                    uint32_t *used_len)
+{
+    struct vblk_req_header header;
+    const struct virtq_iov *data_iov = NULL;
+    const struct virtq_iov *status_iov = NULL;
+    size_t data_count = 0;
+    guest_size_t data_len;
+    uint64_t disk_offset = 0;
+    uint8_t status = VIRTIO_BLK_S_OK;
+
+    if (!vblk || !chain || !used_len)
+        return -EINVAL;
+    *used_len = 0;
+
+    if (chain->readable_count == 0 || chain->readable[0].len < sizeof(header))
+        return -EINVAL;
+    if (!ram_dma_read(vblk->common.dma, chain->readable[0].addr, &header,
+                      sizeof(header)))
+        return -EFAULT;
+
+    switch (header.type) {
+    case VIRTIO_BLK_T_IN:
+        if (chain->writable_count < 2)
+            return -EINVAL;
+        data_iov = chain->writable;
+        data_count = chain->writable_count - 1;
+        status_iov = &chain->writable[chain->writable_count - 1];
+        break;
+    case VIRTIO_BLK_T_OUT:
+        if (chain->readable_count < 2 || chain->writable_count != 1)
+            return -EINVAL;
+        data_iov = &chain->readable[1];
+        data_count = chain->readable_count - 1;
+        status_iov = &chain->writable[0];
+        break;
+    default:
+        if (chain->writable_count < 1)
+            return -EINVAL;
+        status_iov = &chain->writable[chain->writable_count - 1];
+        status = VIRTIO_BLK_S_UNSUPP;
+        if (!virtio_blk_write_status(vblk, status_iov, status))
+            return -EFAULT;
+        return 0;
+    }
+
+    data_len = virtio_blk_iov_bytes(data_iov, data_count);
+    if (!virtio_blk_disk_range_valid(vblk, header.sector, data_len,
+                                     &disk_offset) ||
+        (data_len != 0 && !vblk->disk)) {
+        status = VIRTIO_BLK_S_IOERR;
+        if (!virtio_blk_write_status(vblk, status_iov, status))
+            return -EFAULT;
+        return 0;
+    }
+
+    if (header.type == VIRTIO_BLK_T_IN) {
+        if (!virtio_blk_read_disk_to_iovs(vblk, data_iov, data_count,
+                                          disk_offset))
+            return -EFAULT;
+    } else {
+        if (!virtio_blk_write_iovs_to_disk(vblk, data_iov, data_count,
+                                           disk_offset))
+            return -EFAULT;
+    }
+
+    if (!virtio_blk_write_status(vblk, status_iov, VIRTIO_BLK_S_OK))
+        return -EFAULT;
+    *used_len = (uint32_t) data_len;
+    return 0;
+}
+
+static bool virtio_blk_actor_generation_current(virtio_blk_state_t *vblk,
+                                                struct virtio_actor *actor,
+                                                uint64_t generation)
+{
+    (void) vblk;
+    return actor && virtio_actor_generation(actor) == generation;
+}
+
+static bool virtio_blk_queue_ready_for_actor(virtio_blk_state_t *vblk,
+                                             const struct virtq *queue)
+{
+    unsigned status;
+
+    if (!vblk || !queue || !queue->ready)
+        return false;
+
+    status = virtio_blk_status_load(vblk);
+    return !(status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) &&
+           (status & VIRTIO_STATUS__DRIVER_OK);
+}
+
+static bool virtio_blk_common_generation_current(virtio_blk_state_t *vblk,
+                                                 uint64_t generation)
+{
+    bool current;
+
+    if (!vblk || !vblk->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vblk->common.transport_lock);
+    current = vblk->common.generation == generation &&
+              !vblk->common.reset_in_progress;
+    pthread_mutex_unlock(&vblk->common.transport_lock);
+    return current;
+}
+
+static bool virtio_blk_capture_common_generation(virtio_blk_state_t *vblk,
+                                                 uint64_t *generation)
+{
+    unsigned status;
+    bool current;
+
+    if (!vblk || !vblk->common.initialized || !generation)
+        return false;
+
+    pthread_mutex_lock(&vblk->common.transport_lock);
+    status = virtio_blk_status_load(vblk);
+    current = !vblk->common.reset_in_progress &&
+              (status & VIRTIO_STATUS__DRIVER_OK) &&
+              !(status & VIRTIO_STATUS__DEVICE_NEEDS_RESET);
+    if (current)
+        *generation = vblk->common.generation;
+    pthread_mutex_unlock(&vblk->common.transport_lock);
+    return current;
+}
+
+static bool virtio_blk_begin_actor_completion(virtio_blk_state_t *vblk,
+                                              uint64_t actor_generation,
+                                              uint64_t common_generation)
+{
+    bool common_current;
+
+    if (!vblk || !vblk->actor_initialized || !vblk->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vblk->common.transport_lock);
+    common_current = vblk->common.generation == common_generation &&
+                     !vblk->common.reset_in_progress;
+    if (!common_current) {
+        pthread_mutex_unlock(&vblk->common.transport_lock);
+        return false;
+    }
+
+    if (!virtio_actor_begin_completion(&vblk->actor, actor_generation)) {
+        pthread_mutex_unlock(&vblk->common.transport_lock);
+        return false;
+    }
+    return true;
+}
+
+static void virtio_blk_end_actor_completion(virtio_blk_state_t *vblk)
+{
+    if (!vblk || !vblk->actor_initialized)
+        return;
+
+    virtio_actor_end_completion(&vblk->actor);
+    pthread_mutex_unlock(&vblk->common.transport_lock);
+}
+
+static void virtio_blk_set_fail_for_actor(virtio_blk_state_t *vblk,
+                                          uint64_t actor_generation,
+                                          uint64_t common_generation)
+{
+    if (!virtio_blk_begin_actor_completion(vblk, actor_generation,
+                                           common_generation))
+        return;
+    virtio_blk_set_fail(vblk);
+    virtio_blk_end_actor_completion(vblk);
+}
+
+static int virtio_blk_actor_drain_queue(void *opaque,
+                                        struct virtio_actor *actor,
+                                        uint16_t queue_index,
+                                        uint64_t generation)
+{
+    virtio_blk_state_t *vblk = opaque;
+    struct virtq *queue;
+    struct virtq_iov readable[VBLK_QUEUE_NUM_MAX];
+    struct virtq_iov writable[VBLK_QUEUE_NUM_MAX];
+    bool consumed = false;
+    uint64_t common_generation = 0;
+
+    if (!vblk || queue_index != VBLK_QUEUE) {
+        if (vblk)
             virtio_blk_set_fail(vblk);
-        return true;
-    case _(QueueNum):
-        if (value > 0 && value <= VBLK_QUEUE_NUM_MAX)
-            VBLK_QUEUE.QueueNum = value;
-        else
+        return 0;
+    }
+
+    queue = &vblk->common.queues[VBLK_QUEUE];
+
+    if (!virtio_blk_actor_generation_current(vblk, actor, generation))
+        return 0;
+    if (!virtio_blk_queue_ready_for_actor(vblk, queue))
+        return 0;
+    if (!virtio_blk_capture_common_generation(vblk, &common_generation))
+        return 0;
+
+    for (;;) {
+        struct virtq_chain chain = {
+            .readable = readable,
+            .readable_capacity = ARRAY_SIZE(readable),
+            .writable = writable,
+            .writable_capacity = ARRAY_SIZE(writable),
+        };
+        uint16_t available = 0;
+        uint32_t used_len = 0;
+        int ret;
+
+        if (!virtio_blk_actor_generation_current(vblk, actor, generation))
+            return 0;
+        if (!virtio_blk_common_generation_current(vblk, common_generation))
+            return 0;
+        ret = virtio_blk_queue_available(vblk, queue, &available);
+        if (ret < 0) {
+            virtio_blk_set_fail_for_actor(vblk, generation, common_generation);
+            return 0;
+        }
+        if (available == 0)
+            break;
+
+        ret = virtq_pop(vblk->common.dma, queue, &chain);
+        if (!virtio_blk_actor_generation_current(vblk, actor, generation))
+            return 0;
+        if (!virtio_blk_common_generation_current(vblk, common_generation))
+            return 0;
+        if (ret < 0) {
+            virtio_blk_set_fail_for_actor(vblk, generation, common_generation);
+            return 0;
+        }
+        if (ret == 0)
+            break;
+
+        ret = virtio_blk_process_chain(vblk, &chain, &used_len);
+        if (!virtio_blk_actor_generation_current(vblk, actor, generation))
+            return 0;
+        if (!virtio_blk_common_generation_current(vblk, common_generation))
+            return 0;
+        if (ret < 0) {
+            virtio_blk_set_fail_for_actor(vblk, generation, common_generation);
+            return 0;
+        }
+
+        if (!virtio_blk_begin_actor_completion(vblk, generation,
+                                               common_generation))
+            return 0;
+        ret = virtq_add_used(vblk->common.dma, queue, chain.head, used_len);
+        if (ret < 0) {
             virtio_blk_set_fail(vblk);
-        return true;
-    case _(QueueReady):
-        VBLK_QUEUE.ready = value & 1;
-        if (value & 1)
-            VBLK_QUEUE.last_avail =
-                ram_load_high16_acquire(&vblk->ram[VBLK_QUEUE.QueueAvail]);
-        return true;
-    case _(QueueDescLow):
-        VBLK_QUEUE.QueueDesc = vblk_preprocess(vblk, value);
-        return true;
-    case _(QueueDescHigh):
-        if (value)
+            virtio_blk_end_actor_completion(vblk);
+            return 0;
+        }
+        virtio_blk_end_actor_completion(vblk);
+        consumed = true;
+    }
+
+    if (consumed && virtio_blk_begin_actor_completion(vblk, generation,
+                                                      common_generation)) {
+        if (!virtq_interrupt_suppressed(vblk->common.dma, queue))
+            virtio_irq_trigger(&vblk->common.irq, VIRTIO_INT__USED_RING);
+        virtio_blk_end_actor_completion(vblk);
+    }
+    return 0;
+}
+
+static bool virtio_blk_actor_queue_has_work(void *opaque,
+                                            struct virtio_actor *actor,
+                                            uint16_t queue_index,
+                                            uint64_t generation)
+{
+    virtio_blk_state_t *vblk = opaque;
+    uint16_t available = 0;
+    uint64_t common_generation = 0;
+    int ret;
+
+    if (!vblk || queue_index != VBLK_QUEUE)
+        return false;
+    if (!virtio_blk_actor_generation_current(vblk, actor, generation))
+        return false;
+    if (!virtio_blk_queue_ready_for_actor(vblk,
+                                          &vblk->common.queues[VBLK_QUEUE]))
+        return false;
+    if (!virtio_blk_capture_common_generation(vblk, &common_generation))
+        return false;
+
+    ret = virtio_blk_queue_available(vblk, &vblk->common.queues[VBLK_QUEUE],
+                                     &available);
+    if (ret < 0) {
+        virtio_blk_set_fail_for_actor(vblk, generation, common_generation);
+        return false;
+    }
+    return available != 0;
+}
+
+static void virtio_blk_actor_failed(void *opaque,
+                                    struct virtio_actor *actor UNUSED)
+{
+    virtio_blk_state_t *vblk = opaque;
+
+    if (vblk)
+        virtio_blk_set_fail(vblk);
+}
+
+static const struct virtio_actor_ops virtio_blk_actor_ops = {
+    .drain_queue = virtio_blk_actor_drain_queue,
+    .queue_has_work = virtio_blk_actor_queue_has_work,
+    .on_failed = virtio_blk_actor_failed,
+};
+
+static int virtio_blk_activate(void *opaque,
+                               const struct virtio_activation_context *ctx)
+{
+    virtio_blk_state_t *vblk = opaque;
+    int ret;
+
+    (void) ctx;
+
+    if (!vblk || !vblk->actor_initialized)
+        return -EINVAL;
+
+    ret = virtio_actor_start(&vblk->actor);
+    if (ret < 0 && ret != -EALREADY)
+        return ret;
+
+    ret = virtio_actor_enter_configuring(&vblk->actor);
+    if (ret < 0)
+        return ret;
+    return virtio_actor_activate(&vblk->actor);
+}
+
+static int virtio_blk_prepare_reset(void *opaque,
+                                    uint64_t old_generation,
+                                    uint64_t new_generation)
+{
+    virtio_blk_state_t *vblk = opaque;
+
+    (void) old_generation;
+    (void) new_generation;
+
+    if (!vblk || !vblk->actor_initialized)
+        return 0;
+    return virtio_actor_reset(&vblk->actor);
+}
+
+static int virtio_blk_reset(void *opaque,
+                            uint64_t old_generation,
+                            uint64_t new_generation)
+{
+    (void) opaque;
+    (void) old_generation;
+    (void) new_generation;
+    return 0;
+}
+
+static int virtio_blk_notify_queue(void *opaque,
+                                   uint16_t queue_index,
+                                   uint64_t generation)
+{
+    virtio_blk_state_t *vblk = opaque;
+    int ret;
+
+    (void) generation;
+
+    if (!vblk || queue_index != VBLK_QUEUE) {
+        if (vblk)
             virtio_blk_set_fail(vblk);
+        return -EINVAL;
+    }
+
+    ret = virtio_actor_notify_queue(&vblk->actor, queue_index);
+    if (ret == 0 || ret == -EAGAIN)
+        return 0;
+
+    virtio_blk_set_fail(vblk);
+    return ret;
+}
+
+static const struct virtio_device_ops virtio_blk_ops = {
+    .activate = virtio_blk_activate,
+    .prepare_reset = virtio_blk_prepare_reset,
+    .reset = virtio_blk_reset,
+    .notify_queue = virtio_blk_notify_queue,
+    .read_config = virtio_blk_read_config,
+    .write_config = virtio_blk_write_config,
+};
+
+static bool virtio_blk_load_width_bytes(uint8_t width, size_t *access_size)
+{
+    switch (width) {
+    case RV_MEM_LW:
+        *access_size = 4;
         return true;
-    case _(QueueDriverLow):
-        VBLK_QUEUE.QueueAvail = vblk_preprocess(vblk, value);
+    case RV_MEM_LBU:
+    case RV_MEM_LB:
+        *access_size = 1;
         return true;
-    case _(QueueDriverHigh):
-        if (value)
-            virtio_blk_set_fail(vblk);
-        return true;
-    case _(QueueDeviceLow):
-        VBLK_QUEUE.QueueUsed = vblk_preprocess(vblk, value);
-        return true;
-    case _(QueueDeviceHigh):
-        if (value)
-            virtio_blk_set_fail(vblk);
-        return true;
-    case _(QueueNotify):
-        if (value < ARRAY_SIZE(vblk->queues))
-            virtio_queue_notify_handler(vblk, value);
-        else
-            virtio_blk_set_fail(vblk);
-        return true;
-    case _(InterruptACK):
-        vblk->InterruptStatus &= ~value;
-        return true;
-    case _(Status):
-        virtio_blk_update_status(vblk, value);
+    case RV_MEM_LHU:
+    case RV_MEM_LH:
+        *access_size = 2;
         return true;
     default:
-        /* Invalid address which exceeded the range */
-        if (!RANGE_CHECK(addr, _(Config), sizeof(struct virtio_blk_config)))
-            return false;
-
-        /* Write configuration to the corresponding register */
-        ((uint32_t *) PRIV(vblk))[addr - _(Config)] = value;
-
-        return true;
+        return false;
     }
-#undef _
+}
+
+static bool virtio_blk_store_width_bytes(uint8_t width, size_t *access_size)
+{
+    switch (width) {
+    case RV_MEM_SW:
+        *access_size = 4;
+        return true;
+    case RV_MEM_SB:
+        *access_size = 1;
+        return true;
+    case RV_MEM_SH:
+        *access_size = 2;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool virtio_blk_is_config_access(uint32_t addr, size_t access_size)
+{
+    const uint32_t base = VIRTIO_Config << 2;
+    const uint32_t end = base + (uint32_t) sizeof(struct virtio_blk_config);
+
+    if (access_size == 0 || addr < base || addr >= end)
+        return false;
+    return access_size <= end - addr;
 }
 
 void virtio_blk_read(hart_t *vm,
@@ -426,21 +668,34 @@ void virtio_blk_read(hart_t *vm,
                      uint8_t width,
                      uint32_t *value)
 {
-    switch (width) {
-    case RV_MEM_LW:
-        if (!virtio_blk_reg_read(vblk, addr >> 2, value))
-            vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
-        break;
-    case RV_MEM_LBU:
-    case RV_MEM_LB:
-    case RV_MEM_LHU:
-    case RV_MEM_LH:
-        vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
-        return;
-    default:
+    size_t access_size = 0;
+    bool is_cfg;
+    int ret;
+
+    if (!virtio_blk_load_width_bytes(width, &access_size)) {
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
         return;
     }
+
+    is_cfg = virtio_blk_is_config_access(addr, access_size);
+    if (addr >= (VIRTIO_Config << 2) && !is_cfg) {
+        vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
+        return;
+    }
+
+    if (!is_cfg) {
+        if (access_size != 4 || (addr & 0x3)) {
+            vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
+            return;
+        }
+    } else if (addr & (access_size - 1)) {
+        vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
+        return;
+    }
+
+    ret = virtio_mmio_read(&vblk->common, addr, (uint8_t) access_size, value);
+    if (ret < 0)
+        vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
 }
 
 void virtio_blk_write(hart_t *vm,
@@ -449,23 +704,56 @@ void virtio_blk_write(hart_t *vm,
                       uint8_t width,
                       uint32_t value)
 {
-    switch (width) {
-    case RV_MEM_SW:
-        if (!virtio_blk_reg_write(vblk, addr >> 2, value))
-            vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
-        break;
-    case RV_MEM_SB:
-    case RV_MEM_SH:
-        vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
-        return;
-    default:
+    size_t access_size = 0;
+    bool is_cfg;
+    int ret;
+
+    if (!virtio_blk_store_width_bytes(width, &access_size)) {
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
         return;
     }
+
+    is_cfg = virtio_blk_is_config_access(addr, access_size);
+    if (addr >= (VIRTIO_Config << 2) && !is_cfg) {
+        vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
+        return;
+    }
+
+    if (!is_cfg) {
+        if (access_size != 4 || (addr & 0x3)) {
+            vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
+            return;
+        }
+    } else if (addr & (access_size - 1)) {
+        vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
+        return;
+    }
+
+    ret = virtio_mmio_write(&vblk->common, addr, (uint8_t) access_size, value);
+    if (ret < 0)
+        vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
 }
 
-uint32_t *virtio_blk_init(virtio_blk_state_t *vblk, char *disk_file)
+bool virtio_blk_irq_pending(virtio_blk_state_t *vblk)
 {
+    return virtio_irq_read_status(&vblk->common.irq) != 0;
+}
+
+uint32_t *virtio_blk_init(virtio_blk_state_t *vblk,
+                          emu_state_t *emu,
+                          char *disk_file)
+{
+    static const uint16_t queue_max_sizes[] = {
+        [VBLK_QUEUE] = VBLK_QUEUE_NUM_MAX,
+    };
+    struct virtio_device_common_config common_config;
+    uint32_t *disk_mem = NULL;
+
+    if (!vblk || !emu) {
+        fprintf(stderr, "Failed to initialize virtio-blk common device.\n");
+        exit(2);
+    }
+
     if (vblk_dev_cnt >= VBLK_DEV_CNT_MAX) {
         fprintf(stderr,
                 "Exceeded the number of virtio-blk devices that can be "
@@ -473,56 +761,98 @@ uint32_t *virtio_blk_init(virtio_blk_state_t *vblk, char *disk_file)
         exit(2);
     }
 
-    /* Allocate memory for the private member */
+    memset(vblk, 0, sizeof(*vblk));
+    vblk->ram = emu->ram;
     vblk->priv = &vblk_configs[vblk_dev_cnt++];
+    memset(PRIV(vblk), 0, sizeof(*PRIV(vblk)));
+    PRIV(vblk)->blk_size = DISK_BLK_SIZE;
 
-    /* No disk image is provided */
-    if (!disk_file) {
-        /* By setting the block capacity to zero, the kernel will
-         * then not to touch the device after booting */
-        PRIV(vblk)->capacity = 0;
-        return NULL;
-    }
+    if (disk_file) {
+        int disk_fd;
+        struct stat st;
+        size_t disk_size;
 
-    /* Open disk file */
-    int disk_fd = open(disk_file, O_RDWR);
-    if (disk_fd < 0) {
-        fprintf(stderr, "could not open %s\n", disk_file);
-        exit(2);
-    }
+        disk_fd = open(disk_file, O_RDWR);
+        if (disk_fd < 0) {
+            fprintf(stderr, "could not open %s\n", disk_file);
+            exit(2);
+        }
 
-    /* Get the disk image size */
-    struct stat st;
-    if (fstat(disk_fd, &st) < 0) {
-        fprintf(stderr, "fstat(%s): %s\n", disk_file, strerror(errno));
+        if (fstat(disk_fd, &st) < 0) {
+            fprintf(stderr, "fstat(%s): %s\n", disk_file, strerror(errno));
+            close(disk_fd);
+            exit(2);
+        }
+        if (st.st_size <= 0) {
+            fprintf(stderr, "%s is empty or has invalid size\n", disk_file);
+            close(disk_fd);
+            exit(2);
+        }
+        disk_size = st.st_size;
+
+        disk_mem = mmap(NULL, disk_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        disk_fd, 0);
+        if (disk_mem == MAP_FAILED) {
+            fprintf(stderr, "Could not map disk\n");
+            close(disk_fd);
+            return NULL;
+        }
+        assert(!(((uintptr_t) disk_mem) & 0b11));
         close(disk_fd);
+
+        vblk->disk = disk_mem;
+        PRIV(vblk)->capacity = (disk_size - 1) / DISK_BLK_SIZE + 1;
+
+        if (vblk_disks_cnt == 0)
+            atexit(virtio_blk_sync_all);
+        vblk_disks[vblk_disks_cnt].addr = disk_mem;
+        vblk_disks[vblk_disks_cnt].size = disk_size;
+        vblk_disks_cnt++;
+    }
+
+    common_config = (struct virtio_device_common_config) {
+        .emu = emu,
+        .dma = &emu->ram_dma,
+        .irq_source = SEMU_IRQ_SOURCE_VBLK,
+        .device_id = 2,
+        .vendor_id = VIRTIO_VENDOR_ID,
+        .device_features = VIRTIO_BLK_F_VERSION_1,
+        .required_features = VIRTIO_BLK_F_VERSION_1,
+        .queue_max_sizes = queue_max_sizes,
+        .num_queues = ARRAY_SIZE(queue_max_sizes),
+        .ops = &virtio_blk_ops,
+        .opaque = vblk,
+    };
+
+    if (virtio_device_common_init(&vblk->common, &common_config) < 0) {
+        fprintf(stderr, "Failed to initialize virtio-blk common device.\n");
         exit(2);
     }
-    if (st.st_size <= 0) {
-        fprintf(stderr, "%s is empty or has invalid size\n", disk_file);
-        close(disk_fd);
+
+    if (virtio_actor_init(&vblk->actor, &virtio_blk_actor_ops, vblk,
+                          ARRAY_SIZE(queue_max_sizes)) < 0) {
+        virtio_device_common_destroy(&vblk->common);
+        fprintf(stderr, "Failed to initialize virtio-blk actor.\n");
         exit(2);
     }
-    size_t disk_size = st.st_size;
-
-    /* Set up the disk memory */
-    uint32_t *disk_mem =
-        mmap(NULL, disk_size, PROT_READ | PROT_WRITE, MAP_SHARED, disk_fd, 0);
-    if (disk_mem == MAP_FAILED) {
-        fprintf(stderr, "Could not map disk\n");
-        return NULL;
-    }
-    assert(!(((uintptr_t) disk_mem) & 0b11));
-    close(disk_fd);
-
-    vblk->disk = disk_mem;
-    PRIV(vblk)->capacity = (disk_size - 1) / DISK_BLK_SIZE + 1;
-
-    if (vblk_disks_cnt == 0)
-        atexit(virtio_blk_sync_all);
-    vblk_disks[vblk_disks_cnt].addr = disk_mem;
-    vblk_disks[vblk_disks_cnt].size = disk_size;
-    vblk_disks_cnt++;
+    vblk->actor_initialized = true;
 
     return disk_mem;
+}
+
+void virtio_blk_destroy(virtio_blk_state_t *vblk)
+{
+    if (!vblk)
+        return;
+
+    if (vblk->actor_initialized) {
+        virtio_actor_stop(&vblk->actor);
+        virtio_actor_destroy(&vblk->actor);
+        vblk->actor_initialized = false;
+    }
+
+    virtio_device_common_destroy(&vblk->common);
+    if (vblk->priv && vblk_dev_cnt > 0)
+        vblk_dev_cnt--;
+    vblk->priv = NULL;
 }
