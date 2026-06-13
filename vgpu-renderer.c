@@ -269,8 +269,8 @@ static void vgpu_renderer_transition_queues(uint64_t generation, bool activate)
         vgpu_renderer_release_completion(&completions[i]);
 
     pthread_mutex_lock(&vgpu_renderer_lock);
+    vgpu_renderer_active_generation = generation;
     if (activate) {
-        vgpu_renderer_active_generation = generation;
         vgpu_renderer_available = true;
         debug_queue_resets++;
     }
