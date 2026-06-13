@@ -19,12 +19,23 @@
 #include "virtio.h"
 #include "virtq.h"
 
+#ifndef VIRTIO_BLK_DISK_READ_TO_GUEST
+#define VIRTIO_BLK_DISK_READ_TO_GUEST(vblk, addr, disk, len) \
+    (ram_dma_write((vblk)->common.dma, (addr), (disk), (len)) ? 0 : -EFAULT)
+#endif
+
+#ifndef VIRTIO_BLK_DISK_WRITE_FROM_GUEST
+#define VIRTIO_BLK_DISK_WRITE_FROM_GUEST(vblk, addr, disk, len) \
+    (ram_dma_read((vblk)->common.dma, (addr), (disk), (len)) ? 0 : -EFAULT)
+#endif
+
 #define DISK_BLK_SIZE 512
 
 #define VBLK_DEV_CNT_MAX 1
 #define VIRTIO_BLK_F_VERSION_1 (UINT64_C(1) << 32)
 #define VBLK_QUEUE_NUM_MAX 1024
 #define VBLK_QUEUE 0
+#define VBLK_HOST_DISK_RETRY_MAX 4
 
 #define PRIV(x) ((struct virtio_blk_config *) (x)->priv)
 
@@ -198,34 +209,72 @@ static bool virtio_blk_disk_range_valid(virtio_blk_state_t *vblk,
     return len <= disk_size - *offset;
 }
 
-static bool virtio_blk_read_disk_to_iovs(virtio_blk_state_t *vblk,
-                                         const struct virtq_iov *iov,
-                                         size_t count,
-                                         uint64_t disk_offset)
+static int virtio_blk_copy_disk_to_guest(virtio_blk_state_t *vblk,
+                                         guest_paddr_t addr,
+                                         const void *disk,
+                                         guest_size_t len)
+{
+    int ret = 0;
+
+    for (unsigned attempt = 0; attempt < VBLK_HOST_DISK_RETRY_MAX; attempt++) {
+        ret = VIRTIO_BLK_DISK_READ_TO_GUEST(vblk, addr, disk, len);
+        if (ret != -EINTR && ret != -EAGAIN)
+            return ret;
+    }
+
+    return ret;
+}
+
+static int virtio_blk_copy_guest_to_disk(virtio_blk_state_t *vblk,
+                                         guest_paddr_t addr,
+                                         void *disk,
+                                         guest_size_t len)
+{
+    int ret = 0;
+
+    for (unsigned attempt = 0; attempt < VBLK_HOST_DISK_RETRY_MAX; attempt++) {
+        ret = VIRTIO_BLK_DISK_WRITE_FROM_GUEST(vblk, addr, disk, len);
+        if (ret != -EINTR && ret != -EAGAIN)
+            return ret;
+    }
+
+    return ret;
+}
+
+static int virtio_blk_read_disk_to_iovs(virtio_blk_state_t *vblk,
+                                        const struct virtq_iov *iov,
+                                        size_t count,
+                                        uint64_t disk_offset)
 {
     const uint8_t *disk = (const uint8_t *) vblk->disk + disk_offset;
 
     for (size_t i = 0; i < count; i++) {
-        if (!ram_dma_write(vblk->common.dma, iov[i].addr, disk, iov[i].len))
-            return false;
+        int ret =
+            virtio_blk_copy_disk_to_guest(vblk, iov[i].addr, disk, iov[i].len);
+
+        if (ret < 0)
+            return ret;
         disk += iov[i].len;
     }
-    return true;
+    return 0;
 }
 
-static bool virtio_blk_write_iovs_to_disk(virtio_blk_state_t *vblk,
-                                          const struct virtq_iov *iov,
-                                          size_t count,
-                                          uint64_t disk_offset)
+static int virtio_blk_write_iovs_to_disk(virtio_blk_state_t *vblk,
+                                         const struct virtq_iov *iov,
+                                         size_t count,
+                                         uint64_t disk_offset)
 {
     uint8_t *disk = (uint8_t *) vblk->disk + disk_offset;
 
     for (size_t i = 0; i < count; i++) {
-        if (!ram_dma_read(vblk->common.dma, iov[i].addr, disk, iov[i].len))
-            return false;
+        int ret =
+            virtio_blk_copy_guest_to_disk(vblk, iov[i].addr, disk, iov[i].len);
+
+        if (ret < 0)
+            return ret;
         disk += iov[i].len;
     }
-    return true;
+    return 0;
 }
 
 static int virtio_blk_process_chain(virtio_blk_state_t *vblk,
@@ -286,13 +335,27 @@ static int virtio_blk_process_chain(virtio_blk_state_t *vblk,
     }
 
     if (header.type == VIRTIO_BLK_T_IN) {
-        if (!virtio_blk_read_disk_to_iovs(vblk, data_iov, data_count,
-                                          disk_offset))
-            return -EFAULT;
+        int ret = virtio_blk_read_disk_to_iovs(vblk, data_iov, data_count,
+                                               disk_offset);
+
+        if (ret == -EFAULT)
+            return ret;
+        if (ret < 0) {
+            if (!virtio_blk_write_status(vblk, status_iov, VIRTIO_BLK_S_IOERR))
+                return -EFAULT;
+            return 0;
+        }
     } else {
-        if (!virtio_blk_write_iovs_to_disk(vblk, data_iov, data_count,
-                                           disk_offset))
-            return -EFAULT;
+        int ret = virtio_blk_write_iovs_to_disk(vblk, data_iov, data_count,
+                                                disk_offset);
+
+        if (ret == -EFAULT)
+            return ret;
+        if (ret < 0) {
+            if (!virtio_blk_write_status(vblk, status_iov, VIRTIO_BLK_S_IOERR))
+                return -EFAULT;
+            return 0;
+        }
     }
 
     if (!virtio_blk_write_status(vblk, status_iov, VIRTIO_BLK_S_OK))
