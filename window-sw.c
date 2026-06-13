@@ -392,6 +392,12 @@ static bool sdl_plane_info_update_texture(
     const struct vgpu_display_payload *payload,
     const char *plane_name)
 {
+    if (!payload || payload->type != VGPU_DISPLAY_PAYLOAD_CPU) {
+        fprintf(stderr, "%s(): unsupported %s display payload type %u\n",
+                __func__, plane_name, payload ? (uint32_t) payload->type : 0);
+        return false;
+    }
+
     const struct vgpu_display_cpu_payload *frame = &payload->cpu;
     uint32_t sdl_format;
     if (!sdl_plane_info_get_sdl_format(plane, payload, &sdl_format))
@@ -509,6 +515,14 @@ static bool sdl_scanout_apply_cursor_frame(
     uint32_t hot_x,
     uint32_t hot_y)
 {
+    if (!payload || payload->type != VGPU_DISPLAY_PAYLOAD_CPU) {
+        fprintf(stderr,
+                WINDOW_LOG_PREFIX
+                "%s(): unsupported cursor display payload type %u\n",
+                __func__, payload ? (uint32_t) payload->type : 0);
+        return false;
+    }
+
     const struct vgpu_display_cpu_payload *frame = &payload->cpu;
     struct sdl_plane_info *plane = &scanout->cursor_plane;
     SDL_Rect new_cursor_rect = scanout->cursor_rect;

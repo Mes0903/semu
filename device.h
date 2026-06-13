@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #if SEMU_HAS(VIRTIONET)
 #include "netdev.h"
@@ -282,20 +283,51 @@ struct virtio_gpu_sw_display_counters {
     uint64_t full_frame_bytes;
     uint64_t dirty_rect_bytes;
     uint64_t queue_backpressure;
+    uint64_t publish_queue_full;
+    uint64_t publish_backpressure;
+    uint64_t publish_unavailable;
+    uint64_t publish_can_publish_false;
     uint64_t dirty_merges;
     uint64_t full_resync_escalations;
 };
 
 struct virtio_gpu_debug_counters {
     struct virtio_gpu_sw_display_counters display;
+    uint64_t actor_notify_ok;
+    uint64_t actor_notify_eagain;
+    uint64_t actor_notify_eio;
+    uint64_t actor_notify_einval;
+    uint64_t actor_notify_other_error;
+    uint64_t actor_drain_calls;
+    uint64_t actor_queue_index_invalid;
+    uint64_t actor_stale_generation;
+    uint64_t actor_completion_rejected;
+    uint64_t actor_failed_callbacks;
 };
 
 struct virtio_gpu_sw_display_counter_storage {
     _Atomic uint64_t full_frame_bytes;
     _Atomic uint64_t dirty_rect_bytes;
     _Atomic uint64_t queue_backpressure;
+    _Atomic uint64_t publish_queue_full;
+    _Atomic uint64_t publish_backpressure;
+    _Atomic uint64_t publish_unavailable;
+    _Atomic uint64_t publish_can_publish_false;
     _Atomic uint64_t dirty_merges;
     _Atomic uint64_t full_resync_escalations;
+};
+
+struct virtio_gpu_debug_counter_storage {
+    _Atomic uint64_t actor_notify_ok;
+    _Atomic uint64_t actor_notify_eagain;
+    _Atomic uint64_t actor_notify_eio;
+    _Atomic uint64_t actor_notify_einval;
+    _Atomic uint64_t actor_notify_other_error;
+    _Atomic uint64_t actor_drain_calls;
+    _Atomic uint64_t actor_queue_index_invalid;
+    _Atomic uint64_t actor_stale_generation;
+    _Atomic uint64_t actor_completion_rejected;
+    _Atomic uint64_t actor_failed_callbacks;
 };
 
 struct virtio_gpu_sw_backend_state {
@@ -317,6 +349,7 @@ typedef struct {
     struct virtio_device_common common;
     struct virtio_actor actor;
     struct virtio_gpu_sw_backend_state sw_backend;
+    struct virtio_gpu_debug_counter_storage debug_counters;
     struct virtio_gpu_ctrl_dispatch_context ctrl_dispatch;
     uint64_t actor_drain_generation;
     bool actor_initialized;
@@ -350,6 +383,8 @@ void virtio_gpu_disable_virgl_runtime(virtio_gpu_state_t *vgpu);
  * tearing down the window/display backend.
  */
 void virtio_gpu_destroy(virtio_gpu_state_t *vgpu);
+struct virtio_gpu_debug_counters virtio_gpu_debug_counters(
+    virtio_gpu_state_t *vgpu);
 void virtio_gpu_drain_renderer_completions(virtio_gpu_state_t *vgpu);
 uint32_t virtio_gpu_register_scanout(virtio_gpu_state_t *vgpu,
                                      uint32_t width,

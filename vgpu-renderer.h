@@ -170,6 +170,9 @@ bool vgpu_renderer_pop_request(struct vgpu_renderer_request *request);
  */
 bool vgpu_renderer_complete(const struct vgpu_renderer_completion *completion);
 bool vgpu_renderer_pop_completion(struct vgpu_renderer_completion *completion);
+/* Init/reset make the queues available for a generation. Shutdown drains
+ * queued ownership hooks and leaves the queues unavailable until reopened.
+ */
 void vgpu_renderer_init_queues(uint64_t generation);
 void vgpu_renderer_reset_queues(uint64_t generation);
 void vgpu_renderer_shutdown_queues(void);

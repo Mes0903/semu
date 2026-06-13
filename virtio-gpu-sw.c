@@ -44,24 +44,10 @@ struct vgpu_sw_resource_2d {
 
 #define SW(vgpu) (&((vgpu)->sw_backend))
 
-static void vgpu_sw_display_counters_reset(virtio_gpu_state_t *vgpu)
-{
-    virtio_gpu_debug_counter_store(&SW(vgpu)->display_counters.full_frame_bytes,
-                                   0);
-    virtio_gpu_debug_counter_store(&SW(vgpu)->display_counters.dirty_rect_bytes,
-                                   0);
-    virtio_gpu_debug_counter_store(
-        &SW(vgpu)->display_counters.queue_backpressure, 0);
-    virtio_gpu_debug_counter_store(&SW(vgpu)->display_counters.dirty_merges, 0);
-    virtio_gpu_debug_counter_store(
-        &SW(vgpu)->display_counters.full_resync_escalations, 0);
-}
-
 void virtio_gpu_sw_backend_init(virtio_gpu_state_t *vgpu)
 {
     INIT_LIST_HEAD(&SW(vgpu)->res_2d_list);
     SW(vgpu)->hostmem = 0;
-    vgpu_sw_display_counters_reset(vgpu);
 }
 
 static size_t vgpu_sw_iov_to_buf(const struct iovec *iov,
@@ -263,16 +249,34 @@ static void vgpu_sw_count_publish_backpressure(
     virtio_gpu_state_t *vgpu,
     enum vgpu_display_publish_result result)
 {
-    if (result == VGPU_DISPLAY_PUBLISH_QUEUE_FULL ||
-        result == VGPU_DISPLAY_PUBLISH_BACKPRESSURE)
+    switch (result) {
+    case VGPU_DISPLAY_PUBLISH_QUEUE_FULL:
         virtio_gpu_debug_counter_inc(
             &SW(vgpu)->display_counters.queue_backpressure);
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.publish_queue_full);
+        break;
+    case VGPU_DISPLAY_PUBLISH_BACKPRESSURE:
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.queue_backpressure);
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.publish_backpressure);
+        break;
+    case VGPU_DISPLAY_PUBLISH_UNAVAILABLE:
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.publish_unavailable);
+        break;
+    case VGPU_DISPLAY_PUBLISH_OK:
+        break;
+    }
 }
 
 static void vgpu_sw_count_can_publish_false(virtio_gpu_state_t *vgpu)
 {
     virtio_gpu_debug_counter_inc(
         &SW(vgpu)->display_counters.queue_backpressure);
+    virtio_gpu_debug_counter_inc(
+        &SW(vgpu)->display_counters.publish_can_publish_false);
 }
 
 static enum vgpu_display_publish_result vgpu_sw_publish_primary_clear(
@@ -297,6 +301,11 @@ static bool vgpu_sw_advance_primary_generation(virtio_gpu_state_t *vgpu,
 {
     (void) vgpu;
 
+    /* Lifecycle generation changes are atomic display-bridge state, not lossy
+     * frame queue writes. The actor drain already owns command handling; do
+     * not reuse the descriptor completion gate here or normal in-actor
+     * reconfiguration can be misreported as display backpressure.
+     */
     *generation = vgpu_display_advance_primary_generation(scanout_id);
     return true;
 }
@@ -439,7 +448,6 @@ static void vgpu_sw_accumulate_primary_dirty(
     struct virtio_gpu_scanout_info *scanout,
     const struct vgpu_dirty_rect *src_rect)
 {
-    (void) vgpu;
     struct vgpu_scanout_dirty_state *dirty = &scanout->primary_dirty;
     uint32_t generation = vgpu_display_primary_generation(scanout_id);
 
@@ -558,6 +566,7 @@ static struct vgpu_display_payload *vgpu_sw_create_window_payload(
         return NULL;
     }
 
+    payload->type = VGPU_DISPLAY_PAYLOAD_CPU;
     payload->cpu.format = res_2d->format;
     payload->cpu.width = width;
     payload->cpu.height = height;
@@ -571,6 +580,11 @@ static struct vgpu_display_payload *vgpu_sw_create_window_payload(
     payload->cpu.dst_height = update->dst.height;
     payload->cpu.pixels = (uint8_t *) (payload + 1);
 
+    /* The cropped view is contiguous only when the source stride matches this
+     * snapshot's row size. Otherwise each source row still carries padding or
+     * untouched pixels outside the requested view, so the snapshot must be
+     * packed row by row.
+     */
     const uint8_t *src_pixels = (const uint8_t *) res_2d->image +
                                 (size_t) src_y * res_2d->stride +
                                 (size_t) src_x * bytes_per_pixel;
@@ -595,6 +609,7 @@ static enum vgpu_display_publish_result vgpu_sw_publish_pending_primary_dirty(
     struct vgpu_scanout_dirty_state *dirty = &scanout->primary_dirty;
     struct vgpu_dirty_rect scanout_src = vgpu_sw_scanout_src_rect(scanout);
     struct vgpu_rect_update update;
+    bool full_resync;
 
     if (!dirty->dirty)
         return VGPU_DISPLAY_PUBLISH_OK;
@@ -605,7 +620,8 @@ static enum vgpu_display_publish_result vgpu_sw_publish_pending_primary_dirty(
         return VGPU_DISPLAY_PUBLISH_OK;
     }
 
-    if (dirty->needs_full_resync) {
+    full_resync = dirty->needs_full_resync;
+    if (full_resync) {
         if (!vgpu_rect_compute_full_update(&scanout_src, &update))
             return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
     } else if (!vgpu_rect_compute_update(&scanout_src, &dirty->rect, &update)) {
@@ -613,6 +629,7 @@ static enum vgpu_display_publish_result vgpu_sw_publish_pending_primary_dirty(
         dirty->rect = scanout_src;
         virtio_gpu_debug_counter_inc(
             &SW(vgpu)->display_counters.full_resync_escalations);
+        full_resync = true;
         if (!vgpu_rect_compute_full_update(&scanout_src, &update))
             return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
     }
@@ -639,7 +656,7 @@ static enum vgpu_display_publish_result vgpu_sw_publish_pending_primary_dirty(
         return result;
     }
 
-    if (dirty->needs_full_resync || full_frame_payload)
+    if (full_resync || full_frame_payload)
         virtio_gpu_debug_counter_add(
             &SW(vgpu)->display_counters.full_frame_bytes, bytes);
     else
@@ -673,6 +690,11 @@ static void vgpu_sw_reset(virtio_gpu_state_t *vgpu)
 
         if (!vgpu_scanout_primary_clear_if_published(
                 scanout, primary_result, vgpu_display_primary_generation(i))) {
+            /* Reset is fail-stop for backend resources. Lifecycle clears
+             * should only fail here for real generation/backpressure errors;
+             * normal SET_SCANOUT/UNREF paths keep bindings unchanged on that
+             * class of failure.
+             */
             scanout->primary_resource_id = 0;
             scanout->src_x = 0;
             scanout->src_y = 0;
@@ -691,8 +713,6 @@ static void vgpu_sw_reset(virtio_gpu_state_t *vgpu)
 
         vgpu_sw_destroy_resource_2d(vgpu, res_2d);
     }
-
-    vgpu_sw_display_counters_reset(vgpu);
 }
 
 static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
@@ -1039,6 +1059,11 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
         if (!vgpu_scanout_primary_clear_if_published(
                 scanout, clear_result,
                 vgpu_display_primary_generation(request->scanout_id))) {
+            /* Keep the existing binding when the reliable clear/generation
+             * advance fails. Clearing backend state with the old generation
+             * would let stale queued PRIMARY_SET payloads be accepted as if
+             * they belonged to the disabled scanout.
+             */
             vgpu_sw_count_publish_backpressure(vgpu, clear_result);
             fprintf(stderr,
                     VIRTIO_GPU_LOG_PREFIX
@@ -1106,6 +1131,12 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
     uint32_t primary_generation;
     if (!vgpu_sw_advance_primary_generation(vgpu, request->scanout_id,
                                             &primary_generation)) {
+        /* Do not rebind on generation gate failure. Queued PRIMARY_SET frames
+         * for the previous binding still carry the current generation, so a
+         * new binding with that old generation would defeat stale-frame drop.
+         * Preserve the old backend state and keep the existing OK_NODATA guest
+         * completion policy for this recoverable display backpressure case.
+         */
         vgpu_sw_count_can_publish_false(vgpu);
         goto leave;
     }
@@ -1692,6 +1723,7 @@ static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
         if (vgpu_display_lifecycle_publish_succeeded(clear_result)) {
             scanout->cursor_resource_id = 0;
         } else {
+            vgpu_sw_count_publish_backpressure(vgpu, clear_result);
             fprintf(stderr,
                     VIRTIO_GPU_LOG_PREFIX
                     "%s(): failed to clear cursor on scanout %u; keeping "
@@ -1813,10 +1845,11 @@ static void vgpu_sw_cmd_move_cursor_handler(virtio_gpu_state_t *vgpu,
     }
 
     /* Move cursor to new position */
-    (void) vgpu_sw_publish_cursor_move(
-        vgpu, cursor->pos.scanout_id,
-        vgpu_sw_decode_cursor_coord(cursor->pos.x),
-        vgpu_sw_decode_cursor_coord(cursor->pos.y));
+    enum vgpu_display_publish_result result =
+        vgpu_sw_publish_cursor_move(vgpu, cursor->pos.scanout_id,
+                                    vgpu_sw_decode_cursor_coord(cursor->pos.x),
+                                    vgpu_sw_decode_cursor_coord(cursor->pos.y));
+    vgpu_sw_count_publish_backpressure(vgpu, result);
 
     *plen = 0;
 }
