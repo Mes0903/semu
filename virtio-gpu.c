@@ -3994,9 +3994,19 @@ static bool virtio_gpu_actor_queue_has_work(void *opaque,
     return available != 0;
 }
 
+static void virtio_gpu_actor_failed(void *opaque,
+                                    struct virtio_actor *actor UNUSED)
+{
+    virtio_gpu_state_t *vgpu = opaque;
+
+    if (vgpu)
+        virtio_gpu_set_fail(vgpu);
+}
+
 static const struct virtio_actor_ops virtio_gpu_actor_ops = {
     .drain_queue = virtio_gpu_actor_drain_queue,
     .queue_has_work = virtio_gpu_actor_queue_has_work,
+    .on_failed = virtio_gpu_actor_failed,
 };
 
 static bool virtio_gpu_config_range_valid(uint32_t offset, uint32_t size)
