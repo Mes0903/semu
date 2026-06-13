@@ -1,5 +1,6 @@
 #include "virtio-mmio.h"
 
+#include "device.h"
 #include "virtio.h"
 
 #include <errno.h>
@@ -75,6 +76,14 @@ static bool virtio_mmio_all_queues_ready(
             return false;
     }
     return true;
+}
+
+static bool virtio_mmio_accepting_device_work(
+    const struct virtio_device_common *common)
+{
+    if (!common->emu)
+        return true;
+    return semu_vm_accepting_device_work(&common->emu->lifecycle);
 }
 
 struct virtio_activation_request {
@@ -176,6 +185,7 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
                                        uint16_t queue_index,
                                        uint64_t generation)
 {
+    bool accepting;
     bool still_current;
 
     pthread_mutex_lock(&common->backend_lock);
@@ -188,6 +198,12 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
     if (!still_current) {
         pthread_mutex_unlock(&common->backend_lock);
         return -ECANCELED;
+    }
+
+    accepting = virtio_mmio_accepting_device_work(common);
+    if (!accepting) {
+        pthread_mutex_unlock(&common->backend_lock);
+        return 0;
     }
 
     ops->notify_queue(opaque, queue_index, generation);
@@ -612,6 +628,8 @@ int virtio_mmio_write(struct virtio_device_common *common,
             ret = -EINVAL;
             break;
         }
+        if (!virtio_mmio_accepting_device_work(common))
+            break;
         if (common->ops && common->ops->notify_queue) {
             notify_ops = common->ops;
             notify_opaque = common->opaque;
