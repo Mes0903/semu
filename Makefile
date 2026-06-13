@@ -22,6 +22,20 @@ ROOTFS_CP ?= cp
 ROOTFS_CHOWN ?= chown
 ROOTFS_FAKEROOT_SHELL ?= /bin/sh
 
+SANITIZE ?=
+SANITIZE_VALUE := $(strip $(SANITIZE))
+ifneq ($(SANITIZE_VALUE),)
+ifneq ($(words $(SANITIZE_VALUE)),1)
+$(error Invalid SANITIZE="$(SANITIZE)". Set exactly one of: address thread)
+endif
+ifneq ($(filter address thread,$(SANITIZE_VALUE)),$(SANITIZE_VALUE))
+$(error Unsupported SANITIZE="$(SANITIZE)". Supported values: address thread)
+endif
+SANITIZE_FLAGS := -fsanitize=$(SANITIZE_VALUE) -fno-omit-frame-pointer
+CFLAGS += $(SANITIZE_FLAGS)
+LDFLAGS += $(SANITIZE_FLAGS)
+endif
+
 CFLAGS += -pthread
 LDFLAGS += -pthread
 
