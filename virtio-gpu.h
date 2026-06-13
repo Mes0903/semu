@@ -39,6 +39,7 @@ struct virtio_gpu_scanout_info {
 typedef struct {
     struct virtio_gpu_scanout_info scanouts[VIRTIO_GPU_MAX_SCANOUTS];
     uint32_t num_scanouts;
+    uint32_t num_capsets;
 } virtio_gpu_data_t;
 
 PACKED(struct virtio_gpu_config {

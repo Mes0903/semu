@@ -42,5 +42,10 @@
 #define SEMU_FEATURE_VIRTIOGPU 1
 #endif
 
+/* VirGL/virtio-gpu 3D. Default off until the renderer path is ready. */
+#ifndef SEMU_FEATURE_VIRGL
+#define SEMU_FEATURE_VIRGL 0
+#endif
+
 /* Feature test macro */
 #define SEMU_HAS(x) SEMU_FEATURE_##x

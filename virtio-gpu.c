@@ -23,6 +23,7 @@
 
 #define VIRTIO_GPU_EVENT_DISPLAY (1 << 0)
 #define VIRTIO_GPU_F_EDID (1 << 1)
+#define VIRTIO_GPU_F_VIRGL (1 << 0)
 #define VIRTIO_GPU_F_CONTEXT_INIT (1 << 4)
 
 #define VIRTIO_GPU_QUEUE_NUM_MAX 1024
@@ -64,6 +65,29 @@
 extern const struct virtio_gpu_cmd_backend g_virtio_gpu_backend;
 static virtio_gpu_data_t virtio_gpu_data;
 static bool virtio_gpu_instance_initialized;
+
+static bool virtio_gpu_virgl_runtime_ready(void)
+{
+#if SEMU_HAS(VIRGL)
+    /* Build support can be enabled before the renderer path is fully wired.
+     * Keep all guest-visible 3D capability hidden until later PR11 commits
+     * deliberately attach the renderer backend, GL owner, fences, and capsets.
+     */
+    return false;
+#else
+    return false;
+#endif
+}
+
+static uint64_t virtio_gpu_device_features(void)
+{
+    uint64_t features = VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VERSION_1;
+
+    if (virtio_gpu_virgl_runtime_ready())
+        features |= VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_CONTEXT_INIT;
+
+    return features;
+}
 
 static struct virtio_gpu_sw_display_counters
 virtio_gpu_display_counters_snapshot(
@@ -965,7 +989,8 @@ static uint32_t virtio_gpu_read_config(void *opaque,
         .events_read = 0,
         .events_clear = 0,
         .num_scanouts = PRIV(vgpu)->num_scanouts,
-        .num_capsets = 0,
+        .num_capsets =
+            virtio_gpu_virgl_runtime_ready() ? PRIV(vgpu)->num_capsets : 0,
     };
     uint32_t value = 0;
 
@@ -1224,7 +1249,7 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
         .irq_source = SEMU_IRQ_SOURCE_VGPU,
         .device_id = 16,
         .vendor_id = VIRTIO_VENDOR_ID,
-        .device_features = VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VERSION_1,
+        .device_features = virtio_gpu_device_features(),
         .required_features = VIRTIO_GPU_F_VERSION_1,
         .queue_max_sizes = queue_max_sizes,
         .num_queues = ARRAY_SIZE(queue_max_sizes),

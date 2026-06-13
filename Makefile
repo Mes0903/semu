@@ -2,6 +2,7 @@ include mk/common.mk
 include mk/check-libs.mk
 
 CC ?= gcc
+PKG_CONFIG ?= pkg-config
 CFLAGS := -O2 -g -Wall -Wextra
 CFLAGS += -include common.h
 
@@ -212,6 +213,27 @@ endif
 # virtio-gpu
 ENABLE_VIRTIOGPU ?= 1
 $(call set-feature, VIRTIOGPU)
+
+# VirGL/virtio-gpu 3D support is intentionally default-off. Turning this on
+# only compiles gated 3D substrate until a complete renderer backend is wired.
+ENABLE_VIRGL ?= 0
+VIRGL_PKGS := virglrenderer epoxy gl egl
+VIRGL_CFLAGS :=
+VIRGL_LIBS :=
+ifeq ($(call has, VIRGL), 1)
+    ifneq ($(call has, VIRTIOGPU), 1)
+        $(error ENABLE_VIRGL=1 requires ENABLE_VIRTIOGPU=1)
+    endif
+    ifneq (0,$(shell $(PKG_CONFIG) --exists $(VIRGL_PKGS) >/dev/null 2>&1; echo $$?))
+        $(error ENABLE_VIRGL=1 requires pkg-config packages: $(VIRGL_PKGS))
+    endif
+    VIRGL_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(VIRGL_PKGS))
+    VIRGL_LIBS := $(shell $(PKG_CONFIG) --libs $(VIRGL_PKGS))
+    CFLAGS += $(VIRGL_CFLAGS)
+    LDFLAGS += $(VIRGL_LIBS)
+endif
+$(call set-feature, VIRGL)
+
 ifeq ($(call has, VIRTIOGPU), 1)
     OBJS_EXTRA += virtio-gpu.o
     OBJS_EXTRA += virtio-gpu-sw.o
@@ -225,6 +247,13 @@ endif
 
 BIN = semu
 all: $(BIN) minimal.dtb
+
+.PHONY: print-vgpu-virgl-config
+print-vgpu-virgl-config:
+	@printf 'SEMU_FEATURE_VIRGL=%s\n' '$(call has, VIRGL)'
+	@printf 'VIRGL_PKGS=%s\n' '$(VIRGL_PKGS)'
+	@printf 'VIRGL_CFLAGS=%s\n' '$(VIRGL_CFLAGS)'
+	@printf 'VIRGL_LIBS=%s\n' '$(VIRGL_LIBS)'
 
 OBJS := \
 	riscv.o \
