@@ -70,7 +70,7 @@ static const struct semu_executor_virtio_host_io_policy
         {
             .device_name = "virtio-snd",
             .build_enabled = SEMU_HAS(VIRTIOSND),
-            .actor_mode_allowed = false,
+            .actor_mode_allowed = true,
             .actor_mode_policy =
                 "actor owns virtqueues; callback owns timing; reset releases, "
                 "broadcasts, closes, then frees buffers",

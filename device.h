@@ -439,25 +439,10 @@ void aclint_sswi_write(hart_t *hart,
 #define IRQ_VSND_BIT (1 << IRQ_VSND)
 
 typedef struct {
-    uint32_t QueueNum;
-    uint32_t QueueDesc;
-    uint32_t QueueAvail;
-    uint32_t QueueUsed;
-    uint16_t last_avail;
-    bool ready;
-} virtio_snd_queue_t;
-
-typedef struct {
-    /* feature negotiation */
-    uint32_t DeviceFeaturesSel;
-    uint32_t DriverFeatures;
-    uint32_t DriverFeaturesSel;
-    /* queue config */
-    uint32_t QueueSel;
-    virtio_snd_queue_t queues[4];
-    /* status */
-    uint32_t Status;
-    uint32_t InterruptStatus;
+    struct virtio_device_common common;
+    struct virtio_actor actor;
+    bool actor_initialized;
+    bool portaudio_initialized;
     /* supplied by environment */
     uint32_t *ram;
     /* implementation-specific */
@@ -476,7 +461,9 @@ void virtio_snd_write(hart_t *core,
                       uint8_t width,
                       uint32_t value);
 
-bool virtio_snd_init(virtio_snd_state_t *vsnd);
+bool virtio_snd_irq_pending(virtio_snd_state_t *vsnd);
+bool virtio_snd_init(virtio_snd_state_t *vsnd, emu_state_t *emu);
+void virtio_snd_destroy(virtio_snd_state_t *vsnd);
 #endif /* SEMU_HAS(VIRTIOSND) */
 
 /* VirtIO-File-System */
