@@ -2269,6 +2269,7 @@ bool virtio_fs_init(virtio_fs_state_t *vfs,
         .required_features = VIRTIO_FS_F_VERSION_1,
         .queue_max_sizes = queue_max_sizes,
         .num_queues = ARRAY_SIZE(queue_max_sizes),
+        .required_ready_queues = 2,
         .ops = &virtio_fs_ops,
         .opaque = vfs,
     };
