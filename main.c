@@ -3193,9 +3193,9 @@ static void semu_run_threaded(emu_state_t *emu)
     if (ret < 0) {
         errno = -ret;
         perror("hart executor start");
+        semu_runtime_enter_failed(emu);
         hart_executor_request_stop(emu);
         hart_executor_join(emu);
-        semu_runtime_enter_failed(emu);
         emu->exit_code = 1;
         return;
     }
@@ -3276,6 +3276,7 @@ static bool semu_debug_reject_unsupported_config(emu_state_t *emu)
             "SMP gdbstub/debug is unsupported until stop-all-harts debug "
             "semantics exist; use -c 1 with --gdbstub, or run SMP without "
             "--gdbstub.\n");
+    semu_runtime_enter_failed(emu);
     emu->exit_code = 1;
     return true;
 }
