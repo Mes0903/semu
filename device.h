@@ -320,6 +320,7 @@ typedef struct {
     struct virtio_gpu_ctrl_dispatch_context ctrl_dispatch;
     uint64_t actor_drain_generation;
     bool actor_initialized;
+    atomic_bool virgl_runtime_enabled;
     /* supplied by environment */
     uint32_t *ram;
     /* implementation-specific */
@@ -341,7 +342,10 @@ void virtio_gpu_write(hart_t *vm,
 /* Initializes the process-wide virtio-gpu singleton. semu currently supports
  * one live GPU instance; call virtio_gpu_destroy() before reinitializing.
  */
-void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu);
+void virtio_gpu_init(virtio_gpu_state_t *vgpu,
+                     emu_state_t *emu,
+                     bool enable_virgl_runtime);
+void virtio_gpu_disable_virgl_runtime(virtio_gpu_state_t *vgpu);
 /* Stops the GPU actor before releasing backend/common resources. Call before
  * tearing down the window/display backend.
  */

@@ -12,8 +12,9 @@ struct window_backend {
      * The caller also passes the default SDL window size. VirtIO-GPU builds
      * use it as the initial scanout size; input-only builds use it for the
      * grab target window because they do not have a display mode of their own.
+     * Returns true only when the requested window/renderer runtime is usable.
      */
-    void (*window_init)(bool headless, uint32_t width, uint32_t height);
+    bool (*window_init)(bool headless, uint32_t width, uint32_t height);
     /* Main loop function that runs on the main thread. If non-NULL, the
      * emulator runs in a background thread while this function handles window
      * events on the main thread.

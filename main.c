@@ -2484,14 +2484,19 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #endif
 
 #if SEMU_HAS(VIRTIOGPU)
-    virtio_gpu_init(&(emu->vgpu), emu);
+    virtio_gpu_init(&(emu->vgpu), emu, !headless);
     uint32_t scanout_id =
         virtio_gpu_register_scanout(&(emu->vgpu), SCREEN_WIDTH, SCREEN_HEIGHT);
     vgpu_display_set_scanout_count(scanout_id + 1U);
 #endif
 
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
-    g_window.window_init(headless, SCREEN_WIDTH, SCREEN_HEIGHT);
+    bool window_ready =
+        g_window.window_init(headless, SCREEN_WIDTH, SCREEN_HEIGHT);
+#if SEMU_HAS(VIRTIOGPU)
+    if (!window_ready)
+        virtio_gpu_disable_virgl_runtime(&emu->vgpu);
+#endif
 
     emu->wake_fd[0] = emu->wake_fd[1] = -1;
     if (semu_should_use_threaded_runtime(emu) && g_window.window_main_loop) {

@@ -28,6 +28,7 @@
 
 #define VIRTIO_GPU_CAPSET_VIRGL 1
 #define VIRTIO_GPU_CAPSET_VIRGL2 2
+#define VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK 0x000000ff
 
 #define VIRTIO_GPU_QUEUE_NUM_MAX 1024
 
@@ -462,6 +463,7 @@ uint32_t virtio_gpu_write_ctrl_response(
     uint32_t type);
 
 void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu);
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets);
 int virtio_gpu_complete_deferred_ctrl(
     virtio_gpu_state_t *vgpu,
     const struct virtio_gpu_deferred_ctrl_completion *completion);
@@ -505,6 +507,9 @@ void virtio_gpu_get_display_info_handler(virtio_gpu_state_t *vgpu,
 void virtio_gpu_get_edid_handler(virtio_gpu_state_t *vgpu,
                                  struct virtq_desc *vq_desc,
                                  uint32_t *plen);
+void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
+                                      struct virtq_desc *vq_desc,
+                                      uint32_t *plen);
 #if SEMU_HAS(VIRGL)
 void virtio_gpu_virgl_get_capset_info_handler(virtio_gpu_state_t *vgpu,
                                               struct virtq_desc *vq_desc,
@@ -518,6 +523,12 @@ void virtio_gpu_virgl_ctx_create_handler(virtio_gpu_state_t *vgpu,
 void virtio_gpu_virgl_ctx_destroy_handler(virtio_gpu_state_t *vgpu,
                                           struct virtq_desc *vq_desc,
                                           uint32_t *plen);
+void virtio_gpu_virgl_ctx_attach_resource_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen);
+void virtio_gpu_virgl_ctx_detach_resource_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen);
 void virtio_gpu_virgl_resource_create_3d_handler(virtio_gpu_state_t *vgpu,
                                                  struct virtq_desc *vq_desc,
                                                  uint32_t *plen);
@@ -541,6 +552,12 @@ void virtio_gpu_virgl_set_scanout_handler(virtio_gpu_state_t *vgpu,
 void virtio_gpu_virgl_set_scanout_blob_handler(virtio_gpu_state_t *vgpu,
                                                struct virtq_desc *vq_desc,
                                                uint32_t *plen);
+void virtio_gpu_virgl_resource_flush_handler(virtio_gpu_state_t *vgpu,
+                                             struct virtq_desc *vq_desc,
+                                             uint32_t *plen);
+void virtio_gpu_virgl_transfer_to_host_2d_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen);
 void virtio_gpu_virgl_transfer_to_host_3d_handler(virtio_gpu_state_t *vgpu,
                                                   struct virtq_desc *vq_desc,
                                                   uint32_t *plen);
@@ -562,7 +579,62 @@ void virtio_gpu_virgl_invalidate_scanout(uint32_t scanout_id);
 void virtio_gpu_virgl_apply_renderer_side_effect(
     virtio_gpu_state_t *vgpu,
     struct vgpu_renderer_completion *completion);
+#else
+#define VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(name)                      \
+    static inline void name(virtio_gpu_state_t *vgpu,                   \
+                            struct virtq_desc *vq_desc, uint32_t *plen) \
+    {                                                                   \
+        virtio_gpu_cmd_undefined_handler(vgpu, vq_desc, plen);          \
+    }
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(virtio_gpu_virgl_get_capset_info_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(virtio_gpu_virgl_get_capset_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(virtio_gpu_virgl_ctx_create_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(virtio_gpu_virgl_ctx_destroy_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(
+    virtio_gpu_virgl_ctx_attach_resource_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(
+    virtio_gpu_virgl_ctx_detach_resource_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(
+    virtio_gpu_virgl_resource_create_3d_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(
+    virtio_gpu_virgl_resource_create_blob_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(virtio_gpu_virgl_resource_unref_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(
+    virtio_gpu_virgl_resource_attach_backing_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(
+    virtio_gpu_virgl_resource_detach_backing_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(virtio_gpu_virgl_set_scanout_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(virtio_gpu_virgl_set_scanout_blob_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(virtio_gpu_virgl_resource_flush_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(
+    virtio_gpu_virgl_transfer_to_host_2d_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(
+    virtio_gpu_virgl_transfer_to_host_3d_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(
+    virtio_gpu_virgl_transfer_from_host_3d_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(virtio_gpu_virgl_submit_3d_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(virtio_gpu_virgl_resource_map_blob_handler)
+VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER(
+    virtio_gpu_virgl_resource_unmap_blob_handler)
+#undef VIRTIO_GPU_VIRGL_UNSUPPORTED_HANDLER
+static inline bool virtio_gpu_virgl_resource_id_exists(uint32_t resource_id)
+{
+    (void) resource_id;
+    return false;
+}
+static inline void virtio_gpu_virgl_discard_resource_unref(uint32_t resource_id)
+{
+    (void) resource_id;
+}
+static inline void virtio_gpu_virgl_invalidate_scanout(uint32_t scanout_id)
+{
+    (void) scanout_id;
+}
+static inline void virtio_gpu_virgl_apply_renderer_side_effect(
+    virtio_gpu_state_t *vgpu,
+    struct vgpu_renderer_completion *completion)
+{
+    (void) vgpu;
+    (void) completion;
+}
 #endif
-void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
-                                      struct virtq_desc *vq_desc,
-                                      uint32_t *plen);

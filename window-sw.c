@@ -1187,7 +1187,7 @@ static void window_main_loop_sw(void)
     }
 }
 
-static void window_init_sw(bool headless, uint32_t width, uint32_t height)
+static bool window_init_sw(bool headless, uint32_t width, uint32_t height)
 {
 #if SEMU_HAS(VIRGL)
     vgpu_renderer_set_wake_frontend(window_wake_backend_sw);
@@ -1198,7 +1198,7 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
 #if SEMU_HAS(VIRTIOGPU)
         vgpu_display_set_unavailable();
 #endif
-        return;
+        return false;
     }
 
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -1210,7 +1210,7 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
 #if SEMU_HAS(VIRTIOGPU)
         vgpu_display_set_unavailable();
 #endif
-        return;
+        return false;
     }
     sdl_initialized = true;
 #if SEMU_HAS(VIRGL)
@@ -1246,7 +1246,7 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
         SDL_Quit();
         sdl_initialized = false;
         vgpu_display_set_unavailable();
-        return;
+        return false;
     }
 
 #if SEMU_HAS(VIRGL)
@@ -1268,8 +1268,27 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
         SDL_Quit();
         sdl_initialized = false;
         vgpu_display_set_unavailable();
-        return;
+        return false;
     }
+    int virgl_ret = vgpu_virgl_init_renderer(scanout);
+    if (virgl_ret != 0) {
+        fprintf(stderr,
+                "window_init_sw(): failed to initialize virglrenderer "
+                "(ret=%d)\n"
+                "Running in headless mode.\n",
+                virgl_ret);
+        sdl_scanout_detach_gl_context();
+        SDL_GL_DeleteContext(scanout->gl_context);
+        scanout->gl_context = NULL;
+        SDL_DestroyWindow(scanout->window);
+        scanout->window = NULL;
+        headless_mode = true;
+        SDL_Quit();
+        sdl_initialized = false;
+        vgpu_display_set_unavailable();
+        return false;
+    }
+    sdl_scanout_detach_gl_context();
 #else
     scanout->renderer =
         SDL_CreateRenderer(scanout->window, -1, SDL_RENDERER_ACCELERATED);
@@ -1293,7 +1312,7 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
         SDL_Quit();
         sdl_initialized = false;
         vgpu_display_set_unavailable();
-        return;
+        return false;
     }
 #endif
 
@@ -1329,9 +1348,10 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
         headless_mode = true;
         SDL_Quit();
         sdl_initialized = false;
-        return;
+        return false;
     }
 #endif
+    return true;
 }
 
 static void window_cleanup_sw(void)

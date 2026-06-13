@@ -14,6 +14,7 @@ static pthread_cond_t vgpu_renderer_reset_cond = PTHREAD_COND_INITIALIZER;
 static bool vgpu_renderer_resetting;
 static bool vgpu_renderer_reset_owner_active;
 static pthread_t vgpu_renderer_reset_owner_thread;
+static bool vgpu_renderer_available;
 static uint64_t vgpu_renderer_active_generation;
 static void (*vgpu_renderer_wake_renderer)(void);
 static void (*vgpu_renderer_wake_frontend)(void);
@@ -131,7 +132,7 @@ bool vgpu_renderer_submit(const struct vgpu_renderer_request *request)
         return false;
 
     pthread_mutex_lock(&vgpu_renderer_lock);
-    if (vgpu_renderer_resetting ||
+    if (!vgpu_renderer_available || vgpu_renderer_resetting ||
         vgpu_renderer_ring_full(&vgpu_renderer_request_ring)) {
         debug_requests_dropped++;
         goto out;
@@ -160,7 +161,7 @@ bool vgpu_renderer_pop_request(struct vgpu_renderer_request *request)
         return false;
 
     pthread_mutex_lock(&vgpu_renderer_lock);
-    if (vgpu_renderer_resetting ||
+    if (!vgpu_renderer_available || vgpu_renderer_resetting ||
         vgpu_renderer_ring_empty(&vgpu_renderer_request_ring))
         goto out;
 
@@ -187,7 +188,7 @@ bool vgpu_renderer_complete(const struct vgpu_renderer_completion *completion)
         return false;
 
     pthread_mutex_lock(&vgpu_renderer_lock);
-    if (vgpu_renderer_resetting ||
+    if (!vgpu_renderer_available || vgpu_renderer_resetting ||
         completion->token.generation != vgpu_renderer_active_generation ||
         vgpu_renderer_ring_full(&vgpu_renderer_completion_ring)) {
         rejected = *completion;
@@ -221,7 +222,7 @@ bool vgpu_renderer_pop_completion(struct vgpu_renderer_completion *completion)
         return false;
 
     pthread_mutex_lock(&vgpu_renderer_lock);
-    if (vgpu_renderer_resetting ||
+    if (!vgpu_renderer_available || vgpu_renderer_resetting ||
         vgpu_renderer_ring_empty(&vgpu_renderer_completion_ring))
         goto out;
 
@@ -237,7 +238,7 @@ out:
     return popped;
 }
 
-void vgpu_renderer_reset_queues(uint64_t generation)
+static void vgpu_renderer_transition_queues(uint64_t generation, bool activate)
 {
     struct vgpu_renderer_request requests[VGPU_RENDERER_QUEUE_CAPACITY];
     struct vgpu_renderer_completion completions[VGPU_RENDERER_QUEUE_CAPACITY];
@@ -256,6 +257,8 @@ void vgpu_renderer_reset_queues(uint64_t generation)
     vgpu_renderer_reset_owner_active = true;
     vgpu_renderer_reset_owner_thread = self;
     vgpu_renderer_resetting = true;
+    if (!activate)
+        vgpu_renderer_available = false;
     vgpu_renderer_copy_and_clear_requests(requests, &request_count);
     vgpu_renderer_copy_and_clear_completions(completions, &completion_count);
     pthread_mutex_unlock(&vgpu_renderer_lock);
@@ -266,12 +269,30 @@ void vgpu_renderer_reset_queues(uint64_t generation)
         vgpu_renderer_release_completion(&completions[i]);
 
     pthread_mutex_lock(&vgpu_renderer_lock);
-    vgpu_renderer_active_generation = generation;
-    debug_queue_resets++;
+    if (activate) {
+        vgpu_renderer_active_generation = generation;
+        vgpu_renderer_available = true;
+        debug_queue_resets++;
+    }
     vgpu_renderer_resetting = false;
     vgpu_renderer_reset_owner_active = false;
     pthread_cond_broadcast(&vgpu_renderer_reset_cond);
     pthread_mutex_unlock(&vgpu_renderer_lock);
+}
+
+void vgpu_renderer_init_queues(uint64_t generation)
+{
+    vgpu_renderer_transition_queues(generation, true);
+}
+
+void vgpu_renderer_reset_queues(uint64_t generation)
+{
+    vgpu_renderer_transition_queues(generation, true);
+}
+
+void vgpu_renderer_shutdown_queues(void)
+{
+    vgpu_renderer_transition_queues(0, false);
 }
 
 void vgpu_renderer_debug_note_execute_begin(
@@ -314,6 +335,7 @@ void vgpu_renderer_debug_snapshot(struct vgpu_renderer_debug_stats *stats)
         .completion_head = vgpu_renderer_completion_ring.head,
         .completion_tail = vgpu_renderer_completion_ring.tail,
         .completion_depth = vgpu_renderer_completion_ring.count,
+        .available = vgpu_renderer_available,
         .resetting = vgpu_renderer_resetting,
         .requests_submitted = debug_requests_submitted,
         .requests_dropped = debug_requests_dropped,
