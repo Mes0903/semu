@@ -237,6 +237,7 @@ OBJS := \
 	hart-mailbox.o \
 	semu-event.o \
 	vm-lifecycle.o \
+	lock-order.o \
 	virtio-actor.o \
 	virtio-irq.o \
 	uart.o \

@@ -1,6 +1,7 @@
 #include "virtio-mmio.h"
 
 #include "device.h"
+#include "lock-order.h"
 #include "virtio.h"
 
 #include <errno.h>
@@ -78,12 +79,83 @@ static bool virtio_mmio_all_queues_ready(
     return true;
 }
 
-static bool virtio_mmio_accepting_device_work(
-    const struct virtio_device_common *common)
+struct virtio_mmio_lifecycle_gate {
+    bool locked;
+    struct semu_lock_order_guard order;
+};
+
+static int virtio_mmio_lock_notify_lifecycle_gate(
+    struct virtio_device_common *common,
+    struct virtio_mmio_lifecycle_gate *gate)
 {
+    int ret;
+
+    if (!gate)
+        return -EINVAL;
+    memset(gate, 0, sizeof(*gate));
     if (!common->emu)
+        return 0;
+
+    ret = semu_lock_order_mutex_lock(&common->emu->lifecycle.lock,
+                                     SEMU_LOCK_RANK_VM_LIFECYCLE, &gate->order);
+    if (ret < 0)
+        return ret;
+
+    gate->locked = true;
+    return 0;
+}
+
+static bool virtio_mmio_notify_lifecycle_accepting(
+    const struct virtio_device_common *common,
+    const struct virtio_mmio_lifecycle_gate *gate)
+{
+    if (!gate || !gate->locked)
         return true;
-    return semu_vm_accepting_device_work(&common->emu->lifecycle);
+
+    return common->emu->lifecycle.accepting_device_work;
+}
+
+static int virtio_mmio_unlock_notify_lifecycle_gate(
+    struct virtio_device_common *common,
+    struct virtio_mmio_lifecycle_gate *gate)
+{
+    int ret;
+
+    if (!gate || !gate->locked)
+        return 0;
+
+    ret = semu_lock_order_mutex_unlock(&common->emu->lifecycle.lock,
+                                       &gate->order);
+    if (ret == 0)
+        gate->locked = false;
+    return ret;
+}
+
+static int virtio_mmio_lock_transport(struct virtio_device_common *common,
+                                      bool track_order,
+                                      struct semu_lock_order_guard *order)
+{
+    int ret;
+
+    if (track_order)
+        return semu_lock_order_mutex_lock(
+            &common->transport_lock, SEMU_LOCK_RANK_DEVICE_TRANSPORT, order);
+
+    ret = pthread_mutex_lock(&common->transport_lock);
+    return ret == 0 ? 0 : -ret;
+}
+
+static int virtio_mmio_unlock_transport(struct virtio_device_common *common,
+                                        bool track_order,
+                                        struct semu_lock_order_guard *order)
+{
+    int ret;
+
+    if (track_order)
+        return semu_lock_order_mutex_unlock(&common->transport_lock, order);
+
+    ret = pthread_mutex_unlock(&common->transport_lock);
+    return ret == 0 ? 0 : -ret;
 }
 
 struct virtio_activation_request {
@@ -185,30 +257,113 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
                                        uint16_t queue_index,
                                        uint64_t generation)
 {
-    bool accepting;
-    bool still_current;
+    for (;;) {
+        struct virtio_mmio_lifecycle_gate lifecycle_gate = {0};
+        struct semu_lock_order_guard transport_order = {0};
+        struct semu_lock_order_guard backend_order = {0};
+        bool lifecycle_accepting;
+        bool still_current;
+        int ret;
+        int unlock_ret;
 
-    pthread_mutex_lock(&common->backend_lock);
-    pthread_mutex_lock(&common->transport_lock);
-    still_current = common->generation == generation &&
-                    queue_index < common->num_queues &&
-                    common->queues[queue_index].ready;
-    pthread_mutex_unlock(&common->transport_lock);
+        ret = virtio_mmio_lock_notify_lifecycle_gate(common, &lifecycle_gate);
+        if (ret < 0)
+            return ret;
 
-    if (!still_current) {
-        pthread_mutex_unlock(&common->backend_lock);
-        return -ECANCELED;
+        ret = semu_lock_order_mutex_lock(&common->transport_lock,
+                                         SEMU_LOCK_RANK_DEVICE_TRANSPORT,
+                                         &transport_order);
+        if (ret < 0) {
+            (void) virtio_mmio_unlock_notify_lifecycle_gate(common,
+                                                            &lifecycle_gate);
+            return ret;
+        }
+
+        still_current = common->generation == generation &&
+                        queue_index < common->num_queues &&
+                        common->queues[queue_index].ready;
+        lifecycle_accepting =
+            virtio_mmio_notify_lifecycle_accepting(common, &lifecycle_gate);
+        if (!still_current) {
+            unlock_ret = semu_lock_order_mutex_unlock(&common->transport_lock,
+                                                      &transport_order);
+            if (unlock_ret < 0) {
+                (void) virtio_mmio_unlock_notify_lifecycle_gate(
+                    common, &lifecycle_gate);
+                return unlock_ret;
+            }
+            unlock_ret = virtio_mmio_unlock_notify_lifecycle_gate(
+                common, &lifecycle_gate);
+            return unlock_ret < 0 ? unlock_ret : -ECANCELED;
+        }
+        if (!lifecycle_accepting) {
+            unlock_ret = semu_lock_order_mutex_unlock(&common->transport_lock,
+                                                      &transport_order);
+            if (unlock_ret < 0) {
+                (void) virtio_mmio_unlock_notify_lifecycle_gate(
+                    common, &lifecycle_gate);
+                return unlock_ret;
+            }
+            return virtio_mmio_unlock_notify_lifecycle_gate(common,
+                                                            &lifecycle_gate);
+        }
+
+        ret = semu_lock_order_mutex_trylock(&common->backend_lock,
+                                            SEMU_LOCK_RANK_BACKEND_LOCAL,
+                                            &backend_order);
+        if (ret == -EBUSY) {
+            unlock_ret = semu_lock_order_mutex_unlock(&common->transport_lock,
+                                                      &transport_order);
+            if (unlock_ret < 0) {
+                (void) virtio_mmio_unlock_notify_lifecycle_gate(
+                    common, &lifecycle_gate);
+                return unlock_ret;
+            }
+            unlock_ret = virtio_mmio_unlock_notify_lifecycle_gate(
+                common, &lifecycle_gate);
+            if (unlock_ret < 0)
+                return unlock_ret;
+            ret = semu_lock_order_mutex_lock(&common->backend_lock,
+                                             SEMU_LOCK_RANK_BACKEND_LOCAL,
+                                             &backend_order);
+            if (ret < 0)
+                return ret;
+            ret = semu_lock_order_mutex_unlock(&common->backend_lock,
+                                               &backend_order);
+            if (ret < 0)
+                return ret;
+            continue;
+        }
+        if (ret < 0) {
+            (void) semu_lock_order_mutex_unlock(&common->transport_lock,
+                                                &transport_order);
+            (void) virtio_mmio_unlock_notify_lifecycle_gate(common,
+                                                            &lifecycle_gate);
+            return ret;
+        }
+        ret =
+            semu_lock_order_mutex_unlock(&common->backend_lock, &backend_order);
+        if (ret < 0) {
+            (void) semu_lock_order_mutex_unlock(&common->transport_lock,
+                                                &transport_order);
+            (void) virtio_mmio_unlock_notify_lifecycle_gate(common,
+                                                            &lifecycle_gate);
+            return ret;
+        }
+
+        /* backend_lock is only a reset/activation barrier. Actor-backed
+         * notify_queue callbacks may take actor-local locks, so run the
+         * callback after releasing backend rank.
+         */
+        ops->notify_queue(opaque, queue_index, generation);
+
+        unlock_ret = semu_lock_order_mutex_unlock(&common->transport_lock,
+                                                  &transport_order);
+        ret = virtio_mmio_unlock_notify_lifecycle_gate(common, &lifecycle_gate);
+        if (unlock_ret < 0)
+            return unlock_ret;
+        return ret;
     }
-
-    accepting = virtio_mmio_accepting_device_work(common);
-    if (!accepting) {
-        pthread_mutex_unlock(&common->backend_lock);
-        return 0;
-    }
-
-    ops->notify_queue(opaque, queue_index, generation);
-    pthread_mutex_unlock(&common->backend_lock);
-    return 0;
 }
 
 static int virtio_mmio_set_status_locked(
@@ -552,6 +707,9 @@ int virtio_mmio_write(struct virtio_device_common *common,
     uint16_t notify_queue = 0;
     uint64_t notify_generation = 0;
     bool notify_after_unlock = false;
+    bool notify_write = byte_offset == VIRTIO_MMIO_REG(QueueNotify);
+    struct virtio_mmio_lifecycle_gate notify_lifecycle_gate = {0};
+    struct semu_lock_order_guard notify_transport_order = {0};
     int ret = 0;
 
     if (!common || !common->initialized)
@@ -576,8 +734,20 @@ int virtio_mmio_write(struct virtio_device_common *common,
         return -EINVAL;
     if (byte_offset == VIRTIO_MMIO_REG(Status) && value == 0)
         return virtio_device_common_reset(common);
+    if (notify_write) {
+        ret = virtio_mmio_lock_notify_lifecycle_gate(common,
+                                                     &notify_lifecycle_gate);
+        if (ret < 0)
+            return ret;
+    }
 
-    pthread_mutex_lock(&common->transport_lock);
+    ret = virtio_mmio_lock_transport(common, notify_write,
+                                     &notify_transport_order);
+    if (ret < 0) {
+        (void) virtio_mmio_unlock_notify_lifecycle_gate(common,
+                                                        &notify_lifecycle_gate);
+        return ret;
+    }
     cfg = virtio_mmio_selected_queue_cfg(common);
 
     switch (byte_offset) {
@@ -628,7 +798,8 @@ int virtio_mmio_write(struct virtio_device_common *common,
             ret = -EINVAL;
             break;
         }
-        if (!virtio_mmio_accepting_device_work(common))
+        if (!virtio_mmio_notify_lifecycle_accepting(common,
+                                                    &notify_lifecycle_gate))
             break;
         if (common->ops && common->ops->notify_queue) {
             notify_ops = common->ops;
@@ -700,7 +871,20 @@ int virtio_mmio_write(struct virtio_device_common *common,
         break;
     }
 
-    pthread_mutex_unlock(&common->transport_lock);
+    {
+        int unlock_ret = virtio_mmio_unlock_transport(common, notify_write,
+                                                      &notify_transport_order);
+
+        if (ret == 0 && unlock_ret < 0)
+            ret = unlock_ret;
+    }
+    {
+        int unlock_ret = virtio_mmio_unlock_notify_lifecycle_gate(
+            common, &notify_lifecycle_gate);
+
+        if (ret == 0 && unlock_ret < 0)
+            ret = unlock_ret;
+    }
     if (ret == 0 && activation_request.pending)
         ret = virtio_mmio_complete_activation(common, &activation_request);
     if (ret == 0 && notify_after_unlock)
