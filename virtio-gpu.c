@@ -3647,14 +3647,27 @@ void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
+    const struct virtq_desc *response_desc = virtio_gpu_get_response_desc(
+        vq_desc, sizeof(struct virtio_gpu_ctrl_hdr));
+    if (!response_desc) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
     fprintf(stderr,
             VIRTIO_GPU_LOG_PREFIX
             "%s(): unsupported VirtIO-GPU command type "
             "%u\n",
             __func__, header->type);
 
-    virtio_gpu_set_fail(vgpu);
-    *plen = 0;
+    /* Virtio-GPU has generic error responses but no dedicated unsupported
+     * command response. Use ERR_UNSPEC for a validly described unknown opcode.
+     */
+    *plen = virtio_gpu_write_ctrl_response(vgpu, header, response_desc,
+                                           VIRTIO_GPU_RESP_ERR_UNSPEC);
+    if (!*plen)
+        virtio_gpu_set_fail(vgpu);
 }
 
 static bool virtio_gpu_queue_available(virtio_gpu_state_t *vgpu,
@@ -3843,7 +3856,7 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
         VIRTIO_GPU_CMD_CASE(MOVE_CURSOR, move_cursor)
     default:
         virtio_gpu_cmd_undefined_handler(vgpu, vq_desc, plen);
-        return -1;
+        return *plen == 0 ? -1 : 0;
     }
 
     return 0;
