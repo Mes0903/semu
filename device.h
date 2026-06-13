@@ -664,6 +664,7 @@ typedef struct emu_state {
     rfence_request_t rfence;
 
     /* The fields used for debug mode */
+    atomic_bool debug_shutdown_requested;
     bool is_interrupted;
     int curr_cpuid;
 } emu_state_t;

@@ -264,12 +264,23 @@ BUILD_CONFIG_STAMP := $(STAMP_DIR)/build-config.stamp
 DTB_CONFIG_STAMP := $(STAMP_DIR)/dtb-config.stamp
 BUILD_CONFIG := CC=$(CC) $(strip $(CFLAGS))
 
-GDBSTUB_LIB := mini-gdbstub/build/libgdbstub.a
+GDBSTUB_PATCH := patches/mini-gdbstub-interruptible-shutdown.patch
+GDBSTUB_PATCHED_DIR := $(STAMP_DIR)/mini-gdbstub-patched
+GDBSTUB_PATCHED_STAMP := $(GDBSTUB_PATCHED_DIR)/.patched-stamp
+GDBSTUB_LIB := $(GDBSTUB_PATCHED_DIR)/build/libgdbstub.a
+GDBSTUB_SRCS := $(shell find mini-gdbstub/src mini-gdbstub/include -type f 2>/dev/null)
+CFLAGS += -I$(GDBSTUB_PATCHED_DIR)/include
 LDFLAGS += $(GDBSTUB_LIB)
 mini-gdbstub/Makefile:
 	git submodule update --init $(dir $@)
-$(GDBSTUB_LIB): mini-gdbstub/Makefile
-	$(MAKE) -C $(dir $<)
+$(GDBSTUB_PATCHED_STAMP): mini-gdbstub/Makefile $(GDBSTUB_SRCS) $(GDBSTUB_PATCH)
+	$(RM) -r $(GDBSTUB_PATCHED_DIR)
+	mkdir -p $(GDBSTUB_PATCHED_DIR)
+	cp -a mini-gdbstub/Makefile mini-gdbstub/include mini-gdbstub/src $(GDBSTUB_PATCHED_DIR)/
+	patch -d $(GDBSTUB_PATCHED_DIR) -p1 < $(abspath $(GDBSTUB_PATCH))
+	touch $@
+$(GDBSTUB_LIB): $(GDBSTUB_PATCHED_STAMP)
+	$(MAKE) -C $(GDBSTUB_PATCHED_DIR)
 $(OBJS): $(GDBSTUB_LIB)
 
 ifeq ($(call has, VIRTIONET), 1)
@@ -408,6 +419,7 @@ build-artifacts:
 clean:
 	$(Q)$(RM) $(BIN) $(OBJS) $(deps)
 	$(Q)$(RM) -r $(BUILDROOT_OUTPUT_DIRS)
+	$(Q)$(RM) -r $(GDBSTUB_PATCHED_DIR)
 	$(Q)if [ -f mini-gdbstub/Makefile ]; then \
 		$(MAKE) -C mini-gdbstub clean; \
 	fi

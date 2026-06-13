@@ -1,0 +1,344 @@
+diff --git a/include/conn.h b/include/conn.h
+index 4017d91..479b9ff 100644
+--- a/include/conn.h
++++ b/include/conn.h
+@@ -15,8 +15,18 @@ typedef struct {
+     pktbuf_t pktbuf;
+ } conn_t;
+ 
++typedef bool (*conn_should_abort_fn)(void *opaque);
++
+ bool conn_init(conn_t *conn, char *addr_str, int port);
++bool conn_init_interruptible(conn_t *conn,
++                             char *addr_str,
++                             int port,
++                             conn_should_abort_fn should_abort,
++                             void *opaque);
+ void conn_recv_packet(conn_t *conn);
++bool conn_recv_packet_interruptible(conn_t *conn,
++                                    conn_should_abort_fn should_abort,
++                                    void *opaque);
+ packet_t *conn_pop_packet(conn_t *conn);
+ bool conn_try_recv_intr(conn_t *conn);
+ void conn_send_str(conn_t *conn, char *str);
+diff --git a/include/gdbstub.h b/include/gdbstub.h
+index 655d3f9..83b8bc0 100644
+--- a/include/gdbstub.h
++++ b/include/gdbstub.h
+@@ -59,10 +59,18 @@ typedef struct {
+     gdbstub_private_t *priv;
+ } gdbstub_t;
+ 
++typedef bool (*gdbstub_should_shutdown_fn)(void *opaque);
++
+ bool gdbstub_init(gdbstub_t *gdbstub,
+                   struct target_ops *ops,
+                   arch_info_t arch,
+                   char *s);
++bool gdbstub_init_interruptible(gdbstub_t *gdbstub,
++                                struct target_ops *ops,
++                                arch_info_t arch,
++                                char *s,
++                                gdbstub_should_shutdown_fn should_shutdown,
++                                void *opaque);
+ bool gdbstub_run(gdbstub_t *gdbstub, void *args);
+ void gdbstub_close(gdbstub_t *gdbstub);
+ 
+diff --git a/src/conn.c b/src/conn.c
+index fbfe4ff..312df96 100644
+--- a/src/conn.c
++++ b/src/conn.c
+@@ -1,6 +1,7 @@
+ #include "conn.h"
+ #include <arpa/inet.h>
+ #include <assert.h>
++#include <errno.h>
+ #include <netinet/in.h>
+ #include <poll.h>
+ #include <stdio.h>
+@@ -11,14 +12,56 @@
+ #include "utils/csum.h"
+ #include "utils/log.h"
+ 
+-static bool socket_poll(int socket_fd, int timeout, int events)
++static bool conn_abort_requested(conn_should_abort_fn should_abort,
++                                 void *opaque)
+ {
+-    struct pollfd pfd = (struct pollfd){
+-        .fd = socket_fd,
+-        .events = events,
+-    };
++    return should_abort && should_abort(opaque);
++}
++
++static int socket_poll_interruptible(int socket_fd,
++                                     int timeout,
++                                     int events,
++                                     conn_should_abort_fn should_abort,
++                                     void *opaque)
++{
++    int waited = 0;
++
++    for (;;) {
++        struct pollfd pfd = (struct pollfd){
++            .fd = socket_fd,
++            .events = events,
++        };
++        int slice = timeout < 0 ? 100 : timeout - waited;
++
++        if (conn_abort_requested(should_abort, opaque)) {
++            errno = ECANCELED;
++            return -1;
++        }
++        if (timeout >= 0 && slice > 100)
++            slice = 100;
++
++        int ret = poll(&pfd, 1, slice);
++        if (ret < 0) {
++            if (errno == EINTR)
++                continue;
++            return -1;
++        }
++        if (ret > 0) {
++            short ready = events | POLLERR | POLLHUP | POLLNVAL;
++            return (pfd.revents & ready) ? 1 : 0;
++        }
++        if (timeout >= 0) {
++            waited += slice;
++            if (waited >= timeout)
++                return 0;
++        }
++    }
++}
+ 
+-    return (poll(&pfd, 1, timeout) > 0) && (pfd.revents & events);
++static bool socket_poll(int socket_fd, int timeout, int events)
++{
++    return socket_poll_interruptible(socket_fd, timeout, events, NULL, NULL) >
++           0;
+ }
+ 
+ static bool socket_readable(int socket_fd, int timeout)
+@@ -32,9 +75,20 @@ static bool socket_writable(int socket_fd, int timeout)
+ }
+ 
+ bool conn_init(conn_t *conn, char *addr_str, int port)
++{
++    return conn_init_interruptible(conn, addr_str, port, NULL, NULL);
++}
++
++bool conn_init_interruptible(conn_t *conn,
++                             char *addr_str,
++                             int port,
++                             conn_should_abort_fn should_abort,
++                             void *opaque)
+ {
+     if (!pktbuf_init(&conn->pktbuf))
+         return false;
++    conn->listen_fd = -1;
++    conn->socket_fd = -1;
+ 
+     struct in_addr addr_ip;
+     if (inet_aton(addr_str, &addr_ip) != 0) {
+@@ -44,7 +98,7 @@ bool conn_init(conn_t *conn, char *addr_str, int port)
+         addr.sin_port = htons(port);
+         conn->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+         if (conn->listen_fd < 0)
+-            return false;
++            goto fail;
+ 
+         int optval = 1;
+         if (setsockopt(conn->listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval,
+@@ -60,12 +114,13 @@ bool conn_init(conn_t *conn, char *addr_str, int port)
+         }
+     } else {
+         struct sockaddr_un addr;
++        memset(&addr, 0, sizeof(addr));
+         addr.sun_family = AF_UNIX;
+         strncpy(addr.sun_path, addr_str, sizeof(addr.sun_path) - 1);
+         unlink(addr_str);
+         conn->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+         if (conn->listen_fd < 0)
+-            return false;
++            goto fail;
+ 
+         if (bind(conn->listen_fd, (struct sockaddr *) &addr, sizeof(addr)) <
+             0) {
+@@ -79,29 +134,57 @@ bool conn_init(conn_t *conn, char *addr_str, int port)
+         goto fail;
+     }
+ 
+-    conn->socket_fd = accept(conn->listen_fd, NULL, NULL);
+-    if (conn->socket_fd < 0) {
+-        warn("Accept fail.\n");
+-        goto fail;
++    for (;;) {
++        int ready = socket_poll_interruptible(conn->listen_fd, -1, POLLIN,
++                                              should_abort, opaque);
++        if (ready < 0)
++            goto fail;
++        if (ready == 0)
++            continue;
++
++        conn->socket_fd = accept(conn->listen_fd, NULL, NULL);
++        if (conn->socket_fd >= 0)
++            break;
++        if (errno != EINTR) {
++            warn("Accept fail.\n");
++            goto fail;
++        }
+     }
+ 
+     return true;
+ 
+ fail:
+-    close(conn->listen_fd);
++    if (conn->socket_fd >= 0)
++        close(conn->socket_fd);
++    if (conn->listen_fd >= 0)
++        close(conn->listen_fd);
++    pktbuf_destroy(&conn->pktbuf);
++    conn->socket_fd = -1;
++    conn->listen_fd = -1;
+     return false;
+ }
+ 
+ void conn_recv_packet(conn_t *conn)
++{
++    (void) conn_recv_packet_interruptible(conn, NULL, NULL);
++}
++
++bool conn_recv_packet_interruptible(conn_t *conn,
++                                    conn_should_abort_fn should_abort,
++                                    void *opaque)
+ {
+     while (!pktbuf_is_complete(&conn->pktbuf) &&
+-           socket_readable(conn->socket_fd, -1)) {
++           socket_poll_interruptible(conn->socket_fd, -1, POLLIN,
++                                     should_abort, opaque) > 0) {
+         ssize_t nread = pktbuf_fill_from_file(&conn->pktbuf, conn->socket_fd);
+-        if (nread == -1)
+-            break;
++        if (nread <= 0)
++            return false;
+     }
++    if (!pktbuf_is_complete(&conn->pktbuf))
++        return false;
+ 
+     conn_send_str(conn, STR_ACK);
++    return true;
+ }
+ 
+ packet_t *conn_pop_packet(conn_t *conn)
+@@ -171,7 +254,11 @@ void conn_send_pktstr(conn_t *conn, char *pktstr)
+ 
+ void conn_close(conn_t *conn)
+ {
+-    close(conn->socket_fd);
+-    close(conn->listen_fd);
++    if (conn->socket_fd >= 0)
++        close(conn->socket_fd);
++    if (conn->listen_fd >= 0)
++        close(conn->listen_fd);
++    conn->socket_fd = -1;
++    conn->listen_fd = -1;
+     pktbuf_destroy(&conn->pktbuf);
+ }
+diff --git a/src/gdbstub.c b/src/gdbstub.c
+index d456180..3782271 100644
+--- a/src/gdbstub.c
++++ b/src/gdbstub.c
+@@ -18,6 +18,8 @@ struct gdbstub_private {
+     pthread_t tid;
+     bool async_io_enable;
+     void *args;
++    gdbstub_should_shutdown_fn should_shutdown;
++    void *shutdown_opaque;
+ };
+ 
+ static inline void async_io_enable(struct gdbstub_private *priv)
+@@ -77,8 +79,31 @@ bool gdbstub_init(gdbstub_t *gdbstub,
+                   struct target_ops *ops,
+                   arch_info_t arch,
+                   char *s)
++{
++    return gdbstub_init_interruptible(gdbstub, ops, arch, s, NULL, NULL);
++}
++
++static bool gdbstub_shutdown_requested(gdbstub_t *gdbstub)
++{
++    return gdbstub && gdbstub->priv && gdbstub->priv->should_shutdown &&
++           gdbstub->priv->should_shutdown(gdbstub->priv->shutdown_opaque);
++}
++
++static bool gdbstub_conn_should_abort(void *opaque)
++{
++    return gdbstub_shutdown_requested(opaque);
++}
++
++bool gdbstub_init_interruptible(gdbstub_t *gdbstub,
++                                struct target_ops *ops,
++                                arch_info_t arch,
++                                char *s,
++                                gdbstub_should_shutdown_fn should_shutdown,
++                                void *opaque)
+ {
+     char *addr_str = NULL;
++    char *port_str;
++    int port = 0;
+ 
+     if (s == NULL || ops == NULL)
+         return false;
+@@ -89,13 +114,14 @@ bool gdbstub_init(gdbstub_t *gdbstub,
+     gdbstub->priv = calloc(1, sizeof(struct gdbstub_private));
+     if (gdbstub->priv == NULL)
+         return false;
++    gdbstub->priv->should_shutdown = should_shutdown;
++    gdbstub->priv->shutdown_opaque = opaque;
+ 
+     // This is a naive implementation to parse the string
+     addr_str = strdup(s);
+-    char *port_str = strchr(addr_str, ':');
+-    int port = 0;
+     if (addr_str == NULL)
+         goto addr_fail;
++    port_str = strchr(addr_str, ':');
+ 
+     if (port_str != NULL) {
+         *port_str = '\0';
+@@ -108,7 +134,8 @@ bool gdbstub_init(gdbstub_t *gdbstub,
+     if (!regbuf_init(&gdbstub->priv->regbuf))
+         goto addr_fail;
+ 
+-    if (!conn_init(&gdbstub->priv->conn, addr_str, port))
++    if (!conn_init_interruptible(&gdbstub->priv->conn, addr_str, port,
++                                 gdbstub_conn_should_abort, gdbstub))
+         goto conn_fail;
+ 
+     free(addr_str);
+@@ -118,6 +145,8 @@ conn_fail:
+     regbuf_destroy(&gdbstub->priv->regbuf);
+ addr_fail:
+     free(addr_str);
++    free(gdbstub->priv);
++    gdbstub->priv = NULL;
+     return false;
+ }
+ 
+@@ -687,8 +716,15 @@ bool gdbstub_run(gdbstub_t *gdbstub, void *args)
+     }
+ 
+     while (true) {
+-        conn_recv_packet(&gdbstub->priv->conn);
++        if (gdbstub_shutdown_requested(gdbstub))
++            return true;
++        if (!conn_recv_packet_interruptible(&gdbstub->priv->conn,
++                                            gdbstub_conn_should_abort,
++                                            gdbstub))
++            return gdbstub_shutdown_requested(gdbstub);
+         packet_t *pkt = conn_pop_packet(&gdbstub->priv->conn);
++        if (!pkt)
++            return gdbstub_shutdown_requested(gdbstub);
+ #ifdef DEBUG
+         printf("packet = %s\n", pkt->data);
+ #endif
