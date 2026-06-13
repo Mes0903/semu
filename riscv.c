@@ -270,6 +270,18 @@ void vm_fence_i(hart_t *vm)
     icache_invalidate_all(vm);
 }
 
+static inline void vm_host_fence_rw(void)
+{
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+static inline void vm_host_fence_i(hart_t *vm)
+{
+    vm_host_fence_rw();
+    mmu_invalidate(vm);
+    vm_host_fence_rw();
+}
+
 /* virtual addressing */
 
 void mmu_invalidate(hart_t *vm)
@@ -778,7 +790,44 @@ static inline uint32_t lr_reservation_addr(uint32_t phys_addr)
     return phys_addr & ~3U;
 }
 
-static void lr_reservation_set(hart_t *hart, uint32_t phys_addr)
+static inline void lr_reservation_lock(vm_t *machine)
+{
+#if SEMU_HAS(THREADED)
+    if (machine)
+        pthread_mutex_lock(&machine->reservation_lock);
+#else
+    (void) machine;
+#endif
+}
+
+static inline void lr_reservation_unlock(vm_t *machine)
+{
+#if SEMU_HAS(THREADED)
+    if (machine)
+        pthread_mutex_unlock(&machine->reservation_lock);
+#else
+    (void) machine;
+#endif
+}
+
+static void lr_reservation_recompute_any_locked(vm_t *machine)
+{
+    bool any_active = false;
+
+    if (!machine->reservations) {
+        __atomic_store_n(&machine->any_reservation_active, false,
+                         __ATOMIC_RELAXED);
+        return;
+    }
+
+    for (uint32_t i = 0; i < machine->n_hart; i++)
+        any_active |= machine->reservations[i].valid;
+
+    __atomic_store_n(&machine->any_reservation_active, any_active,
+                     __ATOMIC_RELAXED);
+}
+
+static void lr_reservation_set_locked(hart_t *hart, uint32_t phys_addr)
 {
     vm_t *machine = hart->vm;
 
@@ -787,10 +836,10 @@ static void lr_reservation_set(hart_t *hart, uint32_t phys_addr)
 
     machine->reservations[hart->mhartid].addr = lr_reservation_addr(phys_addr);
     machine->reservations[hart->mhartid].valid = true;
-    machine->any_reservation_active = true;
+    __atomic_store_n(&machine->any_reservation_active, true, __ATOMIC_RELAXED);
 }
 
-static bool lr_reservation_matches(hart_t *hart, uint32_t phys_addr)
+static bool lr_reservation_matches_locked(hart_t *hart, uint32_t phys_addr)
 {
     vm_t *machine = hart->vm;
 
@@ -801,23 +850,31 @@ static bool lr_reservation_matches(hart_t *hart, uint32_t phys_addr)
     return entry->valid && entry->addr == lr_reservation_addr(phys_addr);
 }
 
-static void lr_reservation_invalidate(hart_t *hart, uint32_t phys_addr)
+static void lr_reservation_clear_locked(hart_t *hart)
 {
     vm_t *machine = hart->vm;
-    bool any_active = false;
+
+    if (!machine->reservations)
+        return;
+
+    machine->reservations[hart->mhartid].valid = false;
+    lr_reservation_recompute_any_locked(machine);
+}
+
+static void lr_reservation_invalidate_locked(vm_t *machine, uint32_t phys_addr)
+{
     uint32_t addr = lr_reservation_addr(phys_addr);
 
-    if (!machine->any_reservation_active || !machine->reservations)
+    if (!machine->reservations)
         return;
 
     for (uint32_t i = 0; i < machine->n_hart; i++) {
         reservation_entry_t *entry = &machine->reservations[i];
         if (entry->valid && entry->addr == addr)
             entry->valid = false;
-        any_active |= entry->valid;
     }
 
-    machine->any_reservation_active = any_active;
+    lr_reservation_recompute_any_locked(machine);
 }
 
 static void mmu_load(hart_t *vm,
@@ -905,25 +962,31 @@ static void mmu_load(hart_t *vm,
                            : set->ways[1 - set->lru].data_minus_addr;
     }
 
-    if (likely(host_addr)) {
-        ram_read_host_fast(vm, host_addr, width, value);
-        if (vm->error)
+    bool reservation_locked = false;
+    if (unlikely(reserved)) {
+        if (unlikely(!vm->ram_base || phys_addr >= vm->ram_size)) {
+            vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
             return;
-    } else {
-        uint32_t *page_ptr = ram_cache_lookup(vm, phys_addr, false);
-        if (likely(page_ptr != NULL)) {
-            ram_read_fast(vm, page_ptr, phys_addr, width, value);
-            if (vm->error)
-                return;
-        } else {
-            vm->mem_load(vm, phys_addr, width, value);
-            if (vm->error)
-                return;
         }
+        lr_reservation_lock(vm->vm);
+        reservation_locked = true;
     }
 
-    if (unlikely(reserved))
-        lr_reservation_set(vm, phys_addr);
+    if (likely(host_addr)) {
+        ram_read_host_fast(vm, host_addr, width, value);
+    } else {
+        uint32_t *page_ptr = ram_cache_lookup(vm, phys_addr, false);
+        if (likely(page_ptr != NULL))
+            ram_read_fast(vm, page_ptr, phys_addr, width, value);
+        else
+            vm->mem_load(vm, phys_addr, width, value);
+    }
+
+    if (!vm->error && unlikely(reserved))
+        lr_reservation_set_locked(vm, phys_addr);
+
+    if (reservation_locked)
+        lr_reservation_unlock(vm->vm);
 }
 
 static bool mmu_store(hart_t *vm,
@@ -1010,24 +1073,29 @@ static bool mmu_store(hart_t *vm,
     }
 
 do_store:
-    if (unlikely(cond) && !lr_reservation_matches(vm, phys_addr))
-        return false;
+    lr_reservation_lock(vm->vm);
 
-    lr_reservation_invalidate(vm, phys_addr);
+    if (unlikely(cond) && !lr_reservation_matches_locked(vm, phys_addr)) {
+        lr_reservation_clear_locked(vm);
+        lr_reservation_unlock(vm->vm);
+        return false;
+    }
 
     if (likely(host_addr)) {
         ram_write_host_fast(vm, host_addr, width, value);
-        return true;
+    } else {
+        uint32_t *page_ptr = ram_cache_lookup(vm, phys_addr, true);
+        if (likely(page_ptr != NULL))
+            ram_write_fast(vm, page_ptr, phys_addr, width, value);
+        else
+            vm->mem_store(vm, phys_addr, width, value);
     }
 
-    uint32_t *page_ptr = ram_cache_lookup(vm, phys_addr, true);
-    if (likely(page_ptr != NULL)) {
-        ram_write_fast(vm, page_ptr, phys_addr, width, value);
-        return true;
-    }
+    if (!vm->error)
+        lr_reservation_invalidate_locked(vm->vm, phys_addr);
 
-    vm->mem_store(vm, phys_addr, width, value);
-    return true;
+    lr_reservation_unlock(vm->vm);
+    return !vm->error;
 }
 
 /* exceptions, traps, interrupts */
@@ -1436,25 +1504,91 @@ static void op_jump_link(hart_t *vm, uint8_t rd, uint32_t addr)
     }
 }
 
-#define AMO_OP(STORED_EXPR)                            \
-    do {                                               \
-        value2 = vm->x_regs[decoded_rs2(decoded)];     \
-        mmu_load(vm, addr, RV_MEM_LW, &value, false);  \
-        if (vm->error)                                 \
-            return;                                    \
-        uint32_t stored = (STORED_EXPR);               \
-        mmu_store(vm, addr, RV_MEM_SW, stored, false); \
-        if (vm->error)                                 \
-            return;                                    \
-        set_dest_idx(vm, decoded_rd(decoded), value);  \
-    } while (0)
+static bool amo_translate_ram_w(hart_t *vm,
+                                uint32_t addr,
+                                uint32_t *phys_addr_out,
+                                uint32_t **cell_out)
+{
+    uint32_t phys_addr = addr;
+
+    if (unlikely(addr & 0b11)) {
+        vm_set_exception(vm, RV_EXC_STORE_MISALIGN, addr);
+        return false;
+    }
+
+    mmu_translate(vm, &phys_addr, (1 << 1) | (1 << 2), (1 << 6) | (1 << 7),
+                  vm->sstatus_sum && vm->s_mode, RV_EXC_STORE_FAULT,
+                  RV_EXC_STORE_PFAULT);
+    if (vm->error)
+        return false;
+
+    if (unlikely(!vm->ram_base || phys_addr >= vm->ram_size)) {
+        vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
+        return false;
+    }
+
+    *phys_addr_out = phys_addr;
+    *cell_out = &vm->ram_base[phys_addr >> 2];
+    return true;
+}
+
+static uint32_t amo_fetch_minmax_w(uint32_t *cell,
+                                   uint32_t rhs,
+                                   bool signed_compare,
+                                   bool take_max)
+{
+    uint32_t old = __atomic_load_n(cell, __ATOMIC_SEQ_CST);
+
+    for (;;) {
+        bool take_rhs;
+        if (signed_compare) {
+            int32_t lhs_s = (int32_t) old;
+            int32_t rhs_s = (int32_t) rhs;
+            take_rhs = take_max ? rhs_s > lhs_s : rhs_s < lhs_s;
+        } else {
+            take_rhs = take_max ? rhs > old : rhs < old;
+        }
+
+        uint32_t desired = take_rhs ? rhs : old;
+        if (__atomic_compare_exchange_n(cell, &old, desired, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return old;
+    }
+}
+
+static uint32_t amo_execute_ram_w(uint32_t *cell, uint32_t rhs, uint8_t funct5)
+{
+    switch (funct5) {
+    case 0b00001: /* AMOSWAP */
+        return __atomic_exchange_n(cell, rhs, __ATOMIC_SEQ_CST);
+    case 0b00000: /* AMOADD */
+        return __atomic_fetch_add(cell, rhs, __ATOMIC_SEQ_CST);
+    case 0b00100: /* AMOXOR */
+        return __atomic_fetch_xor(cell, rhs, __ATOMIC_SEQ_CST);
+    case 0b01100: /* AMOAND */
+        return __atomic_fetch_and(cell, rhs, __ATOMIC_SEQ_CST);
+    case 0b01000: /* AMOOR */
+        return __atomic_fetch_or(cell, rhs, __ATOMIC_SEQ_CST);
+    case 0b10000: /* AMOMIN */
+        return amo_fetch_minmax_w(cell, rhs, true, false);
+    case 0b10100: /* AMOMAX */
+        return amo_fetch_minmax_w(cell, rhs, true, true);
+    case 0b11000: /* AMOMINU */
+        return amo_fetch_minmax_w(cell, rhs, false, false);
+    case 0b11100: /* AMOMAXU */
+        return amo_fetch_minmax_w(cell, rhs, false, true);
+    default:
+        return 0;
+    }
+}
 
 static void op_amo(hart_t *vm, const decoded_insn_t *decoded)
 {
     if (unlikely(decoded_funct3(decoded) != 0b010 /* amo.w */))
         return vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
+
     uint32_t addr = vm->x_regs[decoded_rs1(decoded)];
-    uint32_t value, value2;
+    uint32_t value;
     switch (decoded_funct5(decoded)) {
     case 0b00010: /* AMO_LR */
         if (addr & 0b11)
@@ -1475,39 +1609,34 @@ static void op_amo(hart_t *vm, const decoded_insn_t *decoded)
             return;
         set_dest_idx(vm, decoded_rd(decoded), ok ? 0 : 1);
         break;
+    case 0b00001:   /* AMOSWAP */
+    case 0b00000:   /* AMOADD */
+    case 0b00100:   /* AMOXOR */
+    case 0b01100:   /* AMOAND */
+    case 0b01000:   /* AMOOR */
+    case 0b10000:   /* AMOMIN */
+    case 0b10100:   /* AMOMAX */
+    case 0b11000:   /* AMOMINU */
+    case 0b11100: { /* AMOMAXU */
+        uint32_t phys_addr;
+        uint32_t *cell;
+        if (!amo_translate_ram_w(vm, addr, &phys_addr, &cell))
+            return;
 
-    case 0b00001: /* AMOSWAP */
-        AMO_OP(value2);
+        lr_reservation_lock(vm->vm);
+        value = amo_execute_ram_w(cell, vm->x_regs[decoded_rs2(decoded)],
+                                  decoded_funct5(decoded));
+        lr_reservation_invalidate_locked(vm->vm, phys_addr);
+        lr_reservation_unlock(vm->vm);
+        set_dest_idx(vm, decoded_rd(decoded), value);
         break;
-    case 0b00000: /* AMOADD */
-        AMO_OP(value + value2);
-        break;
-    case 0b00100: /* AMOXOR */
-        AMO_OP(value ^ value2);
-        break;
-    case 0b01100: /* AMOAND */
-        AMO_OP(value & value2);
-        break;
-    case 0b01000: /* AMOOR */
-        AMO_OP(value | value2);
-        break;
-    case 0b10000: /* AMOMIN */
-        AMO_OP(((int32_t) value) < ((int32_t) value2) ? value : value2);
-        break;
-    case 0b10100: /* AMOMAX */
-        AMO_OP(((int32_t) value) > ((int32_t) value2) ? value : value2);
-        break;
-    case 0b11000: /* AMOMINU */
-        AMO_OP(value < value2 ? value : value2);
-        break;
-    case 0b11100: /* AMOMAXU */
-        AMO_OP(value > value2 ? value : value2);
-        break;
+    }
     default:
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
         return;
     }
 }
+
 
 void vm_init(hart_t *vm)
 {
@@ -1605,8 +1734,10 @@ static inline bool vm_execute_insn(hart_t *vm, uint32_t insn)
     case RV32_MISC_MEM:
         switch (decode_func3(insn)) {
         case 0b000: /* MM_FENCE */
+            vm_host_fence_rw();
+            break;
         case 0b001: /* MM_FENCE_I */
-                    /* TODO: implement for multi-threading */
+            vm_host_fence_i(vm);
             break;
         default:
             vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
@@ -1933,10 +2064,10 @@ L_store:
 L_misc_mem:
     switch (decode_func3(insn)) {
     case 0b000: /* MM_FENCE */
-        /* nop for single-hart */
+        vm_host_fence_rw();
         break;
     case 0b001: /* MM_FENCE_I */
-        vm_fence_i(vm);
+        vm_host_fence_i(vm);
         break;
     default:
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);

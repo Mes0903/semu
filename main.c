@@ -1365,7 +1365,13 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
                 vm->n_hart);
         return 1;
     }
+    __atomic_store_n(&vm->any_reservation_active, false, __ATOMIC_RELAXED);
 #if SEMU_HAS(THREADED)
+    if (pthread_mutex_init(&vm->reservation_lock, NULL)) {
+        perror("reservation lock init");
+        return 1;
+    }
+
     emu->hart_wait = calloc(vm->n_hart, sizeof(*emu->hart_wait));
     emu->hart_threads = calloc(vm->n_hart, sizeof(*emu->hart_threads));
     if (!emu->hart_wait || !emu->hart_threads) {

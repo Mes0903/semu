@@ -1,5 +1,6 @@
 #pragma once
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -198,8 +199,9 @@ typedef struct {
 struct __vm_internel {
     uint32_t n_hart;
     hart_t **hart;
+    pthread_mutex_t reservation_lock;
     reservation_entry_t *reservations;
-    bool any_reservation_active;
+    _Atomic bool any_reservation_active;
 };
 
 static inline uint32_t hart_sip_load(const hart_t *hart)
