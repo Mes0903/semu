@@ -238,6 +238,7 @@ OBJS := \
 	semu-event.o \
 	vm-lifecycle.o \
 	virtio-actor.o \
+	virtio-irq.o \
 	uart.o \
 	main.o \
 	aclint.o \
