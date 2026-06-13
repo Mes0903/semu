@@ -2219,11 +2219,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #endif
 
 #if SEMU_HAS(VIRTIOINPUT)
-    emu->vkeyboard.ram = emu->ram;
-    virtio_input_init(&(emu->vkeyboard));
+    virtio_input_init(&(emu->vkeyboard), emu, SEMU_IRQ_SOURCE_VINPUT_KEYBOARD);
 
-    emu->vmouse.ram = emu->ram;
-    virtio_input_init(&(emu->vmouse));
+    virtio_input_init(&(emu->vmouse), emu, SEMU_IRQ_SOURCE_VINPUT_MOUSE);
 #endif
 
 #if SEMU_HAS(VIRTIOGPU)

@@ -240,6 +240,8 @@ OBJS := \
 	lock-order.o \
 	virtio-actor.o \
 	virtio-irq.o \
+	virtq.o \
+	virtio-mmio.o \
 	uart.o \
 	main.o \
 	aclint.o \

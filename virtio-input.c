@@ -13,12 +13,13 @@
 #include "utils.h"
 #include "virtio-input-codes.h"
 #include "virtio-input-event.h"
+#include "virtio-mmio.h"
 #include "virtio.h"
 
 /* Threading invariant: every function in this file that reads or writes
- * guest-visible virtio-input state (descriptors, virtqueues, Status,
- * InterruptStatus, the per-device config union) runs exclusively on the
- * emulator thread.
+ * guest-visible virtio-input backend state (host event queues and the
+ * per-device config union) runs exclusively on the emulator thread. Common
+ * VirtIO transport, virtqueue, and IRQ state are owned by virtio-mmio/virtq.
  *
  * The SDL/main thread produces host input through the SPSC queue in
  * virtio-input-event.c; the emulator thread consumes that queue in
@@ -27,7 +28,7 @@
  * mem_load()/mem_store(), which is also the emulator thread.
  *
  * The only cross-thread touch point is virtio_input_irq_pending(), which reads
- * InterruptStatus from the PLIC polling path on the same emulator thread.
+ * the common VirtIO ISR bits from the PLIC polling path.
  *
  * No vinput-internal mutex is required as long as this invariant holds. If a
  * future change reintroduces SDL-thread writes into virtio-input device state,
@@ -43,11 +44,9 @@
 
 #define VINPUT_SERIAL "None"
 
-#define VIRTIO_INPUT_FEATURES_0 0
-#define VIRTIO_INPUT_FEATURES_1 1 /* VIRTIO_F_VERSION_1 */
+#define VIRTIO_INPUT_F_VERSION_1 (UINT64_C(1) << 32)
 
 #define VIRTIO_INPUT_QUEUE_NUM_MAX 1024
-#define VIRTIO_INPUT_QUEUE (vinput->queues[vinput->QueueSel])
 
 #define PRIV(x) ((struct vinput_data *) (x)->priv)
 
@@ -134,11 +133,18 @@ static inline unsigned long vinput_bitmap_get_size(const uint8_t *bitmap,
     return max_bytes;
 }
 
+static inline unsigned virtio_input_status_load(virtio_input_state_t *vinput)
+{
+    return atomic_load_explicit(&vinput->common.status, memory_order_acquire);
+}
+
 static inline void virtio_input_set_fail(virtio_input_state_t *vinput)
 {
-    vinput->Status |= VIRTIO_STATUS__DEVICE_NEEDS_RESET;
-    if (vinput->Status & VIRTIO_STATUS__DRIVER_OK)
-        vinput->InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
+    unsigned status = virtio_input_status_load(vinput);
+
+    virtio_device_common_set_needs_reset(&vinput->common);
+    if (status & VIRTIO_STATUS__DRIVER_OK)
+        virtio_irq_trigger(&vinput->common.irq, VIRTIO_INT__CONF_CHANGE);
 }
 
 static inline bool virtio_input_is_config_access(uint32_t addr,
@@ -148,22 +154,72 @@ static inline bool virtio_input_is_config_access(uint32_t addr,
     const uint32_t end = base + (uint32_t) sizeof(struct virtio_input_config);
 
     /* [base, end) */
-    if (access_size == 0)
+    if (access_size == 0 || addr < base || addr >= end)
         return false;
-    if (addr < base)
+    return access_size <= end - addr;
+}
+
+static bool virtio_input_queue_available(virtio_input_state_t *vinput,
+                                         const struct virtq *queue,
+                                         uint16_t *available)
+{
+    uint16_t avail_idx;
+    uint16_t delta;
+
+    if (!queue || !queue->ready || !available)
         return false;
-    if (addr + access_size > end)
+
+    if (!ram_dma_read(vinput->common.dma, queue->driver_addr + 2, &avail_idx,
+                      sizeof(avail_idx))) {
+        virtio_input_set_fail(vinput);
         return false;
+    }
+
+    delta = (uint16_t) (avail_idx - queue->last_avail);
+    if (delta > queue->queue_size) {
+        virtio_input_set_fail(vinput);
+        return false;
+    }
+
+    *available = delta;
     return true;
 }
 
-static inline uint32_t virtio_input_preprocess(virtio_input_state_t *vinput,
-                                               uint32_t addr)
+static guest_size_t virtio_input_iov_bytes(const struct virtq_iov *iov,
+                                           size_t count)
 {
-    if ((addr >= RAM_SIZE) || (addr & 0b11))
-        return virtio_input_set_fail(vinput), 0;
+    guest_size_t total = 0;
 
-    return addr >> 2;
+    for (size_t i = 0; i < count; i++)
+        total += iov[i].len;
+    return total;
+}
+
+static bool virtio_input_write_event_to_chain(
+    virtio_input_state_t *vinput,
+    const struct virtq_chain *chain,
+    const struct virtio_input_event *event)
+{
+    const uint8_t *src = (const uint8_t *) event;
+    guest_size_t remaining = sizeof(*event);
+    guest_size_t offset = 0;
+
+    if (virtio_input_iov_bytes(chain->writable, chain->writable_count) <
+        sizeof(*event))
+        return false;
+
+    for (size_t i = 0; i < chain->writable_count && remaining != 0; i++) {
+        guest_size_t chunk =
+            MIN((guest_size_t) chain->writable[i].len, remaining);
+
+        if (!ram_dma_write(vinput->common.dma, chain->writable[i].addr,
+                           src + offset, chunk))
+            return false;
+        offset += chunk;
+        remaining -= chunk;
+    }
+
+    return remaining == 0;
 }
 
 /* Consume all pending buffers from the status queue and return them to the
@@ -174,164 +230,105 @@ static inline uint32_t virtio_input_preprocess(virtio_input_state_t *vinput,
  */
 static void virtio_input_drain_statusq(virtio_input_state_t *vinput)
 {
-    virtio_input_queue_t *queue = &vinput->queues[VIRTIO_INPUT_STATUSQ];
-    uint32_t *ram = vinput->ram;
-
-    if (!(vinput->Status & VIRTIO_STATUS__DRIVER_OK) || !queue->ready)
-        return;
-
-    uint16_t new_avail = ram_load_high16_acquire(&ram[queue->QueueAvail]);
-    uint16_t avail_delta = (uint16_t) (new_avail - queue->last_avail);
-    uint16_t new_used = ram_load_high16(&ram[queue->QueueUsed]);
+    struct virtq *queue = &vinput->common.queues[VIRTIO_INPUT_STATUSQ];
+    struct virtq_iov readable[VIRTIO_INPUT_QUEUE_NUM_MAX];
+    struct virtq_iov writable[VIRTIO_INPUT_QUEUE_NUM_MAX];
     bool consumed = false;
 
-    if (avail_delta > (uint16_t) queue->QueueNum) {
-        virtio_input_set_fail(vinput);
+    if (!(virtio_input_status_load(vinput) & VIRTIO_STATUS__DRIVER_OK) ||
+        !queue->ready)
         return;
-    }
 
-    const uint32_t event_size = (uint32_t) sizeof(struct virtio_input_event);
+    for (;;) {
+        struct virtq_chain chain = {
+            .readable = readable,
+            .readable_capacity = ARRAY_SIZE(readable),
+            .writable = writable,
+            .writable_capacity = ARRAY_SIZE(writable),
+        };
+        uint16_t available;
+        int ret;
 
-    while (queue->last_avail != new_avail) {
-        uint16_t queue_idx = queue->last_avail % queue->QueueNum;
-        uint16_t buffer_idx =
-            ram_load_w_acquire(&ram[queue->QueueAvail + 1 + queue_idx / 2]) >>
-            (16 * (queue_idx % 2));
+        if (!virtio_input_queue_available(vinput, queue, &available))
+            return;
+        if (available == 0)
+            break;
 
-        if (buffer_idx >= queue->QueueNum) {
+        ret = virtq_pop(vinput->common.dma, queue, &chain);
+        if (ret < 0) {
+            virtio_input_set_fail(vinput);
+            return;
+        }
+        if (ret == 0)
+            break;
+
+        if (chain.writable_count != 0 || chain.readable_count == 0 ||
+            virtio_input_iov_bytes(chain.readable, chain.readable_count) <
+                sizeof(struct virtio_input_event)) {
             virtio_input_set_fail(vinput);
             return;
         }
 
-        uint32_t *desc = &ram[queue->QueueDesc + buffer_idx * 4];
-        uint32_t desc_addr = desc[0];
-        uint32_t desc_addr_high = desc[1];
-        uint32_t desc_len = desc[2];
-        uint16_t desc_flags = desc[3] & 0xFFFF;
-
-        if (desc_addr_high != 0 || (desc_flags & VIRTIO_DESC_F_WRITE) ||
-            desc_len < event_size || desc_addr > RAM_SIZE - event_size) {
+        if (virtq_add_used(vinput->common.dma, queue, chain.head, 0) < 0) {
             virtio_input_set_fail(vinput);
             return;
         }
-
-        /* Device is read-only on this queue, so no bytes are written into
-         * the device-writable portion of the buffer. used.len must be 0.
-         */
-        uint32_t vq_used_addr =
-            queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2;
-        ram_store_w(&ram[vq_used_addr], buffer_idx);
-        ram_store_w(&ram[vq_used_addr + 1], 0);
-        new_used++;
-        queue->last_avail++;
         consumed = true;
     }
 
-    if (consumed) {
-        ram_store_high16_release(&ram[queue->QueueUsed], new_used);
-        if (!(ram_load_w_acquire(&ram[queue->QueueAvail]) & 1))
-            vinput->InterruptStatus |= VIRTIO_INT__USED_RING;
-    }
-}
-
-static void virtio_input_update_status(virtio_input_state_t *vinput,
-                                       uint32_t status)
-{
-    vinput->Status |= status;
-    if (status)
-        return;
-
-    /* Reset */
-    uint32_t *ram = vinput->ram;
-    void *priv = vinput->priv;
-    int dev_id = PRIV(vinput)->type;
-    vinput_reset_host_events(dev_id);
-    memset(vinput, 0, sizeof(*vinput));
-    vinput->ram = ram;
-    vinput->priv = priv;
+    if (consumed && !virtq_interrupt_suppressed(vinput->common.dma, queue))
+        virtio_irq_trigger(&vinput->common.irq, VIRTIO_INT__USED_RING);
 }
 
 /* Returns true if any events were written to used ring, false otherwise */
 static bool virtio_input_desc_handler(virtio_input_state_t *vinput,
                                       struct virtio_input_event *input_ev,
                                       uint32_t ev_cnt,
-                                      virtio_input_queue_t *queue)
+                                      struct virtq *queue)
 {
-    uint32_t *desc;
-    struct virtq_desc vq_desc;
-    struct virtio_input_event *ev;
+    struct virtq_iov readable[VIRTIO_INPUT_QUEUE_NUM_MAX];
+    struct virtq_iov writable[VIRTIO_INPUT_QUEUE_NUM_MAX];
+    uint16_t available;
+    bool wrote_events = false;
 
-    uint32_t *ram = vinput->ram;
-    uint16_t new_avail = ram_load_high16_acquire(
-        &ram[queue->QueueAvail]); /* virtq_avail.idx (le16) */
-    uint16_t new_used =
-        ram_load_high16(&ram[queue->QueueUsed]); /* virtq_used.idx (le16) */
+    if (!virtio_input_queue_available(vinput, queue, &available))
+        return false;
 
-    /* For checking if the event buffer has enough space to write */
-    uint32_t end = queue->last_avail + ev_cnt;
-    uint32_t flattened_avail_idx = new_avail;
-
-    /* Handle if the available index has overflowed and returned to the
-     * beginning
-     */
-    if (new_avail < queue->last_avail)
-        flattened_avail_idx += (1U << 16);
-
-    /* Check if need to wait until the driver supplies new buffers */
-    if (flattened_avail_idx < end)
+    /* Preserve the old all-or-drop behavior for grouped input events. */
+    if (available < ev_cnt)
         return false;
 
     for (uint32_t i = 0; i < ev_cnt; i++) {
-        /* Obtain the available ring index */
-        uint16_t queue_idx = queue->last_avail % queue->QueueNum;
-        uint16_t buffer_idx =
-            ram_load_w_acquire(&ram[queue->QueueAvail + 1 + queue_idx / 2]) >>
-            (16 * (queue_idx % 2));
+        struct virtq_chain chain = {
+            .readable = readable,
+            .readable_capacity = ARRAY_SIZE(readable),
+            .writable = writable,
+            .writable_capacity = ARRAY_SIZE(writable),
+        };
+        int ret = virtq_pop(vinput->common.dma, queue, &chain);
 
-        if (buffer_idx >= queue->QueueNum) {
+        if (ret < 0) {
+            virtio_input_set_fail(vinput);
+            return false;
+        }
+        if (ret == 0)
+            return wrote_events;
+
+        if (chain.readable_count != 0 || chain.writable_count == 0 ||
+            !virtio_input_write_event_to_chain(vinput, &chain, &input_ev[i])) {
             virtio_input_set_fail(vinput);
             return false;
         }
 
-        desc = &ram[queue->QueueDesc + buffer_idx * 4];
-        vq_desc.addr = desc[0];
-        uint32_t addr_high = desc[1];
-        vq_desc.len = desc[2];
-        vq_desc.flags = desc[3] & 0xFFFF;
-
-        /* Validate descriptor: 32-bit addressing only, WRITE flag set,
-         * buffer large enough, and address within RAM bounds. Compare the
-         * start address against the last valid event-sized window in RAM so
-         * guest-controlled addr cannot wrap past UINT32_MAX during validation.
-         */
-        const uint32_t event_size =
-            (uint32_t) sizeof(struct virtio_input_event);
-        if (addr_high != 0 || !(vq_desc.flags & VIRTIO_DESC_F_WRITE) ||
-            vq_desc.len < event_size || vq_desc.addr > RAM_SIZE - event_size) {
+        if (virtq_add_used(vinput->common.dma, queue, chain.head,
+                           sizeof(struct virtio_input_event)) < 0) {
             virtio_input_set_fail(vinput);
             return false;
         }
-
-        /* Write event into guest buffer directly */
-        ev = (struct virtio_input_event *) ((uintptr_t) ram + vq_desc.addr);
-        ev->type = input_ev[i].type;
-        ev->code = input_ev[i].code;
-        ev->value = input_ev[i].value;
-
-        /* Update used ring */
-        uint32_t vq_used_addr =
-            queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2;
-        ram_store_w(&ram[vq_used_addr], buffer_idx);
-        ram_store_w(&ram[vq_used_addr + 1], sizeof(struct virtio_input_event));
-
-        new_used++;
-        queue->last_avail++;
+        wrote_events = true;
     }
 
-    /* Update used ring header */
-    ram_store_high16_release(&ram[queue->QueueUsed], new_used);
-
-    return true;
+    return wrote_events;
 }
 
 static void virtio_input_update_eventq(int dev_id,
@@ -339,49 +336,32 @@ static void virtio_input_update_eventq(int dev_id,
                                        uint32_t ev_cnt)
 {
     virtio_input_state_t *vinput = vinput_dev[dev_id].vinput;
+    struct virtq *queue;
+    unsigned status;
+    bool wrote_events;
+
     if (!vinput)
         return;
 
-    int index = VIRTIO_INPUT_EVENTQ;
+    queue = &vinput->common.queues[VIRTIO_INPUT_EVENTQ];
+    status = virtio_input_status_load(vinput);
 
-    uint32_t *ram = vinput->ram;
-    virtio_input_queue_t *queue = &vinput->queues[index];
-
-    /* Check device status */
-    if (vinput->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
+    if (status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
         return;
 
-    if (!((vinput->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready))
+    if (!(status & VIRTIO_STATUS__DRIVER_OK) || !queue->ready)
         return;
 
-    /* Check for new buffers */
-    uint16_t new_avail = ram_load_high16_acquire(&ram[queue->QueueAvail]);
-    uint16_t avail_delta = (uint16_t) (new_avail - queue->last_avail);
-    if (avail_delta > (uint16_t) queue->QueueNum) {
-        fprintf(stderr, "%s(): size check failed\n", __func__);
-        virtio_input_set_fail(vinput);
-        return;
-    }
+    wrote_events = virtio_input_desc_handler(vinput, input_ev, ev_cnt, queue);
 
-    /* No buffers available - drop event or handle later */
-    if (queue->last_avail == new_avail) {
 #if SEMU_INPUT_DEBUG
+    if (!wrote_events)
         fprintf(stderr, VINPUT_DEBUG_PREFIX "drop dev=%d (no guest buffers)\n",
                 dev_id);
 #endif
-        /* TODO: Consider buffering events instead of dropping them */
-        return;
-    }
 
-    /* Try to write events to used ring */
-    bool wrote_events =
-        virtio_input_desc_handler(vinput, input_ev, ev_cnt, queue);
-
-    /* Send interrupt only if we actually wrote events, unless
-     * VIRTQ_AVAIL_F_NO_INTERRUPT is set
-     */
-    if (wrote_events && !(ram_load_w_acquire(&ram[queue->QueueAvail]) & 1))
-        vinput->InterruptStatus |= VIRTIO_INT__USED_RING;
+    if (wrote_events && !virtq_interrupt_suppressed(vinput->common.dma, queue))
+        virtio_irq_trigger(&vinput->common.irq, VIRTIO_INT__USED_RING);
 }
 
 static void virtio_input_update_key(uint32_t key, uint32_t ev_value)
@@ -651,180 +631,99 @@ static void virtio_input_cfg_read(int dev_id)
     }
 }
 
-static bool virtio_input_reg_read(virtio_input_state_t *vinput,
-                                  uint32_t addr,
-                                  uint32_t *value,
-                                  size_t size)
+static bool virtio_input_config_range_valid(uint32_t offset, uint32_t size)
 {
-#define _(reg) (VIRTIO_##reg << 2)
-    switch (addr) {
-    case _(MagicValue):
-        *value = 0x74726976;
-        return true;
-    case _(Version):
-        *value = 2;
-        return true;
-    case _(DeviceID):
-        *value = 18;
-        return true;
-    case _(VendorID):
-        *value = VIRTIO_VENDOR_ID;
-        return true;
-    case _(DeviceFeatures):
-        *value = vinput->DeviceFeaturesSel == 0
-                     ? VIRTIO_INPUT_FEATURES_0
-                     : (vinput->DeviceFeaturesSel == 1 ? VIRTIO_INPUT_FEATURES_1
-                                                       : 0);
-        return true;
-    case _(QueueNumMax):
-        *value = VIRTIO_INPUT_QUEUE_NUM_MAX;
-        return true;
-    case _(QueueReady):
-        *value = VIRTIO_INPUT_QUEUE.ready ? 1 : 0;
-        return true;
-    case _(InterruptStatus):
-        *value = vinput->InterruptStatus;
-        return true;
-    case _(Status):
-        *value = vinput->Status;
-        return true;
-    case _(ConfigGeneration):
-        *value = 0;
-        return true;
-    case VIRTIO_INPUT_REG_SIZE:
-        virtio_input_cfg_read(PRIV(vinput)->type);
-        *value = PRIV(vinput)->cfg.size;
-        return true;
-    default:
-        /* Invalid address which exceeded the range */
-        if (!RANGE_CHECK(addr, _(Config), sizeof(struct virtio_input_config)))
-            return false;
-
-        /* Read virtio-input specific registers */
-        uint32_t offset = addr - VIRTIO_INPUT_REG_SELECT;
-        uint8_t *reg = (uint8_t *) ((uintptr_t) &PRIV(vinput)->cfg + offset);
-
-        /* Clear value first to avoid returning dirty high bits on partial reads
-         */
-        *value = 0;
-        memcpy(value, reg, size);
-
-        return true;
-    }
-#undef _
+    return size != 0 && offset < sizeof(struct virtio_input_config) &&
+           size <= sizeof(struct virtio_input_config) - offset;
 }
 
-static bool virtio_input_reg_write(virtio_input_state_t *vinput,
-                                   uint32_t addr,
-                                   uint32_t value)
+static bool virtio_input_range_overlaps(uint32_t offset,
+                                        uint32_t size,
+                                        uint32_t field_offset,
+                                        uint32_t field_size)
 {
-#define _(reg) (VIRTIO_##reg << 2)
-    switch (addr) {
-    case _(DeviceFeaturesSel):
-        vinput->DeviceFeaturesSel = value;
-        return true;
-    case _(DriverFeatures):
-        if (vinput->DriverFeaturesSel == 0)
-            vinput->DriverFeatures = value;
-        return true;
-    case _(DriverFeaturesSel):
-        vinput->DriverFeaturesSel = value;
-        return true;
-    case _(QueueSel):
-        if (value < ARRAY_SIZE(vinput->queues))
-            vinput->QueueSel = value;
-        else
-            virtio_input_set_fail(vinput);
-        return true;
-    case _(QueueNum):
-        if (value > 0 && value <= VIRTIO_INPUT_QUEUE_NUM_MAX)
-            VIRTIO_INPUT_QUEUE.QueueNum = value;
-        else
-            virtio_input_set_fail(vinput);
-        return true;
-    case _(QueueReady):
-        VIRTIO_INPUT_QUEUE.ready = value & 1;
-        if (VIRTIO_INPUT_QUEUE.ready) {
-            uint32_t qnum = VIRTIO_INPUT_QUEUE.QueueNum;
-            uint32_t ram_words = RAM_SIZE / 4;
+    return offset < field_offset + field_size && field_offset < offset + size;
+}
 
-            /* Validate that the entire avail ring, desc table, and used ring
-             * fit within guest RAM. virtio_input_preprocess() only checks the
-             * base address of each ring — without this check a guest could
-             * place a ring near the end of RAM and cause out-of-bounds host
-             * accesses when the ring entries are subsequently dereferenced.
-             *
-             * Max words accessed per ring:
-             *   avail: QueueAvail + 1 + (qnum-1)/2
-             *   desc:  QueueDesc  + qnum*4 - 1
-             *   used:  QueueUsed  + qnum*2      (vq_used_addr+1)
-             */
-            if (qnum == 0 ||
-                VIRTIO_INPUT_QUEUE.QueueAvail + 1 + (qnum - 1) / 2 >=
-                    ram_words ||
-                VIRTIO_INPUT_QUEUE.QueueDesc + qnum * 4 > ram_words ||
-                VIRTIO_INPUT_QUEUE.QueueUsed + qnum * 2 >= ram_words) {
-                virtio_input_set_fail(vinput);
-                return true;
-            }
+static uint32_t virtio_input_read_config(void *opaque,
+                                         uint32_t offset,
+                                         uint32_t size)
+{
+    virtio_input_state_t *vinput = opaque;
+    struct virtio_input_config *cfg = &PRIV(vinput)->cfg;
+    uint32_t value = 0;
 
-            VIRTIO_INPUT_QUEUE.last_avail = ram_load_high16_acquire(
-                &vinput->ram[VIRTIO_INPUT_QUEUE.QueueAvail]);
-        }
+    if (!virtio_input_config_range_valid(offset, size))
+        return 0;
+
+    if (virtio_input_range_overlaps(offset, size,
+                                    offsetof(struct virtio_input_config, size),
+                                    sizeof(cfg->size)))
+        virtio_input_cfg_read(PRIV(vinput)->type);
+
+    memcpy(&value, (uint8_t *) cfg + offset, size);
+    return value;
+}
+
+static void virtio_input_write_config(void *opaque,
+                                      uint32_t offset,
+                                      uint32_t size,
+                                      uint32_t value)
+{
+    virtio_input_state_t *vinput = opaque;
+    uint8_t *dst = (uint8_t *) &PRIV(vinput)->cfg;
+    uint8_t *src = (uint8_t *) &value;
+
+    if (!virtio_input_config_range_valid(offset, size))
+        return;
+
+    for (uint32_t i = 0; i < size; i++)
+        dst[offset + i] = src[i];
+}
+
+static bool virtio_input_load_width_bytes(uint8_t width, size_t *access_size)
+{
+    switch (width) {
+    case RV_MEM_LW:
+        *access_size = 4;
         return true;
-    case _(QueueDescLow):
-        VIRTIO_INPUT_QUEUE.QueueDesc = virtio_input_preprocess(vinput, value);
+    case RV_MEM_LBU:
+    case RV_MEM_LB:
+        *access_size = 1;
         return true;
-    case _(QueueDescHigh):
-        if (value)
-            virtio_input_set_fail(vinput);
-        return true;
-    case _(QueueDriverLow):
-        VIRTIO_INPUT_QUEUE.QueueAvail = virtio_input_preprocess(vinput, value);
-        return true;
-    case _(QueueDriverHigh):
-        if (value)
-            virtio_input_set_fail(vinput);
-        return true;
-    case _(QueueDeviceLow):
-        VIRTIO_INPUT_QUEUE.QueueUsed = virtio_input_preprocess(vinput, value);
-        return true;
-    case _(QueueDeviceHigh):
-        if (value)
-            virtio_input_set_fail(vinput);
-        return true;
-    case _(QueueNotify):
-        if (value >= ARRAY_SIZE(vinput->queues)) {
-            virtio_input_set_fail(vinput);
-            return true;
-        }
-        /* EVENTQ: actual buffer availability is checked lazily in
-         * virtio_input_update_eventq() when the next event arrives.
-         * STATUSQ: drain LED-state buffers from the guest immediately so
-         * the driver's status queue never runs out of available entries.
-         */
-        if (value == VIRTIO_INPUT_STATUSQ)
-            virtio_input_drain_statusq(vinput);
-        return true;
-    case _(InterruptACK):
-        vinput->InterruptStatus &= ~value;
-        return true;
-    case _(Status):
-        virtio_input_update_status(vinput, value);
-        return true;
-    case _(SHMSel):
-        return true;
-    case VIRTIO_INPUT_REG_SELECT:
-        PRIV(vinput)->cfg.select = value;
-        return true;
-    case VIRTIO_INPUT_REG_SUBSEL:
-        PRIV(vinput)->cfg.subsel = value;
+    case RV_MEM_LHU:
+    case RV_MEM_LH:
+        *access_size = 2;
         return true;
     default:
-        /* No other writable registers */
         return false;
     }
-#undef _
+}
+
+static bool virtio_input_store_width_bytes(uint8_t width, size_t *access_size)
+{
+    switch (width) {
+    case RV_MEM_SW:
+        *access_size = 4;
+        return true;
+    case RV_MEM_SB:
+        *access_size = 1;
+        return true;
+    case RV_MEM_SH:
+        *access_size = 2;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool virtio_input_config_write_allowed(uint32_t addr, size_t size)
+{
+    uint32_t offset = addr - (VIRTIO_Config << 2);
+
+    return virtio_input_config_range_valid(offset, (uint32_t) size) &&
+           offset < offsetof(struct virtio_input_config, subsel) + 1 &&
+           size <= offsetof(struct virtio_input_config, subsel) + 1 - offset;
 }
 
 void virtio_input_read(hart_t *vm,
@@ -834,45 +733,32 @@ void virtio_input_read(hart_t *vm,
                        uint32_t *value)
 {
     size_t access_size = 0;
-    bool is_cfg = false;
+    bool is_cfg;
+    int ret;
 
-    switch (width) {
-    case RV_MEM_LW:
-        access_size = 4;
-        break;
-    case RV_MEM_LBU:
-    case RV_MEM_LB:
-        access_size = 1;
-        break;
-    case RV_MEM_LHU:
-    case RV_MEM_LH:
-        access_size = 2;
-        break;
-    default:
+    if (!virtio_input_load_width_bytes(width, &access_size)) {
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
         return;
     }
 
     is_cfg = virtio_input_is_config_access(addr, access_size);
+    if (addr >= (VIRTIO_Config << 2) && !is_cfg) {
+        vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
+        return;
+    }
 
-    /*
-     * Common registers (before Config): only allow aligned 32-bit LW.
-     * Device-specific config (Config and after): allow 8/16/32-bit with
-     * natural alignment.
-     */
     if (!is_cfg) {
         if (access_size != 4 || (addr & 0x3)) {
             vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
             return;
         }
-    } else {
-        if (addr & (access_size - 1)) {
-            vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
-            return;
-        }
+    } else if (addr & (access_size - 1)) {
+        vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
+        return;
     }
 
-    if (!virtio_input_reg_read(vinput, addr, value, access_size))
+    ret = virtio_mmio_read(&vinput->common, addr, (uint8_t) access_size, value);
+    if (ret < 0)
         vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
 }
 
@@ -883,31 +769,20 @@ void virtio_input_write(hart_t *vm,
                         uint32_t value)
 {
     size_t access_size = 0;
-    bool is_cfg = false;
+    bool is_cfg;
+    int ret;
 
-    switch (width) {
-    case RV_MEM_SW:
-        access_size = 4;
-        break;
-    case RV_MEM_SB:
-        access_size = 1;
-        break;
-    case RV_MEM_SH:
-        access_size = 2;
-        break;
-    default:
+    if (!virtio_input_store_width_bytes(width, &access_size)) {
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
         return;
     }
 
     is_cfg = virtio_input_is_config_access(addr, access_size);
+    if (addr >= (VIRTIO_Config << 2) && !is_cfg) {
+        vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
+        return;
+    }
 
-    /*
-     * Common registers (before Config): only allow aligned 32-bit SW.
-     * Device-specific config (Config and after): allow 8/16/32-bit with
-     * natural alignment. Note: only select/subsel are writable — others
-     * will return false and be reported as STORE_FAULT below.
-     */
     if (!is_cfg) {
         if (access_size != 4 || (addr & 0x3)) {
             vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
@@ -918,23 +793,74 @@ void virtio_input_write(hart_t *vm,
             vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
             return;
         }
+        if (!virtio_input_config_write_allowed(addr, access_size)) {
+            vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
+            return;
+        }
     }
 
-    if (!virtio_input_reg_write(vinput, addr, value))
+    ret =
+        virtio_mmio_write(&vinput->common, addr, (uint8_t) access_size, value);
+    if (ret < 0)
         vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
 }
 
 bool virtio_input_irq_pending(virtio_input_state_t *vinput)
 {
-    /* Called from the emulator thread after draining queued window events; see
-     * the threading invariant at the top of this file.
-     */
-    return vinput->InterruptStatus != 0;
+    return virtio_irq_read_status(&vinput->common.irq) != 0;
 }
 
-void virtio_input_init(virtio_input_state_t *vinput)
+static int virtio_input_activate(void *opaque,
+                                 const struct virtio_activation_context *ctx)
 {
+    (void) opaque;
+    (void) ctx;
+    return 0;
+}
+
+static int virtio_input_reset(void *opaque,
+                              uint64_t old_generation,
+                              uint64_t new_generation)
+{
+    virtio_input_state_t *vinput = opaque;
+    (void) old_generation;
+    (void) new_generation;
+
+    vinput_reset_host_events(PRIV(vinput)->type);
+    return 0;
+}
+
+static void virtio_input_notify_queue(void *opaque,
+                                      uint16_t queue_index,
+                                      uint64_t generation)
+{
+    virtio_input_state_t *vinput = opaque;
+    (void) generation;
+
+    if (queue_index == VIRTIO_INPUT_STATUSQ)
+        virtio_input_drain_statusq(vinput);
+}
+
+static const struct virtio_device_ops virtio_input_ops = {
+    .activate = virtio_input_activate,
+    .reset = virtio_input_reset,
+    .notify_queue = virtio_input_notify_queue,
+    .read_config = virtio_input_read_config,
+    .write_config = virtio_input_write_config,
+};
+
+void virtio_input_init(virtio_input_state_t *vinput,
+                       emu_state_t *emu,
+                       enum semu_irq_source irq_source)
+{
+    static const uint16_t queue_max_sizes[] = {
+        [VIRTIO_INPUT_EVENTQ] = VIRTIO_INPUT_QUEUE_NUM_MAX,
+        [VIRTIO_INPUT_STATUSQ] = VIRTIO_INPUT_QUEUE_NUM_MAX,
+    };
     static int vinput_dev_cnt = 0;
+    int dev_id;
+    struct virtio_device_common_config config;
+
     if (vinput_dev_cnt >= VINPUT_DEV_CNT) {
         fprintf(stderr,
                 "Exceeded the number of virtio-input devices that can be "
@@ -942,8 +868,31 @@ void virtio_input_init(virtio_input_state_t *vinput)
         exit(2);
     }
 
-    vinput->priv = &vinput_dev[vinput_dev_cnt];
-    PRIV(vinput)->type = vinput_dev_cnt;
+    dev_id = vinput_dev_cnt;
+    memset(vinput, 0, sizeof(*vinput));
+    vinput->ram = emu->ram;
+    vinput->priv = &vinput_dev[dev_id];
+    PRIV(vinput)->type = dev_id;
     PRIV(vinput)->vinput = vinput;
+
+    config = (struct virtio_device_common_config) {
+        .emu = emu,
+        .dma = &emu->ram_dma,
+        .irq_source = irq_source,
+        .device_id = 18,
+        .vendor_id = VIRTIO_VENDOR_ID,
+        .device_features = VIRTIO_INPUT_F_VERSION_1,
+        .required_features = VIRTIO_INPUT_F_VERSION_1,
+        .queue_max_sizes = queue_max_sizes,
+        .num_queues = ARRAY_SIZE(queue_max_sizes),
+        .ops = &virtio_input_ops,
+        .opaque = vinput,
+    };
+
+    if (virtio_device_common_init(&vinput->common, &config) < 0) {
+        fprintf(stderr, "Failed to initialize virtio-input common device.\n");
+        exit(2);
+    }
+
     vinput_dev_cnt++;
 }

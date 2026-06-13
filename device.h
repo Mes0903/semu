@@ -8,6 +8,7 @@
 #include "mmio-bus.h"
 #include "ram_access.h"
 #include "riscv.h"
+#include "virtio-device.h"
 #include "virtio.h"
 #include "vm-lifecycle.h"
 
@@ -249,25 +250,7 @@ void virtio_rng_init(void);
 #define IRQ_VINPUT_MOUSE_BIT (1 << IRQ_VINPUT_MOUSE)
 
 typedef struct {
-    uint32_t QueueNum;
-    uint32_t QueueDesc;
-    uint32_t QueueAvail;
-    uint32_t QueueUsed;
-    uint16_t last_avail;
-    bool ready;
-} virtio_input_queue_t;
-
-typedef struct {
-    /* feature negotiation */
-    uint32_t DeviceFeaturesSel;
-    uint32_t DriverFeatures;
-    uint32_t DriverFeaturesSel;
-    /* queue config */
-    uint32_t QueueSel;
-    virtio_input_queue_t queues[2];
-    /* status */
-    uint32_t Status;
-    uint32_t InterruptStatus;
+    struct virtio_device_common common;
     /* supplied by environment */
     uint32_t *ram;
     /* implementation-specific */
@@ -286,7 +269,9 @@ void virtio_input_write(hart_t *vm,
                         uint8_t width,
                         uint32_t value);
 
-void virtio_input_init(virtio_input_state_t *vinput);
+void virtio_input_init(virtio_input_state_t *vinput,
+                       emu_state_t *emu,
+                       enum semu_irq_source irq_source);
 
 /* Drain translated host window events and update guest-visible virtio-input
  * device state. Must be called from the emulator thread.
