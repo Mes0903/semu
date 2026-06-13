@@ -39,9 +39,9 @@ static const struct semu_executor_virtio_host_io_policy
         {
             .device_name = "virtio-rng",
             .build_enabled = SEMU_HAS(VIRTIORNG),
-            .actor_mode_allowed = false,
-            .actor_mode_policy = "actor required before target threaded mode; "
-                                 "do not block vCPU on /dev/random",
+            .actor_mode_allowed = true,
+            .actor_mode_policy = "actor-backed; QueueNotify wakes actor, "
+                                 "entropy read runs outside vCPU",
         },
         {
             .device_name = "virtio-blk",

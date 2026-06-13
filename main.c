@@ -378,14 +378,51 @@ static void semu_pause_ack_parked_targets(emu_state_t *emu,
     pthread_mutex_unlock(&emu->lifecycle.lock);
 }
 
+static bool semu_try_resume_suspended_hart(emu_state_t *emu,
+                                           hart_t *hart,
+                                           uint32_t hartid)
+{
+    bool resumed = false;
+
+    if (hart_hsm_status_load(hart) != SBI_HSM_STATE_SUSPENDED)
+        return false;
+    if (pthread_mutex_trylock(&emu->lifecycle.lock) != 0)
+        return false;
+
+    if (!semu_lifecycle_pause_active(emu->lifecycle.state)) {
+        int32_t expected = SBI_HSM_STATE_SUSPENDED;
+        resumed = hart_hsm_status_compare_exchange(hart, &expected,
+                                                   SBI_HSM_STATE_STARTED);
+    }
+    pthread_mutex_unlock(&emu->lifecycle.lock);
+
+    if (resumed)
+        semu_signal_hart(emu, hartid);
+    return resumed;
+}
+
 static void semu_wake_hart_if_interrupt_pending(emu_state_t *emu,
                                                 uint32_t hartid)
 {
+    hart_t *hart;
+
     if (hartid >= emu->vm.n_hart)
         return;
 
-    if (semu_hart_has_enabled_interrupt(emu->vm.hart[hartid]))
-        semu_resume_hart(emu, hartid);
+    hart = emu->vm.hart[hartid];
+    if (!hart || !semu_hart_has_enabled_interrupt(hart))
+        return;
+
+    /* Device IRQ injection may already hold lifecycle-gated transport locks.
+     * Started harts only need the wait condition signaled, so avoid taking the
+     * lifecycle lock on that path.
+     */
+    if (hart_hsm_status_load(hart) == SBI_HSM_STATE_STARTED) {
+        semu_signal_hart(emu, hartid);
+        return;
+    }
+
+    (void) semu_try_resume_suspended_hart(emu, hart, hartid);
 }
 
 void semu_wake_interruptible_harts(emu_state_t *emu)
@@ -693,7 +730,8 @@ static void UNUSED emu_update_vrng_interrupts(vm_t *vm)
     emu_state_t *data = PRIV(vm->hart[0]);
     bool pending;
 
-    EMU_DEVICE_CALL(data->vrng_lock, pending = data->vrng.InterruptStatus != 0);
+    EMU_DEVICE_CALL(data->vrng_lock,
+                    pending = virtio_rng_irq_pending(&data->vrng));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VRNG, pending);
 }
 #endif
@@ -810,7 +848,8 @@ static void io_poll_peripherals(emu_state_t *emu)
 #endif
 
 #if SEMU_HAS(VIRTIORNG)
-    EMU_DEVICE_CALL(emu->vrng_lock, pending = emu->vrng.InterruptStatus != 0);
+    EMU_DEVICE_CALL(emu->vrng_lock,
+                    pending = virtio_rng_irq_pending(&emu->vrng));
     emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VRNG, pending);
 #endif
 
@@ -1190,13 +1229,10 @@ static bool semu_mmio_vrng_write(hart_t *hart,
                                  uint32_t value)
 {
     emu_state_t *data = opaque;
-    bool pending;
 
     EMU_DEVICE_CALL(
         data->vrng_lock,
-        virtio_rng_write(hart, &data->vrng, (uint32_t) off, width, value);
-        pending = data->vrng.InterruptStatus != 0);
-    emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VRNG, pending);
+        virtio_rng_write(hart, &data->vrng, (uint32_t) off, width, value));
     return true;
 }
 #endif
@@ -2377,8 +2413,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     emu->disk = virtio_blk_init(&(emu->vblk), disk_file);
 #endif
 #if SEMU_HAS(VIRTIORNG)
-    emu->vrng.ram = emu->ram;
-    virtio_rng_init();
+    virtio_rng_init(&emu->vrng, emu);
 #endif
     /* Set up ACLINT */
     semu_timer_init(&emu->mtimer.mtime, CLOCK_FREQ, hart_count);
@@ -2423,6 +2458,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             virtio_gpu_destroy(&emu->vgpu);
             vgpu_display_shutdown_after_producer_stopped();
 #endif
+#if SEMU_HAS(VIRTIORNG)
+            virtio_rng_destroy(&emu->vrng);
+#endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
         }
@@ -2443,6 +2481,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #if SEMU_HAS(VIRTIOGPU)
             virtio_gpu_destroy(&emu->vgpu);
             vgpu_display_shutdown_after_producer_stopped();
+#endif
+#if SEMU_HAS(VIRTIORNG)
+            virtio_rng_destroy(&emu->vrng);
 #endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
@@ -3365,6 +3406,9 @@ int main(int argc, char **argv)
             virtio_gpu_destroy(&emu.vgpu);
             vgpu_display_shutdown_after_producer_stopped();
 #endif
+#if SEMU_HAS(VIRTIORNG)
+            virtio_rng_destroy(&emu.vrng);
+#endif
             g_window.window_cleanup();
             return 1;
         }
@@ -3399,6 +3443,10 @@ int main(int argc, char **argv)
     vgpu_display_shutdown_after_producer_stopped();
 #endif
     g_window.window_cleanup();
+#endif
+
+#if SEMU_HAS(VIRTIORNG)
+    virtio_rng_destroy(&emu.vrng);
 #endif
 
 #ifdef MMU_CACHE_STATS

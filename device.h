@@ -207,25 +207,9 @@ uint32_t *virtio_blk_init(virtio_blk_state_t *vblk, char *disk_file);
 #define IRQ_VRNG_BIT (1 << IRQ_VRNG)
 
 typedef struct {
-    uint32_t QueueNum;
-    uint32_t QueueDesc;
-    uint32_t QueueAvail;
-    uint32_t QueueUsed;
-    uint16_t last_avail;
-    bool ready;
-} virtio_rng_queue_t;
-
-typedef struct {
-    /* feature negotiation */
-    uint32_t DeviceFeaturesSel;
-    uint32_t DriverFeatures;
-    uint32_t DriverFeaturesSel;
-    /* queue config */
-    uint32_t QueueSel;
-    virtio_rng_queue_t queues[1];
-    /* status */
-    uint32_t Status;
-    uint32_t InterruptStatus;
+    struct virtio_device_common common;
+    struct virtio_actor actor;
+    bool actor_initialized;
     /* supplied by environment */
     uint32_t *ram;
 } virtio_rng_state_t;
@@ -242,7 +226,9 @@ void virtio_rng_write(hart_t *vm,
                       uint8_t width,
                       uint32_t value);
 
-void virtio_rng_init(void);
+bool virtio_rng_irq_pending(virtio_rng_state_t *vrng);
+void virtio_rng_init(virtio_rng_state_t *vrng, emu_state_t *emu);
+void virtio_rng_destroy(virtio_rng_state_t *vrng);
 #endif /* SEMU_HAS(VIRTIORNG) */
 
 /* VirtIO Input */
