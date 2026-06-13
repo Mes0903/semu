@@ -556,6 +556,14 @@ int virtio_actor_fail(struct virtio_actor *actor)
     ret = virtio_actor_broadcast_unlock(actor);
     if (ret < 0)
         return ret;
+
+    /* Wake waiters before publishing device-visible failure, and run the
+     * callback outside actor->lock so device/common locks cannot invert with
+     * it.
+     */
+    if (actor->ops && actor->ops->on_failed)
+        actor->ops->on_failed(actor->opaque, actor);
+
     return virtio_actor_wake(actor);
 }
 

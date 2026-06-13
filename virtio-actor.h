@@ -33,6 +33,7 @@ struct virtio_actor_ops {
                            struct virtio_actor *actor,
                            uint16_t queue_index,
                            uint64_t generation);
+    void (*on_failed)(void *opaque, struct virtio_actor *actor);
 };
 
 struct virtio_actor {
