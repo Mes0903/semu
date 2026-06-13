@@ -1,3 +1,4 @@
+#include "ram_access.h"
 #include "riscv.h"
 #include "riscv_private.h"
 
@@ -22,20 +23,22 @@ void ram_read(hart_t *vm,
     const uint32_t exc_cause = RV_EXC_LOAD_MISALIGN;
     switch (width) {
     case RV_MEM_LW:
-        RAM_FUNC(4, *value = *cell);
+        RAM_FUNC(4, *value = ram_load_w(cell));
         break;
     case RV_MEM_LHU:
-        RAM_FUNC(2, *value = (uint32_t) (uint16_t) ((*cell) >> offset));
+        RAM_FUNC(2,
+                 *value = (uint32_t) (uint16_t) (ram_load_w(cell) >> offset));
         break;
     case RV_MEM_LH:
-        RAM_FUNC(2,
-                 *value = (uint32_t) (int32_t) (int16_t) ((*cell) >> offset));
+        RAM_FUNC(2, *value = (uint32_t) (int32_t) (int16_t) (ram_load_w(cell) >>
+                                                             offset));
         break;
     case RV_MEM_LBU:
-        RAM_FUNC(1, *value = (uint32_t) (uint8_t) ((*cell) >> offset));
+        RAM_FUNC(1, *value = (uint32_t) (uint8_t) (ram_load_w(cell) >> offset));
         break;
     case RV_MEM_LB:
-        RAM_FUNC(1, *value = (uint32_t) (int32_t) (int8_t) ((*cell) >> offset));
+        RAM_FUNC(1, *value = (uint32_t) (int32_t) (int8_t) (ram_load_w(cell) >>
+                                                            offset));
         break;
     default:
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
@@ -52,15 +55,15 @@ void ram_write(hart_t *vm,
     const uint32_t exc_cause = RV_EXC_STORE_MISALIGN;
     switch (width) {
     case RV_MEM_SW:
-        RAM_FUNC(4, *cell = value);
+        RAM_FUNC(4, ram_store_w(cell, value));
         break;
     case RV_MEM_SH:
-        RAM_FUNC(2, *cell = ((*cell) & ~(MASK(16) << offset)) |
-                            (value & MASK(16)) << offset);
+        RAM_FUNC(2, ram_store_subword(cell, MASK(16) << offset,
+                                      (value & MASK(16)) << offset));
         break;
     case RV_MEM_SB:
-        RAM_FUNC(1, *cell = ((*cell) & ~(MASK(8) << offset)) | (value & MASK(8))
-                                                                   << offset);
+        RAM_FUNC(1, ram_store_subword(cell, MASK(8) << offset,
+                                      (value & MASK(8)) << offset));
         break;
     default:
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);

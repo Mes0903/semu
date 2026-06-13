@@ -6,6 +6,7 @@
 
 #include "common.h"
 #include "device.h"
+#include "ram_access.h"
 #include "riscv.h"
 #include "riscv_private.h"
 #include "virtio.h"
@@ -55,7 +56,8 @@ static void virtio_queue_notify_handler(virtio_rng_state_t *vrng,
     /* Calculate available ring index */
     uint16_t queue_idx = queue->last_avail % queue->QueueNum;
     uint16_t buffer_idx =
-        ram[queue->QueueAvail + 1 + queue_idx / 2] >> (16 * (queue_idx % 2));
+        ram_load_w_acquire(&ram[queue->QueueAvail + 1 + queue_idx / 2]) >>
+        (16 * (queue_idx % 2));
 
     /* Update available ring pointer */
     VRNG_QUEUE.last_avail++;
@@ -75,23 +77,20 @@ static void virtio_queue_notify_handler(virtio_rng_state_t *vrng,
     vq_desc->flags = 0;
 
     /* Get virtq_used.idx (le16) */
-    uint16_t used = ram[queue->QueueUsed] >> 16;
+    uint16_t used = ram_load_high16(&ram[queue->QueueUsed]);
 
     /* Update used ring information */
     uint32_t vq_used_addr =
         VRNG_QUEUE.QueueUsed + 1 + (used % queue->QueueNum) * 2;
-    ram[vq_used_addr] = buffer_idx;
-    ram[vq_used_addr + 1] = total;
+    ram_store_w(&ram[vq_used_addr], buffer_idx);
+    ram_store_w(&ram[vq_used_addr + 1], total);
     used++;
 
-    /* Reset used ring flag to zero (virtq_used.flags) */
-    vrng->ram[VRNG_QUEUE.QueueUsed] &= MASK(16);
-
-    /* Update the used ring pointer (virtq_used.idx) */
-    vrng->ram[VRNG_QUEUE.QueueUsed] |= ((uint32_t) used) << 16;
+    /* Update the used ring pointer (virtq_used.idx). */
+    ram_store_high16_release(&vrng->ram[VRNG_QUEUE.QueueUsed], used);
 
     /* Send interrupt, unless VIRTQ_AVAIL_F_NO_INTERRUPT is set */
-    if (!(ram[VRNG_QUEUE.QueueAvail] & 1))
+    if (!(ram_load_w_acquire(&ram[VRNG_QUEUE.QueueAvail]) & 1))
         vrng->InterruptStatus |= VIRTIO_INT__USED_RING;
 }
 
@@ -170,7 +169,8 @@ static bool virtio_rng_reg_write(virtio_rng_state_t *vrng,
     case _(QueueReady):
         VRNG_QUEUE.ready = value & 1;
         if (value & 1)
-            VRNG_QUEUE.last_avail = vrng->ram[VRNG_QUEUE.QueueAvail] >> 16;
+            VRNG_QUEUE.last_avail =
+                ram_load_high16_acquire(&vrng->ram[VRNG_QUEUE.QueueAvail]);
         return true;
     case _(QueueDescLow):
         VRNG_QUEUE.QueueDesc = vrng_preprocess(vrng, value);

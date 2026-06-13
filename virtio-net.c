@@ -16,6 +16,7 @@
 
 #include "common.h"
 #include "device.h"
+#include "ram_access.h"
 #include "riscv.h"
 #include "riscv_private.h"
 #include "virtio.h"
@@ -292,7 +293,7 @@ static ssize_t handle_write(netdev_t *netdev,
             return virtio_net_set_fail(vnet);                                  \
                                                                                \
         /* check for new buffers */                                            \
-        uint16_t new_avail = ram[queue->QueueAvail] >> 16;                     \
+        uint16_t new_avail = ram_load_high16_acquire(&ram[queue->QueueAvail]); \
         if (new_avail - queue->last_avail > (uint16_t) queue->QueueNum)        \
             return (fprintf(stderr, "size check fail\n"),                      \
                     virtio_net_set_fail(vnet));                                \
@@ -300,11 +301,12 @@ static ssize_t handle_write(netdev_t *netdev,
             return;                                                            \
                                                                                \
         /* process them */                                                     \
-        uint16_t new_used = ram[queue->QueueUsed] >> 16;                       \
+        uint16_t new_used = ram_load_high16(&ram[queue->QueueUsed]);           \
         while (queue->last_avail != new_avail) {                               \
             uint16_t queue_idx = queue->last_avail % queue->QueueNum;          \
             uint16_t buffer_idx =                                              \
-                ram[queue->QueueAvail + 1 + queue_idx / 2] >>                  \
+                ram_load_w_acquire(                                            \
+                    &ram[queue->QueueAvail + 1 + queue_idx / 2]) >>            \
                 (16 * (queue_idx % 2));                                        \
             VNET_BUFFER_TO_IOV(READ)                                           \
             struct iovec *buffer_iovs_cursor = buffer_iovs;                    \
@@ -325,17 +327,18 @@ static ssize_t handle_write(netdev_t *netdev,
                 break;                                                         \
             /* consume from available queue, write to used queue */            \
             queue->last_avail++;                                               \
-            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2] =     \
-                buffer_idx;                                                    \
-            ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2 + 1] = \
-                READ ? (plen + sizeof(virtio_header)) : 0;                     \
+            ram_store_w(                                                       \
+                &ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2], \
+                buffer_idx);                                                   \
+            ram_store_w(&ram[queue->QueueUsed + 1 +                            \
+                             (new_used % queue->QueueNum) * 2 + 1],            \
+                        READ ? (plen + sizeof(virtio_header)) : 0);            \
             new_used++;                                                        \
         }                                                                      \
-        vnet->ram[queue->QueueUsed] &= MASK(16);                               \
-        vnet->ram[queue->QueueUsed] |= ((uint32_t) new_used) << 16;            \
+        ram_store_high16_release(&vnet->ram[queue->QueueUsed], new_used);      \
                                                                                \
         /* send interrupt, unless VIRTQ_AVAIL_F_NO_INTERRUPT is set */         \
-        if (!(ram[queue->QueueAvail] & 1))                                     \
+        if (!(ram_load_w_acquire(&ram[queue->QueueAvail]) & 1))                \
             vnet->InterruptStatus |= VIRTIO_INT__USED_RING;                    \
     }
 
@@ -510,10 +513,11 @@ static bool virtio_net_reg_write(virtio_net_state_t *vnet,
     case _(QueueReady):
         VNET_QUEUE.ready = value & 1;
         if (value & 1)
-            VNET_QUEUE.last_avail = vnet->ram[VNET_QUEUE.QueueAvail] >> 16;
+            VNET_QUEUE.last_avail =
+                ram_load_high16_acquire(&vnet->ram[VNET_QUEUE.QueueAvail]);
         if (vnet->QueueSel == VNET_QUEUE_RX)
-            vnet->ram[VNET_QUEUE.QueueAvail] |=
-                1; /* set VIRTQ_AVAIL_F_NO_INTERRUPT */
+            ram_fetch_or_w(&vnet->ram[VNET_QUEUE.QueueAvail],
+                           1); /* set VIRTQ_AVAIL_F_NO_INTERRUPT */
         return true;
     case _(QueueDescLow):
         VNET_QUEUE.QueueDesc = vnet_preprocess(vnet, value);

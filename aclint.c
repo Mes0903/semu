@@ -6,12 +6,13 @@
 /* ACLINT MTIMER */
 void aclint_mtimer_update_interrupts(hart_t *hart, mtimer_state_t *mtimer)
 {
-    if (semu_timer_get(&mtimer->mtime) >= mtimer->mtimecmp[hart->mhartid]) {
-        hart->sip |= RV_INT_STI_BIT; /* Set Supervisor Timer Interrupt */
+    if (semu_timer_get(&mtimer->mtime) >=
+        __atomic_load_n(&mtimer->mtimecmp[hart->mhartid], __ATOMIC_RELAXED)) {
+        hart_sip_set_bits(hart, RV_INT_STI_BIT);
         /* Clear WFI flag when interrupt is injected - wakes the hart */
-        hart->in_wfi = false;
+        hart_in_wfi_store(hart, false);
     } else {
-        hart->sip &= ~RV_INT_STI_BIT; /* Clear Supervisor Timer Interrupt */
+        hart_sip_clear_bits(hart, RV_INT_STI_BIT);
     }
 }
 
@@ -32,8 +33,9 @@ static bool aclint_mtimer_reg_read(mtimer_state_t *mtimer,
     if (addr < 0x7FF8) {
         if ((addr >> 3) >= mtimer->n_hart)
             return false;
-        *value =
-            (uint32_t) (mtimer->mtimecmp[addr >> 3] >> (addr & 0x4 ? 32 : 0));
+        uint64_t cmp_val =
+            __atomic_load_n(&mtimer->mtimecmp[addr >> 3], __ATOMIC_RELAXED);
+        *value = (uint32_t) (cmp_val >> (addr & 0x4 ? 32 : 0));
         return true;
     }
 
@@ -62,14 +64,18 @@ static bool aclint_mtimer_reg_write(mtimer_state_t *mtimer,
     if (addr < 0x7FF8) {
         if ((addr >> 3) >= mtimer->n_hart)
             return false;
-        uint64_t cmp_val = mtimer->mtimecmp[addr >> 3];
+        uint64_t old =
+            __atomic_load_n(&mtimer->mtimecmp[addr >> 3], __ATOMIC_RELAXED);
+        uint64_t new_value;
 
-        if (addr & 0x4)
-            cmp_val = (cmp_val & 0xFFFFFFFF) | ((uint64_t) value << 32);
-        else
-            cmp_val = (cmp_val & 0xFFFFFFFF00000000ULL) | value;
-
-        mtimer->mtimecmp[addr >> 3] = cmp_val;
+        do {
+            if (addr & 0x4)
+                new_value = (old & 0xFFFFFFFF) | ((uint64_t) value << 32);
+            else
+                new_value = (old & 0xFFFFFFFF00000000ULL) | value;
+        } while (!__atomic_compare_exchange_n(
+            &mtimer->mtimecmp[addr >> 3], &old, new_value, true,
+            __ATOMIC_RELAXED, __ATOMIC_RELAXED));
         return true;
     }
 
@@ -110,16 +116,22 @@ void aclint_mtimer_write(hart_t *hart,
         vm_set_exception(hart, RV_EXC_STORE_FAULT, hart->exc_val);
 }
 
+static void aclint_set_swi_interrupt(hart_t *hart, bool pending)
+{
+    if (pending) {
+        hart_sip_set_bits(hart, RV_INT_SSI_BIT);
+        /* Clear WFI flag when interrupt is injected */
+        hart_in_wfi_store(hart, false);
+    } else {
+        hart_sip_clear_bits(hart, RV_INT_SSI_BIT);
+    }
+}
+
 /* ACLINT MSWI */
 void aclint_mswi_update_interrupts(hart_t *hart, mswi_state_t *mswi)
 {
-    if (mswi->msip[hart->mhartid]) {
-        hart->sip |= RV_INT_SSI_BIT; /* Set Machine Software Interrupt */
-        /* Clear WFI flag when interrupt is injected */
-        hart->in_wfi = false;
-    } else {
-        hart->sip &= ~RV_INT_SSI_BIT; /* Clear Machine Software Interrupt */
-    }
+    if (__atomic_load_n(&mswi->msip[hart->mhartid], __ATOMIC_RELAXED))
+        aclint_set_swi_interrupt(hart, true);
 }
 
 static bool aclint_mswi_reg_read(mswi_state_t *mswi,
@@ -135,7 +147,7 @@ static bool aclint_mswi_reg_read(mswi_state_t *mswi,
     if (addr < 0x4000) {
         if ((addr >> 2) >= mswi->n_hart)
             return false;
-        *value = mswi->msip[addr >> 2];
+        *value = __atomic_load_n(&mswi->msip[addr >> 2], __ATOMIC_RELAXED);
         return true;
     }
     return false;
@@ -148,7 +160,8 @@ static bool aclint_mswi_reg_write(mswi_state_t *mswi,
     if (addr < 0x4000) {
         if ((addr >> 2) >= mswi->n_hart)
             return false;
-        mswi->msip[addr >> 2] = value & 0x1; /* Only the LSB is valid */
+        __atomic_store_n(&mswi->msip[addr >> 2], value & 0x1,
+                         __ATOMIC_RELAXED); /* Only the LSB is valid */
         return true;
     }
     return false;
@@ -179,13 +192,18 @@ void aclint_mswi_write(hart_t *hart,
 /* ACLINT SSWI */
 void aclint_sswi_update_interrupts(hart_t *hart, sswi_state_t *sswi)
 {
-    if (sswi->ssip[hart->mhartid]) {
-        hart->sip |= RV_INT_SSI_BIT; /* Set Supervisor Software Interrupt */
-        /* Clear WFI flag when interrupt is injected */
-        hart->in_wfi = false;
-    } else {
-        hart->sip &= ~RV_INT_SSI_BIT; /* Clear Supervisor Software Interrupt */
-    }
+    if (__atomic_load_n(&sswi->ssip[hart->mhartid], __ATOMIC_RELAXED))
+        aclint_set_swi_interrupt(hart, true);
+}
+
+void aclint_swi_update_interrupts(hart_t *hart,
+                                  mswi_state_t *mswi,
+                                  sswi_state_t *sswi)
+{
+    bool pending =
+        __atomic_load_n(&mswi->msip[hart->mhartid], __ATOMIC_RELAXED) ||
+        __atomic_load_n(&sswi->ssip[hart->mhartid], __ATOMIC_RELAXED);
+    aclint_set_swi_interrupt(hart, pending);
 }
 
 static bool aclint_sswi_reg_read(sswi_state_t *sswi,
@@ -209,7 +227,8 @@ static bool aclint_sswi_reg_write(sswi_state_t *sswi,
     if (addr < 0x4000) {
         if ((addr >> 2) >= sswi->n_hart)
             return false;
-        sswi->ssip[addr >> 2] = value & 0x1; /* Only the LSB is valid */
+        __atomic_store_n(&sswi->ssip[addr >> 2], value & 0x1,
+                         __ATOMIC_RELAXED); /* Only the LSB is valid */
         return true;
     }
     return false;

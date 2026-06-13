@@ -9,6 +9,7 @@
 
 #include "device.h"
 #include "fuse.h"
+#include "ram_access.h"
 #include "riscv_private.h"
 
 /* SEMU currently only supports a single virtio-fs device. Although virtio-fs
@@ -684,18 +685,19 @@ static void virtio_queue_notify_handler(virtio_fs_state_t *vfs, int index)
     if (!((vfs->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready))
         return virtio_fs_set_fail(vfs);
 
-    uint16_t new_avail = ram[queue->QueueAvail] >> 16;
+    uint16_t new_avail = ram_load_high16_acquire(&ram[queue->QueueAvail]);
     if (new_avail - queue->last_avail > (uint16_t) queue->QueueNum)
         return virtio_fs_set_fail(vfs);
 
     if (queue->last_avail == new_avail)
         return;
 
-    uint16_t new_used = ram[queue->QueueUsed] >> 16;
+    uint16_t new_used = ram_load_high16(&ram[queue->QueueUsed]);
     while (queue->last_avail != new_avail) {
         uint16_t queue_idx = queue->last_avail % queue->QueueNum;
-        uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >>
-                              (16 * (queue_idx % 2));
+        uint16_t buffer_idx =
+            ram_load_w_acquire(&ram[queue->QueueAvail + 1 + queue_idx / 2]) >>
+            (16 * (queue_idx % 2));
 
         uint32_t len = 0;
         int result = virtio_fs_desc_handler(vfs, queue, buffer_idx, &len);
@@ -704,16 +706,15 @@ static void virtio_queue_notify_handler(virtio_fs_state_t *vfs, int index)
 
         uint32_t vq_used_addr =
             queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2;
-        ram[vq_used_addr] = buffer_idx;
-        ram[vq_used_addr + 1] = len;
+        ram_store_w(&ram[vq_used_addr], buffer_idx);
+        ram_store_w(&ram[vq_used_addr + 1], len);
         queue->last_avail++;
         new_used++;
     }
 
-    vfs->ram[queue->QueueUsed] &= MASK(16);
-    vfs->ram[queue->QueueUsed] |= ((uint32_t) new_used) << 16;
+    ram_store_high16_release(&vfs->ram[queue->QueueUsed], new_used);
 
-    if (!(ram[queue->QueueAvail] & 1))
+    if (!(ram_load_w_acquire(&ram[queue->QueueAvail]) & 1))
         vfs->InterruptStatus |= VIRTIO_INT__USED_RING;
 }
 
@@ -802,7 +803,8 @@ static bool virtio_fs_reg_write(virtio_fs_state_t *vfs,
     case _(QueueReady):
         VFS_QUEUE.ready = value & 1;
         if (value & 1)
-            VFS_QUEUE.last_avail = vfs->ram[VFS_QUEUE.QueueAvail] >> 16;
+            VFS_QUEUE.last_avail =
+                ram_load_high16_acquire(&vfs->ram[VFS_QUEUE.QueueAvail]);
         return true;
     case _(QueueDescLow):
         VFS_QUEUE.QueueDesc = vfs_preprocess(vfs, value);

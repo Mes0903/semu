@@ -4,6 +4,54 @@
 
 /* Make PLIC as simple as possible: 32 interrupts, no priority */
 
+enum {
+    PLIC_ENABLE_BASE = 0x800,
+    PLIC_ENABLE_STRIDE = 0x20,
+    PLIC_CONTEXT_BASE = 0x80000,
+    PLIC_CONTEXT_STRIDE = 0x400,
+    PLIC_CONTEXT_THRESHOLD = 0,
+    PLIC_CONTEXT_CLAIM = 1,
+};
+
+static bool plic_decode_enable_context(uint32_t addr, uint32_t *context)
+{
+    if (addr < PLIC_ENABLE_BASE)
+        return false;
+
+    uint32_t offset = addr - PLIC_ENABLE_BASE;
+    if (offset % PLIC_ENABLE_STRIDE)
+        return false;
+
+    uint32_t decoded = offset / PLIC_ENABLE_STRIDE;
+    if (decoded >= 32)
+        return false;
+
+    *context = decoded;
+    return true;
+}
+
+static bool plic_decode_context_reg(uint32_t addr,
+                                    uint32_t *context,
+                                    uint32_t *reg)
+{
+    if (addr < PLIC_CONTEXT_BASE)
+        return false;
+
+    uint32_t offset = addr - PLIC_CONTEXT_BASE;
+    uint32_t decoded_reg = offset % PLIC_CONTEXT_STRIDE;
+    if (decoded_reg != PLIC_CONTEXT_THRESHOLD &&
+        decoded_reg != PLIC_CONTEXT_CLAIM)
+        return false;
+
+    uint32_t decoded_context = offset / PLIC_CONTEXT_STRIDE;
+    if (decoded_context >= 32)
+        return false;
+
+    *context = decoded_context;
+    *reg = decoded_reg;
+    return true;
+}
+
 void plic_update_interrupts(vm_t *vm, plic_state_t *plic)
 {
     /* Update pending interrupts */
@@ -12,11 +60,11 @@ void plic_update_interrupts(vm_t *vm, plic_state_t *plic)
     /* Send interrupt to target */
     for (uint32_t i = 0; i < vm->n_hart; i++) {
         if (plic->ip & plic->ie[i]) {
-            vm->hart[i]->sip |= RV_INT_SEI_BIT;
+            hart_sip_set_bits(vm->hart[i], RV_INT_SEI_BIT);
             /* Clear WFI flag when external interrupt is injected */
-            vm->hart[i]->in_wfi = false;
+            hart_in_wfi_store(vm->hart[i], false);
         } else {
-            vm->hart[i]->sip &= ~RV_INT_SEI_BIT;
+            hart_sip_clear_bits(vm->hart[i], RV_INT_SEI_BIT);
         }
     }
 }
@@ -32,26 +80,28 @@ static bool plic_reg_read(plic_state_t *plic, uint32_t addr, uint32_t *value)
         return true;
     }
 
-    int addr_mask = MASK(ilog2(addr)) ^ (1 & addr);
-    int context = (addr_mask & addr);
-    context >>= __builtin_ffs(context) - (__builtin_ffs(context) & 1);
-    if (context < 0 || context >= (int) ARRAY_SIZE(plic->ie))
-        return false;
-    switch (addr & ~addr_mask) {
-    case 0x800:
+    uint32_t context;
+    if (plic_decode_enable_context(addr, &context)) {
         *value = plic->ie[context];
         return true;
-    case 0x80000:
+    }
+
+    uint32_t reg;
+    if (!plic_decode_context_reg(addr, &context, &reg))
+        return false;
+
+    switch (reg) {
+    case PLIC_CONTEXT_THRESHOLD:
         *value = 0;
         /* no priority support: target priority threshold hardwired to 0 */
         return true;
-    case 0x80001:
+    case PLIC_CONTEXT_CLAIM:
         /* claim */
         *value = 0;
         uint32_t candidates = plic->ip & plic->ie[context];
         if (candidates) {
-            *value = ilog2(candidates);
-            plic->ip &= ~(1 << (*value));
+            *value = (uint32_t) __builtin_ctz(candidates);
+            plic->ip &= ~(UINT32_C(1) << (*value));
         }
         return true;
     default:
@@ -65,20 +115,22 @@ static bool plic_reg_write(plic_state_t *plic, uint32_t addr, uint32_t value)
     if (1 <= addr && addr <= 31)
         return true;
 
-    int addr_mask = MASK(ilog2(addr)) ^ (1 & addr);
-    int context = (addr_mask & addr);
-    context >>= __builtin_ffs(context) - (__builtin_ffs(context) & 1);
-    if (context < 0 || context >= (int) ARRAY_SIZE(plic->ie))
-        return false;
-    switch (addr & ~addr_mask) {
-    case 0x800:
+    uint32_t context;
+    if (plic_decode_enable_context(addr, &context)) {
         value &= ~1;
         plic->ie[context] = value;
         return true;
-    case 0x80000:
+    }
+
+    uint32_t reg;
+    if (!plic_decode_context_reg(addr, &context, &reg))
+        return false;
+
+    switch (reg) {
+    case PLIC_CONTEXT_THRESHOLD:
         /* no priority support: target priority threshold hardwired to 0 */
         return true;
-    case 0x80001:
+    case PLIC_CONTEXT_CLAIM:
         /* completion */
         if (plic->ie[context] & (1 << value))
             plic->masked &= ~(1 << value);

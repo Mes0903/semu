@@ -4,6 +4,7 @@
 
 #include "common.h"
 #include "device.h"
+#include "ram_access.h"
 #include "riscv.h"
 #include "riscv_private.h"
 
@@ -476,9 +477,8 @@ static void mmu_translate(hart_t *vm,
         return;
     }
 
-    uint32_t new_pte = pte | set_bits;
-    if (new_pte != pte)
-        *pte_ref = new_pte;
+    if (set_bits & ~pte)
+        ram_fetch_or_w(pte_ref, set_bits);
 
     *addr = ((*addr) & MASK(RV_PAGE_SHIFT)) | (ppn << RV_PAGE_SHIFT);
 }
@@ -633,7 +633,7 @@ static inline void ram_read_host_fast(hart_t *vm,
             vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
             return;
         }
-        *value = *cell;
+        *value = ram_load_w(cell);
         return;
     }
     switch (width) {
@@ -642,20 +642,20 @@ static inline void ram_read_host_fast(hart_t *vm,
             vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
             return;
         }
-        *value = (uint16_t) (*cell >> shift);
+        *value = (uint16_t) (ram_load_w(cell) >> shift);
         return;
     case RV_MEM_LH:
         if (unlikely(host_addr & 0x1)) {
             vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
             return;
         }
-        *value = (uint32_t) (int32_t) (int16_t) (*cell >> shift);
+        *value = (uint32_t) (int32_t) (int16_t) (ram_load_w(cell) >> shift);
         return;
     case RV_MEM_LBU:
-        *value = (uint8_t) (*cell >> shift);
+        *value = (uint8_t) (ram_load_w(cell) >> shift);
         return;
     case RV_MEM_LB:
-        *value = (uint32_t) (int32_t) (int8_t) (*cell >> shift);
+        *value = (uint32_t) (int32_t) (int8_t) (ram_load_w(cell) >> shift);
         return;
     default:
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
@@ -675,7 +675,7 @@ static inline void ram_write_host_fast(hart_t *vm,
             vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
             return;
         }
-        *cell = value;
+        ram_store_w(cell, value);
         return;
     }
     switch (width) {
@@ -684,10 +684,10 @@ static inline void ram_write_host_fast(hart_t *vm,
             vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
             return;
         }
-        *cell = (*cell & ~(MASK(16) << shift)) | ((value & MASK(16)) << shift);
+        ram_store_subword(cell, MASK(16) << shift, (value & MASK(16)) << shift);
         return;
     case RV_MEM_SB:
-        *cell = (*cell & ~(MASK(8) << shift)) | ((value & MASK(8)) << shift);
+        ram_store_subword(cell, MASK(8) << shift, (value & MASK(8)) << shift);
         return;
     default:
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
@@ -711,27 +711,27 @@ static inline void ram_read_fast(hart_t *vm,
             vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
             return;
         }
-        *value = *cell;
+        *value = ram_load_w(cell);
         return;
     case RV_MEM_LHU:
         if (unlikely(offset & 0x1)) {
             vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
             return;
         }
-        *value = (uint16_t) (*cell >> shift);
+        *value = (uint16_t) (ram_load_w(cell) >> shift);
         return;
     case RV_MEM_LH:
         if (unlikely(offset & 0x1)) {
             vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
             return;
         }
-        *value = (uint32_t) (int32_t) (int16_t) (*cell >> shift);
+        *value = (uint32_t) (int32_t) (int16_t) (ram_load_w(cell) >> shift);
         return;
     case RV_MEM_LBU:
-        *value = (uint8_t) (*cell >> shift);
+        *value = (uint8_t) (ram_load_w(cell) >> shift);
         return;
     case RV_MEM_LB:
-        *value = (uint32_t) (int32_t) (int8_t) (*cell >> shift);
+        *value = (uint32_t) (int32_t) (int8_t) (ram_load_w(cell) >> shift);
         return;
     default:
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
@@ -755,22 +755,69 @@ static inline void ram_write_fast(hart_t *vm,
             vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
             return;
         }
-        *cell = value;
+        ram_store_w(cell, value);
         return;
     case RV_MEM_SH:
         if (unlikely(offset & 0x1)) {
             vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
             return;
         }
-        *cell = (*cell & ~(MASK(16) << shift)) | ((value & MASK(16)) << shift);
+        ram_store_subword(cell, MASK(16) << shift, (value & MASK(16)) << shift);
         return;
     case RV_MEM_SB:
-        *cell = (*cell & ~(MASK(8) << shift)) | ((value & MASK(8)) << shift);
+        ram_store_subword(cell, MASK(8) << shift, (value & MASK(8)) << shift);
         return;
     default:
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
         return;
     }
+}
+
+static inline uint32_t lr_reservation_addr(uint32_t phys_addr)
+{
+    return phys_addr & ~3U;
+}
+
+static void lr_reservation_set(hart_t *hart, uint32_t phys_addr)
+{
+    vm_t *machine = hart->vm;
+
+    if (!machine->reservations)
+        return;
+
+    machine->reservations[hart->mhartid].addr = lr_reservation_addr(phys_addr);
+    machine->reservations[hart->mhartid].valid = true;
+    machine->any_reservation_active = true;
+}
+
+static bool lr_reservation_matches(hart_t *hart, uint32_t phys_addr)
+{
+    vm_t *machine = hart->vm;
+
+    if (!machine->reservations)
+        return false;
+
+    reservation_entry_t *entry = &machine->reservations[hart->mhartid];
+    return entry->valid && entry->addr == lr_reservation_addr(phys_addr);
+}
+
+static void lr_reservation_invalidate(hart_t *hart, uint32_t phys_addr)
+{
+    vm_t *machine = hart->vm;
+    bool any_active = false;
+    uint32_t addr = lr_reservation_addr(phys_addr);
+
+    if (!machine->any_reservation_active || !machine->reservations)
+        return;
+
+    for (uint32_t i = 0; i < machine->n_hart; i++) {
+        reservation_entry_t *entry = &machine->reservations[i];
+        if (entry->valid && entry->addr == addr)
+            entry->valid = false;
+        any_active |= entry->valid;
+    }
+
+    machine->any_reservation_active = any_active;
 }
 
 static void mmu_load(hart_t *vm,
@@ -876,7 +923,7 @@ static void mmu_load(hart_t *vm,
     }
 
     if (unlikely(reserved))
-        vm->lr_reservation = phys_addr | 1;
+        lr_reservation_set(vm, phys_addr);
 }
 
 static bool mmu_store(hart_t *vm,
@@ -963,22 +1010,10 @@ static bool mmu_store(hart_t *vm,
     }
 
 do_store:
-    if (unlikely(cond)) {
-        if ((vm->lr_reservation != (phys_addr | 1)))
-            return false;
-    }
+    if (unlikely(cond) && !lr_reservation_matches(vm, phys_addr))
+        return false;
 
-    if (likely(vm->vm->n_hart == 1)) {
-        if (unlikely(vm->lr_reservation & 1) &&
-            (vm->lr_reservation & ~3) == (phys_addr & ~3))
-            vm->lr_reservation = 0;
-    } else {
-        for (uint32_t i = 0; i < vm->vm->n_hart; i++) {
-            if (unlikely(vm->vm->hart[i]->lr_reservation & 1) &&
-                (vm->vm->hart[i]->lr_reservation & ~3) == (phys_addr & ~3))
-                vm->vm->hart[i]->lr_reservation = 0;
-        }
-    }
+    lr_reservation_invalidate(vm, phys_addr);
 
     if (likely(host_addr)) {
         ram_write_host_fast(vm, host_addr, width, value);
@@ -1043,8 +1078,8 @@ static void op_sret(hart_t *vm)
      * by checking whether the switch to U mode has already occurred, we can
      * determine if the boot process has been completed.
      */
-    if (!boot_complete && !vm->s_mode)
-        boot_complete = true;
+    if (!semu_boot_complete_load() && !vm->s_mode)
+        semu_boot_complete_store(true);
 
     /* Reset stack */
     vm->sstatus_spp = false;
@@ -1132,7 +1167,7 @@ static void csr_read(hart_t *vm, uint16_t addr, uint32_t *value)
         *value = vm->sie;
         break;
     case RV_CSR_SIP:
-        *value = vm->sip;
+        *value = hart_sip_load(vm);
         break;
     case RV_CSR_STVEC:
         *value = 0;
@@ -1188,9 +1223,7 @@ static void csr_write(hart_t *vm, uint16_t addr, uint32_t value)
         vm->sie = value;
         break;
     case RV_CSR_SIP:
-        value &= SIP_MASK;
-        value |= vm->sip & ~SIP_MASK;
-        vm->sip = value;
+        hart_sip_replace_bits(vm, SIP_MASK, value);
         break;
     case RV_CSR_STVEC:
         vm->stvec_addr = value;
@@ -1482,12 +1515,15 @@ void vm_init(hart_t *vm)
 #define PRIV(x) ((emu_state_t *) x->priv)
 static inline void vm_handle_pending_interrupt(hart_t *vm)
 {
-    if ((vm->sstatus_sie || !vm->s_mode) && (vm->sip & vm->sie)) {
-        uint32_t applicable = (vm->sip & vm->sie);
+    uint32_t sip = hart_sip_load(vm);
+
+    if ((vm->sstatus_sie || !vm->s_mode) && (sip & vm->sie)) {
+        uint32_t applicable = sip & vm->sie;
         uint8_t idx = ilog2(applicable);
         if (idx == 1) {
             emu_state_t *data = PRIV(vm);
-            data->sswi.ssip[vm->mhartid] = 0;
+            __atomic_store_n(&data->sswi.ssip[vm->mhartid], 0,
+                             __ATOMIC_RELAXED);
         }
         vm->exc_cause = (1U << 31) | idx;
         vm->stval = 0;
@@ -1602,7 +1638,8 @@ __attribute__((hot, flatten)) int vm_step_many(hart_t *vm, int steps)
     int executed = 0;
     uint32_t insn = 0;
 
-    if (vm->hsm_status != SBI_HSM_STATE_STARTED || unlikely(vm->error))
+    if (hart_hsm_status_load(vm) != SBI_HSM_STATE_STARTED ||
+        unlikely(vm->error))
         return 0;
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -2021,7 +2058,7 @@ L_error:
 
 void vm_step(hart_t *vm)
 {
-    if (vm->hsm_status != SBI_HSM_STATE_STARTED)
+    if (hart_hsm_status_load(vm) != SBI_HSM_STATE_STARTED)
         return;
 
     if (unlikely(vm->error))

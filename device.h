@@ -1,5 +1,7 @@
 #pragma once
 
+#include <pthread.h>
+
 #if SEMU_HAS(VIRTIONET)
 #include "netdev.h"
 #endif
@@ -365,7 +367,7 @@ typedef struct {
      * For more details, please refer to the register map at:
      * https://github.com/riscv/riscv-aclint/blob/main/riscv-aclint.adoc#21-register-map
      */
-    uint64_t *mtimecmp;
+    _Atomic uint64_t *mtimecmp;
     uint32_t n_hart;
     semu_timer_t mtime;
 } mtimer_state_t;
@@ -394,7 +396,7 @@ typedef struct {
      * For more details, please refer to the register map at:
      * https://github.com/riscv/riscv-aclint/blob/main/riscv-aclint.adoc#31-register-map
      */
-    uint32_t *msip;
+    _Atomic uint32_t *msip;
     uint32_t n_hart;
 } mswi_state_t;
 
@@ -422,11 +424,14 @@ typedef struct {
      * For more details, please refer to the register map at:
      * https://github.com/riscv/riscv-aclint/blob/main/riscv-aclint.adoc#41-register-map
      */
-    uint32_t *ssip;
+    _Atomic uint32_t *ssip;
     uint32_t n_hart;
 } sswi_state_t;
 
 void aclint_sswi_update_interrupts(hart_t *hart, sswi_state_t *sswi);
+void aclint_swi_update_interrupts(hart_t *hart,
+                                  mswi_state_t *mswi,
+                                  sswi_state_t *sswi);
 void aclint_sswi_read(hart_t *hart,
                       sswi_state_t *sswi,
                       uint32_t addr,
@@ -553,33 +558,43 @@ bool virtio_fs_init(virtio_fs_state_t *vfs, char *mtag, char *dir);
 typedef struct {
     int exit_code;
     bool debug;
-    bool stopped;
+    _Atomic bool stopped;
     uint32_t *ram;
     uint32_t *disk;
     vm_t vm;
     plic_state_t plic;
+    pthread_mutex_t plic_lock;
     u8250_state_t uart;
+    pthread_mutex_t uart_lock;
 #if SEMU_HAS(VIRTIONET)
     virtio_net_state_t vnet;
+    pthread_mutex_t vnet_lock;
 #endif
 #if SEMU_HAS(VIRTIOBLK)
     virtio_blk_state_t vblk;
+    pthread_mutex_t vblk_lock;
 #endif
 #if SEMU_HAS(VIRTIORNG)
     virtio_rng_state_t vrng;
+    pthread_mutex_t vrng_lock;
 #endif
 #if SEMU_HAS(VIRTIOSND)
     virtio_snd_state_t vsnd;
+    pthread_mutex_t vsnd_lock;
 #endif
 #if SEMU_HAS(VIRTIOFS)
     virtio_fs_state_t vfs;
+    pthread_mutex_t vfs_lock;
 #endif
 #if SEMU_HAS(VIRTIOINPUT)
     virtio_input_state_t vkeyboard;
+    pthread_mutex_t vkeyboard_lock;
     virtio_input_state_t vmouse;
+    pthread_mutex_t vmouse_lock;
 #endif
 #if SEMU_HAS(VIRTIOGPU)
     virtio_gpu_state_t vgpu;
+    pthread_mutex_t vgpu_lock;
 #endif
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
     /* Use self-pipe trick to unblock the emulator loop when the window backend
@@ -598,8 +613,11 @@ typedef struct {
 #endif
     /* ACLINT */
     mtimer_state_t mtimer;
+    pthread_mutex_t mtimer_lock;
     mswi_state_t mswi;
+    pthread_mutex_t mswi_lock;
     sswi_state_t sswi;
+    pthread_mutex_t sswi_lock;
 
     uint32_t peripheral_update_ctr;
 

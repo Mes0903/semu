@@ -8,6 +8,7 @@
 #include <portaudio.h>
 
 #include "device.h"
+#include "ram_access.h"
 #include "riscv.h"
 #include "riscv_private.h"
 #include "utils.h"
@@ -1008,7 +1009,7 @@ static void virtio_queue_notify_handler(virtio_snd_state_t *vsnd, int index)
         return virtio_snd_set_fail(vsnd);
 
     /* Check for new buffers */
-    uint16_t new_avail = ram[queue->QueueAvail] >> 16;
+    uint16_t new_avail = ram_load_high16_acquire(&ram[queue->QueueAvail]);
     if (new_avail - queue->last_avail > (uint16_t) queue->QueueNum)
         return virtio_snd_set_fail(vsnd);
 
@@ -1016,7 +1017,8 @@ static void virtio_queue_notify_handler(virtio_snd_state_t *vsnd, int index)
         return;
 
     /* Process them */
-    uint16_t new_used = ram[queue->QueueUsed] >> 16; /* virtq_used.idx (le16) */
+    uint16_t new_used =
+        ram_load_high16(&ram[queue->QueueUsed]); /* virtq_used.idx (le16) */
     while (queue->last_avail != new_avail) {
         /* Obtain the index in the ring buffer */
         uint16_t queue_idx = queue->last_avail % queue->QueueNum;
@@ -1027,8 +1029,9 @@ static void virtio_queue_notify_handler(virtio_snd_state_t *vsnd, int index)
          * requires the following array index calculation and bit shifting.
          * Check also the `struct virtq_avail` on the spec.
          */
-        uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >>
-                              (16 * (queue_idx % 2));
+        uint16_t buffer_idx =
+            ram_load_w_acquire(&ram[queue->QueueAvail + 1 + queue_idx / 2]) >>
+            (16 * (queue_idx % 2));
 
         /* Consume request from the available queue and process the data in the
          * descriptor list.
@@ -1045,18 +1048,19 @@ static void virtio_queue_notify_handler(virtio_snd_state_t *vsnd, int index)
          * queue */
         uint32_t vq_used_addr =
             queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2;
-        ram[vq_used_addr] = buffer_idx; /* virtq_used_elem.id  (le32) */
-        ram[vq_used_addr + 1] = len;    /* virtq_used_elem.len (le32) */
+        ram_store_w(&ram[vq_used_addr],
+                    buffer_idx); /* virtq_used_elem.id  (le32) */
+        ram_store_w(&ram[vq_used_addr + 1],
+                    len); /* virtq_used_elem.len (le32) */
         queue->last_avail++;
         new_used++;
     }
 
     /* Check le32 len field of struct virtq_used_elem on the spec  */
-    vsnd->ram[queue->QueueUsed] &= MASK(16); /* Reset low 16 bits to zero */
-    vsnd->ram[queue->QueueUsed] |= ((uint32_t) new_used) << 16; /* len */
+    ram_store_high16_release(&vsnd->ram[queue->QueueUsed], new_used);
 
     /* Publish used-ring writes before making the IRQ visible to the guest. */
-    if (!(ram[queue->QueueAvail] & 1))
+    if (!(ram_load_w_acquire(&ram[queue->QueueAvail]) & 1))
         __atomic_fetch_or(&vsnd->InterruptStatus, VIRTIO_INT__USED_RING,
                           __ATOMIC_RELEASE);
 }
@@ -1159,7 +1163,8 @@ static bool virtio_snd_reg_write(virtio_snd_state_t *vsnd,
     case _(QueueReady):
         vsndq.ready = value & 1;
         if (value & 1)
-            vsndq.last_avail = vsnd->ram[vsndq.QueueAvail] >> 16;
+            vsndq.last_avail =
+                ram_load_high16_acquire(&vsnd->ram[vsndq.QueueAvail]);
         return true;
     case _(QueueDescLow):
         vsndq.QueueDesc = vsnd_preprocess(vsnd, value);

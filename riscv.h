@@ -120,8 +120,6 @@ struct __hart_internal {
     uint64_t instret;
     vm_error_t error;
     uint32_t exc_cause, exc_val;
-    uint32_t lr_reservation;
-
     /* Load/store TLB last-entry fast path */
     uint32_t cache_load_last_vpn;
     uint32_t cache_load_last_phys_ppn;
@@ -147,7 +145,7 @@ struct __hart_internal {
     bool sstatus_sie;
     bool s_mode;
     uint32_t sie;
-    uint32_t sip;
+    _Atomic uint32_t sip;
 
     semu_timer_t time;
 
@@ -155,7 +153,7 @@ struct __hart_internal {
     bool sstatus_spp;
     bool sstatus_spie;
     uint32_t sepc;
-    bool in_wfi;
+    _Atomic bool in_wfi;
     uint32_t scause;
     uint32_t stval;
     bool sstatus_mxr;
@@ -180,7 +178,7 @@ struct __hart_internal {
     uint32_t *(*mem_page_table)(const hart_t *vm, uint32_t ppn);
 
     vm_t *vm;
-    int32_t hsm_status;
+    _Atomic int32_t hsm_status;
     bool hsm_resume_is_ret;
     int32_t hsm_resume_pc;
     int32_t hsm_resume_opaque;
@@ -192,10 +190,66 @@ struct __hart_internal {
     icache_t icache;
 };
 
+typedef struct {
+    uint32_t addr;
+    bool valid;
+} reservation_entry_t;
+
 struct __vm_internel {
     uint32_t n_hart;
     hart_t **hart;
+    reservation_entry_t *reservations;
+    bool any_reservation_active;
 };
+
+static inline uint32_t hart_sip_load(const hart_t *hart)
+{
+    return __atomic_load_n(&hart->sip, __ATOMIC_RELAXED);
+}
+
+static inline void hart_sip_set_bits(hart_t *hart, uint32_t bits)
+{
+    __atomic_fetch_or(&hart->sip, bits, __ATOMIC_RELAXED);
+}
+
+static inline void hart_sip_clear_bits(hart_t *hart, uint32_t bits)
+{
+    __atomic_fetch_and(&hart->sip, ~bits, __ATOMIC_RELAXED);
+}
+
+static inline void hart_sip_replace_bits(hart_t *hart,
+                                         uint32_t mask,
+                                         uint32_t value)
+{
+    uint32_t old = hart_sip_load(hart);
+    uint32_t new_value;
+
+    do {
+        new_value = (old & ~mask) | (value & mask);
+    } while (!__atomic_compare_exchange_n(&hart->sip, &old, new_value, true,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+}
+
+static inline bool hart_in_wfi_load(const hart_t *hart)
+{
+    return __atomic_load_n(&hart->in_wfi, __ATOMIC_RELAXED);
+}
+
+static inline void hart_in_wfi_store(hart_t *hart, bool value)
+{
+    __atomic_store_n(&hart->in_wfi, value, __ATOMIC_RELAXED);
+}
+
+static inline int32_t hart_hsm_status_load(const hart_t *hart)
+{
+    return __atomic_load_n(&hart->hsm_status, __ATOMIC_RELAXED);
+}
+
+static inline void hart_hsm_status_store(hart_t *hart, int32_t value)
+{
+    __atomic_store_n(&hart->hsm_status, value, __ATOMIC_RELAXED);
+}
+
 
 void vm_init(hart_t *vm);
 

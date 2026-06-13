@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "device.h"
+#include "ram_access.h"
 #include "riscv.h"
 #include "riscv_private.h"
 #include "utils.h"
@@ -179,9 +180,9 @@ static void virtio_input_drain_statusq(virtio_input_state_t *vinput)
     if (!(vinput->Status & VIRTIO_STATUS__DRIVER_OK) || !queue->ready)
         return;
 
-    uint16_t new_avail = ram[queue->QueueAvail] >> 16;
+    uint16_t new_avail = ram_load_high16_acquire(&ram[queue->QueueAvail]);
     uint16_t avail_delta = (uint16_t) (new_avail - queue->last_avail);
-    uint16_t new_used = ram[queue->QueueUsed] >> 16;
+    uint16_t new_used = ram_load_high16(&ram[queue->QueueUsed]);
     bool consumed = false;
 
     if (avail_delta > (uint16_t) queue->QueueNum) {
@@ -193,8 +194,9 @@ static void virtio_input_drain_statusq(virtio_input_state_t *vinput)
 
     while (queue->last_avail != new_avail) {
         uint16_t queue_idx = queue->last_avail % queue->QueueNum;
-        uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >>
-                              (16 * (queue_idx % 2));
+        uint16_t buffer_idx =
+            ram_load_w_acquire(&ram[queue->QueueAvail + 1 + queue_idx / 2]) >>
+            (16 * (queue_idx % 2));
 
         if (buffer_idx >= queue->QueueNum) {
             virtio_input_set_fail(vinput);
@@ -218,18 +220,16 @@ static void virtio_input_drain_statusq(virtio_input_state_t *vinput)
          */
         uint32_t vq_used_addr =
             queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2;
-        ram[vq_used_addr] = buffer_idx;
-        ram[vq_used_addr + 1] = 0;
+        ram_store_w(&ram[vq_used_addr], buffer_idx);
+        ram_store_w(&ram[vq_used_addr + 1], 0);
         new_used++;
         queue->last_avail++;
         consumed = true;
     }
 
     if (consumed) {
-        uint16_t *used_hdr = (uint16_t *) &ram[queue->QueueUsed];
-        used_hdr[0] = 0;
-        used_hdr[1] = new_used;
-        if (!(ram[queue->QueueAvail] & 1))
+        ram_store_high16_release(&ram[queue->QueueUsed], new_used);
+        if (!(ram_load_w_acquire(&ram[queue->QueueAvail]) & 1))
             vinput->InterruptStatus |= VIRTIO_INT__USED_RING;
     }
 }
@@ -262,9 +262,10 @@ static bool virtio_input_desc_handler(virtio_input_state_t *vinput,
     struct virtio_input_event *ev;
 
     uint32_t *ram = vinput->ram;
-    uint16_t new_avail =
-        ram[queue->QueueAvail] >> 16; /* virtq_avail.idx (le16) */
-    uint16_t new_used = ram[queue->QueueUsed] >> 16; /* virtq_used.idx (le16) */
+    uint16_t new_avail = ram_load_high16_acquire(
+        &ram[queue->QueueAvail]); /* virtq_avail.idx (le16) */
+    uint16_t new_used =
+        ram_load_high16(&ram[queue->QueueUsed]); /* virtq_used.idx (le16) */
 
     /* For checking if the event buffer has enough space to write */
     uint32_t end = queue->last_avail + ev_cnt;
@@ -283,8 +284,9 @@ static bool virtio_input_desc_handler(virtio_input_state_t *vinput,
     for (uint32_t i = 0; i < ev_cnt; i++) {
         /* Obtain the available ring index */
         uint16_t queue_idx = queue->last_avail % queue->QueueNum;
-        uint16_t buffer_idx = ram[queue->QueueAvail + 1 + queue_idx / 2] >>
-                              (16 * (queue_idx % 2));
+        uint16_t buffer_idx =
+            ram_load_w_acquire(&ram[queue->QueueAvail + 1 + queue_idx / 2]) >>
+            (16 * (queue_idx % 2));
 
         if (buffer_idx >= queue->QueueNum) {
             virtio_input_set_fail(vinput);
@@ -319,17 +321,15 @@ static bool virtio_input_desc_handler(virtio_input_state_t *vinput,
         /* Update used ring */
         uint32_t vq_used_addr =
             queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2;
-        ram[vq_used_addr] = buffer_idx;
-        ram[vq_used_addr + 1] = sizeof(struct virtio_input_event);
+        ram_store_w(&ram[vq_used_addr], buffer_idx);
+        ram_store_w(&ram[vq_used_addr + 1], sizeof(struct virtio_input_event));
 
         new_used++;
         queue->last_avail++;
     }
 
     /* Update used ring header */
-    uint16_t *used_hdr = (uint16_t *) &ram[queue->QueueUsed];
-    used_hdr[0] = 0;        /* virtq_used.flags */
-    used_hdr[1] = new_used; /* virtq_used.idx */
+    ram_store_high16_release(&ram[queue->QueueUsed], new_used);
 
     return true;
 }
@@ -355,7 +355,7 @@ static void virtio_input_update_eventq(int dev_id,
         return;
 
     /* Check for new buffers */
-    uint16_t new_avail = ram[queue->QueueAvail] >> 16;
+    uint16_t new_avail = ram_load_high16_acquire(&ram[queue->QueueAvail]);
     uint16_t avail_delta = (uint16_t) (new_avail - queue->last_avail);
     if (avail_delta > (uint16_t) queue->QueueNum) {
         fprintf(stderr, "%s(): size check failed\n", __func__);
@@ -380,7 +380,7 @@ static void virtio_input_update_eventq(int dev_id,
     /* Send interrupt only if we actually wrote events, unless
      * VIRTQ_AVAIL_F_NO_INTERRUPT is set
      */
-    if (wrote_events && !(ram[queue->QueueAvail] & 1))
+    if (wrote_events && !(ram_load_w_acquire(&ram[queue->QueueAvail]) & 1))
         vinput->InterruptStatus |= VIRTIO_INT__USED_RING;
 }
 
@@ -768,8 +768,8 @@ static bool virtio_input_reg_write(virtio_input_state_t *vinput,
                 return true;
             }
 
-            VIRTIO_INPUT_QUEUE.last_avail =
-                vinput->ram[VIRTIO_INPUT_QUEUE.QueueAvail] >> 16;
+            VIRTIO_INPUT_QUEUE.last_avail = ram_load_high16_acquire(
+                &vinput->ram[VIRTIO_INPUT_QUEUE.QueueAvail]);
         }
         return true;
     case _(QueueDescLow):

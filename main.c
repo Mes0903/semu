@@ -49,9 +49,39 @@ static int semu_run_chunk(emu_state_t *emu, int steps);
 
 enum {
     SEMU_SMP_SLICE_STEPS = 8,
+    SEMU_SMP_BATCH_STEPS = 4096,
     SEMU_SINGLE_SLICE_STEPS = 512,
     SEMU_SLIRP_SLICE_STEPS = 8,
 };
+
+static inline bool emu_stopped_load(const emu_state_t *emu)
+{
+    return __atomic_load_n(&emu->stopped, __ATOMIC_RELAXED);
+}
+
+static inline void emu_stopped_store(emu_state_t *emu, bool value)
+{
+    __atomic_store_n(&emu->stopped, value, __ATOMIC_RELAXED);
+}
+
+static inline void emu_device_lock(pthread_mutex_t *lock UNUSED) {}
+
+static inline void emu_device_unlock(pthread_mutex_t *lock UNUSED) {}
+
+#define EMU_DEVICE_CALL(lock, ...)  \
+    do {                            \
+        emu_device_lock(&(lock));   \
+        __VA_ARGS__;                \
+        emu_device_unlock(&(lock)); \
+    } while (0)
+
+static int emu_mutex_init(pthread_mutex_t *lock)
+{
+    int rc = pthread_mutex_init(lock, NULL);
+    if (rc)
+        errno = rc;
+    return rc;
+}
 
 /* Define fetch separately since it is simpler (fixed width, already checked
  * alignment, only main RAM is executable).
@@ -169,8 +199,7 @@ static void emu_update_timer_interrupt(hart_t *hart)
 static void emu_update_swi_interrupt(hart_t *hart)
 {
     emu_state_t *data = PRIV(hart);
-    aclint_mswi_update_interrupts(hart, &data->mswi);
-    aclint_sswi_update_interrupts(hart, &data->sswi);
+    aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi);
 }
 
 #if SEMU_HAS(VIRTIOSND)
@@ -203,7 +232,7 @@ static void emu_update_vfs_interrupts(vm_t *vm)
  *
  * Rationale:
  * 1. Non-blocking poll() is extremely cheap (~200ns syscall overhead)
- * 2. Inline polling provides lowest latency (checked every 64 instructions)
+ * 2. Inline polling provides lowest latency (checked every SMP slice)
  * 3. All harts share peripheral_update_ctr, ensuring frequent polling
  *    regardless of hart count (e.g., 4 harts = 4 polls per 256 instructions)
  * 4. Coroutine-based I/O would INCREASE latency by n_hart factor due to
@@ -216,62 +245,66 @@ static void emu_update_vfs_interrupts(vm_t *vm)
  *
  * For simple non-blocking I/O, inline polling is superior.
  */
-static inline void emu_tick_peripherals(emu_state_t *emu)
+static void io_poll_peripherals(emu_state_t *emu)
 {
     vm_t *vm = &emu->vm;
 
-    if (emu->peripheral_update_ctr-- == 0) {
-        emu->peripheral_update_ctr = 64;
-
-        u8250_check_ready(&emu->uart);
-        u8250_flush_out(&emu->uart);
-        if (emu->uart.in_ready)
-            emu_update_uart_interrupts(vm);
+    u8250_check_ready(&emu->uart);
+    u8250_flush_out(&emu->uart);
+    if (emu->uart.in_ready)
+        emu_update_uart_interrupts(vm);
 
 #if SEMU_HAS(VIRTIONET)
-        virtio_net_refresh_queue(&emu->vnet);
-        if (emu->vnet.InterruptStatus)
-            emu_update_vnet_interrupts(vm);
+    virtio_net_refresh_queue(&emu->vnet);
+    if (emu->vnet.InterruptStatus)
+        emu_update_vnet_interrupts(vm);
 #endif
 
 #if SEMU_HAS(VIRTIOBLK)
-        if (emu->vblk.InterruptStatus)
-            emu_update_vblk_interrupts(vm);
+    if (emu->vblk.InterruptStatus)
+        emu_update_vblk_interrupts(vm);
 #endif
 
 #if SEMU_HAS(VIRTIORNG)
-        if (emu->vrng.InterruptStatus)
-            emu_update_vrng_interrupts(vm);
+    if (emu->vrng.InterruptStatus)
+        emu_update_vrng_interrupts(vm);
 #endif
 
 #if SEMU_HAS(VIRTIOSND)
-        if (__atomic_load_n(&emu->vsnd.InterruptStatus, __ATOMIC_ACQUIRE))
-            emu_update_vsnd_interrupts(vm);
+    if (__atomic_load_n(&emu->vsnd.InterruptStatus, __ATOMIC_ACQUIRE))
+        emu_update_vsnd_interrupts(vm);
 #endif
 
 #if SEMU_HAS(VIRTIOFS)
-        if (emu->vfs.InterruptStatus)
-            emu_update_vfs_interrupts(vm);
+    if (emu->vfs.InterruptStatus)
+        emu_update_vfs_interrupts(vm);
 #endif
 #if SEMU_HAS(VIRTIOINPUT)
-        /* The empty path is common during CI and boot workloads, so only
-         * drain the host-side queue after the window thread has published
-         * pending work for the emulator thread.
-         */
-        if (vinput_may_have_pending_cmds())
-            virtio_input_drain_host_events();
+    /* The empty path is common during CI and boot workloads, so only
+     * drain the host-side queue after the window thread has published
+     * pending work for the emulator thread.
+     */
+    if (vinput_may_have_pending_cmds())
+        virtio_input_drain_host_events();
 
-        if (virtio_input_irq_pending(&emu->vkeyboard))
-            emu_update_vinput_keyboard_interrupts(vm);
+    if (virtio_input_irq_pending(&emu->vkeyboard))
+        emu_update_vinput_keyboard_interrupts(vm);
 
-        if (virtio_input_irq_pending(&emu->vmouse))
-            emu_update_vinput_mouse_interrupts(vm);
+    if (virtio_input_irq_pending(&emu->vmouse))
+        emu_update_vinput_mouse_interrupts(vm);
 #endif
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
-        /* A closed window is treated like a frontend shutdown request. */
-        if (g_window.window_is_closed())
-            emu->stopped = true;
+    /* A closed window is treated like a frontend shutdown request. */
+    if (g_window.window_is_closed())
+        emu_stopped_store(emu, true);
 #endif
+}
+
+static inline void emu_tick_peripherals(emu_state_t *emu)
+{
+    if (emu->peripheral_update_ctr-- == 0) {
+        emu->peripheral_update_ctr = 64;
+        io_poll_peripherals(emu);
     }
 }
 
@@ -292,62 +325,85 @@ static void mem_load(hart_t *hart,
         switch ((addr >> 20) & MASK(8)) {
         case 0x0:
         case 0x2: /* PLIC (0 - 0x3F) */
-            plic_read(hart, &data->plic, addr & 0x3FFFFFF, width, value);
+            EMU_DEVICE_CALL(
+                data->plic_lock,
+                plic_read(hart, &data->plic, addr & 0x3FFFFFF, width, value));
             return;
         case 0x40: /* UART */
-            u8250_read(hart, &data->uart, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(
+                data->uart_lock,
+                u8250_read(hart, &data->uart, addr & 0xFFFFF, width, value));
             emu_update_uart_interrupts(hart->vm);
             return;
 #if SEMU_HAS(VIRTIONET)
         case 0x41: /* virtio-net */
-            virtio_net_read(hart, &data->vnet, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vnet_lock,
+                            virtio_net_read(hart, &data->vnet, addr & 0xFFFFF,
+                                            width, value));
             return;
 #endif
 #if SEMU_HAS(VIRTIOBLK)
         case 0x42: /* virtio-blk */
-            virtio_blk_read(hart, &data->vblk, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vblk_lock,
+                            virtio_blk_read(hart, &data->vblk, addr & 0xFFFFF,
+                                            width, value));
             return;
 #endif
         case 0x43: /* mtimer */
-            aclint_mtimer_read(hart, &data->mtimer, addr & 0xFFFFF, width,
-                               value);
+            EMU_DEVICE_CALL(data->mtimer_lock,
+                            aclint_mtimer_read(hart, &data->mtimer,
+                                               addr & 0xFFFFF, width, value));
             return;
         case 0x44: /* mswi */
-            aclint_mswi_read(hart, &data->mswi, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->mswi_lock,
+                            aclint_mswi_read(hart, &data->mswi, addr & 0xFFFFF,
+                                             width, value));
             return;
         case 0x45: /* sswi */
-            aclint_sswi_read(hart, &data->sswi, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->sswi_lock,
+                            aclint_sswi_read(hart, &data->sswi, addr & 0xFFFFF,
+                                             width, value));
             return;
 #if SEMU_HAS(VIRTIORNG)
         case 0x46: /* virtio-rng */
-            virtio_rng_read(hart, &data->vrng, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vrng_lock,
+                            virtio_rng_read(hart, &data->vrng, addr & 0xFFFFF,
+                                            width, value));
             return;
 #endif
 
 #if SEMU_HAS(VIRTIOSND)
         case 0x47: /* virtio-snd */
-            virtio_snd_read(hart, &data->vsnd, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vsnd_lock,
+                            virtio_snd_read(hart, &data->vsnd, addr & 0xFFFFF,
+                                            width, value));
             return;
 #endif
 
 #if SEMU_HAS(VIRTIOFS)
         case 0x48: /* virtio-fs */
-            virtio_fs_read(hart, &data->vfs, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(
+                data->vfs_lock,
+                virtio_fs_read(hart, &data->vfs, addr & 0xFFFFF, width, value));
             return;
 #endif
 #if SEMU_HAS(VIRTIOINPUT)
         case 0x49: /* virtio-input keyboard */
-            virtio_input_read(hart, &data->vkeyboard, addr & 0xFFFFF, width,
-                              value);
+            EMU_DEVICE_CALL(data->vkeyboard_lock,
+                            virtio_input_read(hart, &data->vkeyboard,
+                                              addr & 0xFFFFF, width, value));
             return;
         case 0x4A: /* virtio-input mouse */
-            virtio_input_read(hart, &data->vmouse, addr & 0xFFFFF, width,
-                              value);
+            EMU_DEVICE_CALL(data->vmouse_lock,
+                            virtio_input_read(hart, &data->vmouse,
+                                              addr & 0xFFFFF, width, value));
             return;
 #endif
 #if SEMU_HAS(VIRTIOGPU)
         case 0x4B: /* virtio-gpu */
-            virtio_gpu_read(hart, &data->vgpu, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vgpu_lock,
+                            virtio_gpu_read(hart, &data->vgpu, addr & 0xFFFFF,
+                                            width, value));
             return;
 #endif
         }
@@ -372,74 +428,100 @@ static void mem_store(hart_t *hart,
         switch ((addr >> 20) & MASK(8)) {
         case 0x0:
         case 0x2: /* PLIC (0 - 0x3F) */
-            plic_write(hart, &data->plic, addr & 0x3FFFFFF, width, value);
-            plic_update_interrupts(hart->vm, &data->plic);
+            EMU_DEVICE_CALL(
+                data->plic_lock,
+                plic_write(hart, &data->plic, addr & 0x3FFFFFF, width, value);
+                plic_update_interrupts(hart->vm, &data->plic));
             return;
         case 0x40: /* UART */
-            u8250_write(hart, &data->uart, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(
+                data->uart_lock,
+                u8250_write(hart, &data->uart, addr & 0xFFFFF, width, value));
             emu_update_uart_interrupts(hart->vm);
             return;
 #if SEMU_HAS(VIRTIONET)
         case 0x41: /* virtio-net */
-            virtio_net_write(hart, &data->vnet, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vnet_lock,
+                            virtio_net_write(hart, &data->vnet, addr & 0xFFFFF,
+                                             width, value));
             emu_update_vnet_interrupts(hart->vm);
             return;
 #endif
 #if SEMU_HAS(VIRTIOBLK)
         case 0x42: /* virtio-blk */
-            virtio_blk_write(hart, &data->vblk, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vblk_lock,
+                            virtio_blk_write(hart, &data->vblk, addr & 0xFFFFF,
+                                             width, value));
             emu_update_vblk_interrupts(hart->vm);
             return;
 #endif
         case 0x43: /* mtimer */
-            aclint_mtimer_write(hart, &data->mtimer, addr & 0xFFFFF, width,
-                                value);
-            aclint_mtimer_update_interrupts(hart, &data->mtimer);
+            EMU_DEVICE_CALL(
+                data->mtimer_lock,
+                aclint_mtimer_write(hart, &data->mtimer, addr & 0xFFFFF, width,
+                                    value);
+                aclint_mtimer_update_interrupts(hart, &data->mtimer));
             return;
         case 0x44: /* mswi */
-            aclint_mswi_write(hart, &data->mswi, addr & 0xFFFFF, width, value);
-            aclint_mswi_update_interrupts(hart, &data->mswi);
+            EMU_DEVICE_CALL(
+                data->mswi_lock,
+                aclint_mswi_write(hart, &data->mswi, addr & 0xFFFFF, width,
+                                  value);
+                aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi));
             return;
         case 0x45: /* sswi */
-            aclint_sswi_write(hart, &data->sswi, addr & 0xFFFFF, width, value);
-            aclint_sswi_update_interrupts(hart, &data->sswi);
+            EMU_DEVICE_CALL(
+                data->sswi_lock,
+                aclint_sswi_write(hart, &data->sswi, addr & 0xFFFFF, width,
+                                  value);
+                aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi));
             return;
 
 #if SEMU_HAS(VIRTIORNG)
         case 0x46: /* virtio-rng */
-            virtio_rng_write(hart, &data->vrng, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vrng_lock,
+                            virtio_rng_write(hart, &data->vrng, addr & 0xFFFFF,
+                                             width, value));
             emu_update_vrng_interrupts(hart->vm);
             return;
 #endif
 
 #if SEMU_HAS(VIRTIOSND)
         case 0x47: /* virtio-snd */
-            virtio_snd_write(hart, &data->vsnd, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vsnd_lock,
+                            virtio_snd_write(hart, &data->vsnd, addr & 0xFFFFF,
+                                             width, value));
             emu_update_vsnd_interrupts(hart->vm);
             return;
 #endif
 
 #if SEMU_HAS(VIRTIOFS)
         case 0x48: /* virtio-fs */
-            virtio_fs_write(hart, &data->vfs, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vfs_lock,
+                            virtio_fs_write(hart, &data->vfs, addr & 0xFFFFF,
+                                            width, value));
             emu_update_vfs_interrupts(hart->vm);
             return;
 #endif
 #if SEMU_HAS(VIRTIOINPUT)
         case 0x49: /* virtio-input keyboard */
-            virtio_input_write(hart, &data->vkeyboard, addr & 0xFFFFF, width,
-                               value);
+            EMU_DEVICE_CALL(data->vkeyboard_lock,
+                            virtio_input_write(hart, &data->vkeyboard,
+                                               addr & 0xFFFFF, width, value));
             emu_update_vinput_keyboard_interrupts(hart->vm);
             return;
         case 0x4A: /* virtio-input mouse */
-            virtio_input_write(hart, &data->vmouse, addr & 0xFFFFF, width,
-                               value);
+            EMU_DEVICE_CALL(data->vmouse_lock,
+                            virtio_input_write(hart, &data->vmouse,
+                                               addr & 0xFFFFF, width, value));
             emu_update_vinput_mouse_interrupts(hart->vm);
             return;
 #endif
 #if SEMU_HAS(VIRTIOGPU)
         case 0x4B: /* virtio-gpu */
-            virtio_gpu_write(hart, &data->vgpu, addr & 0xFFFFF, width, value);
+            EMU_DEVICE_CALL(data->vgpu_lock,
+                            virtio_gpu_write(hart, &data->vgpu, addr & 0xFFFFF,
+                                             width, value));
             emu_update_vgpu_interrupts(hart->vm);
             return;
 #endif
@@ -462,10 +544,11 @@ static inline sbi_ret_t handle_sbi_ecall_TIMER(hart_t *hart, int32_t fid)
     emu_state_t *data = PRIV(hart);
     switch (fid) {
     case SBI_TIMER__SET_TIMER:
-        data->mtimer.mtimecmp[hart->mhartid] =
-            (((uint64_t) hart->x_regs[RV_R_A1]) << 32) |
-            (uint64_t) (hart->x_regs[RV_R_A0]);
-        hart->sip &= ~RV_INT_STI_BIT;
+        __atomic_store_n(&data->mtimer.mtimecmp[hart->mhartid],
+                         (((uint64_t) hart->x_regs[RV_R_A1]) << 32) |
+                             (uint64_t) (hart->x_regs[RV_R_A0]),
+                         __ATOMIC_RELAXED);
+        hart_sip_clear_bits(hart, RV_INT_STI_BIT);
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     default:
         return (sbi_ret_t) {SBI_ERR_NOT_SUPPORTED, 0};
@@ -479,7 +562,7 @@ static inline sbi_ret_t handle_sbi_ecall_RST(hart_t *hart, int32_t fid)
     case SBI_RST__SYSTEM_RESET:
         fprintf(stderr, "system reset: type=%u, reason=%u\n",
                 hart->x_regs[RV_R_A0], hart->x_regs[RV_R_A1]);
-        data->stopped = true;
+        emu_stopped_store(data, true);
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     default:
         return (sbi_ret_t) {SBI_ERR_NOT_SUPPORTED, 0};
@@ -497,27 +580,28 @@ static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
             return (sbi_ret_t) {SBI_ERR_INVALID_PARAM, 0};
         start_addr = hart->x_regs[RV_R_A1];
         opaque = hart->x_regs[RV_R_A2];
-        vm->hart[hartid]->hsm_status = SBI_HSM_STATE_STARTED;
         vm->hart[hartid]->satp = 0;
         vm->hart[hartid]->sstatus_sie = 0;
         vm->hart[hartid]->x_regs[RV_R_A0] = hartid;
         vm->hart[hartid]->x_regs[RV_R_A1] = opaque;
         vm->hart[hartid]->pc = start_addr;
         vm->hart[hartid]->s_mode = true;
+        hart_hsm_status_store(vm->hart[hartid], SBI_HSM_STATE_STARTED);
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     case SBI_HSM__HART_STOP:
-        hart->hsm_status = SBI_HSM_STATE_STOPPED;
+        hart_hsm_status_store(hart, SBI_HSM_STATE_STOPPED);
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     case SBI_HSM__HART_GET_STATUS:
         hartid = hart->x_regs[RV_R_A0];
         if (hartid >= vm->n_hart)
             return (sbi_ret_t) {SBI_ERR_INVALID_PARAM, 0};
-        return (sbi_ret_t) {SBI_SUCCESS, vm->hart[hartid]->hsm_status};
+        return (sbi_ret_t) {SBI_SUCCESS,
+                            hart_hsm_status_load(vm->hart[hartid])};
     case SBI_HSM__HART_SUSPEND:
         suspend_type = hart->x_regs[RV_R_A0];
         resume_addr = hart->x_regs[RV_R_A1];
         opaque = hart->x_regs[RV_R_A2];
-        hart->hsm_status = SBI_HSM_STATE_SUSPENDED;
+        hart_hsm_status_store(hart, SBI_HSM_STATE_SUSPENDED);
         if (suspend_type == 0x00000000) {
             hart->hsm_resume_is_ret = true;
             hart->hsm_resume_pc = hart->pc;
@@ -536,19 +620,19 @@ static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
 static inline sbi_ret_t handle_sbi_ecall_IPI(hart_t *hart, int32_t fid)
 {
     emu_state_t *data = PRIV(hart);
-    uint64_t hart_mask, hart_mask_base;
+    uint32_t hart_mask, hart_mask_base;
     switch (fid) {
     case SBI_IPI__SEND_IPI:
-        hart_mask = (uint64_t) hart->x_regs[RV_R_A0];
-        hart_mask_base = (uint32_t) hart->x_regs[RV_R_A1];
+        hart_mask = hart->x_regs[RV_R_A0];
+        hart_mask_base = hart->x_regs[RV_R_A1];
         if (hart_mask_base == UINT32_MAX) {
             for (uint32_t i = 0; i < hart->vm->n_hart; i++)
-                data->sswi.ssip[i] = 1;
+                __atomic_store_n(&data->sswi.ssip[i], 1, __ATOMIC_RELAXED);
         } else {
             for (uint32_t i = hart_mask_base; hart_mask && i < hart->vm->n_hart;
                  hart_mask >>= 1, i++) {
                 if (hart_mask & 1)
-                    data->sswi.ssip[i] = 1;
+                    __atomic_store_n(&data->sswi.ssip[i], 1, __ATOMIC_RELAXED);
             }
         }
 
@@ -561,12 +645,12 @@ static inline sbi_ret_t handle_sbi_ecall_IPI(hart_t *hart, int32_t fid)
 
 static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
 {
-    uint64_t hart_mask, hart_mask_base;
+    uint32_t hart_mask, hart_mask_base;
     uint32_t start_addr, size;
     switch (fid) {
     case SBI_RFENCE__I:
-        hart_mask = (uint64_t) hart->x_regs[RV_R_A0];
-        hart_mask_base = (uint32_t) hart->x_regs[RV_R_A1];
+        hart_mask = hart->x_regs[RV_R_A0];
+        hart_mask_base = hart->x_regs[RV_R_A1];
 
         if (hart_mask_base == UINT32_MAX) {
             for (uint32_t i = 0; i < hart->vm->n_hart; i++)
@@ -581,8 +665,8 @@ static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     case SBI_RFENCE__VMA:
     case SBI_RFENCE__VMA_ASID:
-        hart_mask = (uint64_t) hart->x_regs[RV_R_A0];
-        hart_mask_base = (uint32_t) hart->x_regs[RV_R_A1];
+        hart_mask = hart->x_regs[RV_R_A0];
+        hart_mask_base = hart->x_regs[RV_R_A1];
         start_addr = hart->x_regs[RV_R_A2];
         size = hart->x_regs[RV_R_A3];
 
@@ -887,19 +971,19 @@ static int validate_default_dtb_boot_options(const char *dtb_file,
     return 0;
 }
 
-#define INIT_HART(hart, emu, id)                  \
-    do {                                          \
-        hart->priv = emu;                         \
-        hart->mhartid = id;                       \
-        hart->ram_base = (emu)->ram;              \
-        hart->ram_size = RAM_SIZE;                \
-        hart->mem_fetch = mem_fetch;              \
-        hart->mem_load = mem_load;                \
-        hart->mem_store = mem_store;              \
-        hart->mem_page_table = mem_page_table;    \
-        hart->s_mode = true;                      \
-        hart->hsm_status = SBI_HSM_STATE_STOPPED; \
-        vm_init(hart);                            \
+#define INIT_HART(hart, emu, id)                            \
+    do {                                                    \
+        hart->priv = emu;                                   \
+        hart->mhartid = id;                                 \
+        hart->ram_base = (emu)->ram;                        \
+        hart->ram_size = RAM_SIZE;                          \
+        hart->mem_fetch = mem_fetch;                        \
+        hart->mem_load = mem_load;                          \
+        hart->mem_store = mem_store;                        \
+        hart->mem_page_table = mem_page_table;              \
+        hart->s_mode = true;                                \
+        hart_hsm_status_store(hart, SBI_HSM_STATE_STOPPED); \
+        vm_init(hart);                                      \
     } while (0)
 
 static int semu_init(emu_state_t *emu, int argc, char **argv)
@@ -931,6 +1015,43 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 
     /* Initialize the emulator */
     memset(emu, 0, sizeof(*emu));
+
+#define INIT_EMU_MUTEX(lock)              \
+    do {                                  \
+        if (emu_mutex_init(&(lock))) {    \
+            perror("pthread_mutex_init"); \
+            return 1;                     \
+        }                                 \
+    } while (0)
+
+    INIT_EMU_MUTEX(emu->plic_lock);
+    INIT_EMU_MUTEX(emu->uart_lock);
+    INIT_EMU_MUTEX(emu->mtimer_lock);
+    INIT_EMU_MUTEX(emu->mswi_lock);
+    INIT_EMU_MUTEX(emu->sswi_lock);
+#if SEMU_HAS(VIRTIONET)
+    INIT_EMU_MUTEX(emu->vnet_lock);
+#endif
+#if SEMU_HAS(VIRTIOBLK)
+    INIT_EMU_MUTEX(emu->vblk_lock);
+#endif
+#if SEMU_HAS(VIRTIORNG)
+    INIT_EMU_MUTEX(emu->vrng_lock);
+#endif
+#if SEMU_HAS(VIRTIOSND)
+    INIT_EMU_MUTEX(emu->vsnd_lock);
+#endif
+#if SEMU_HAS(VIRTIOFS)
+    INIT_EMU_MUTEX(emu->vfs_lock);
+#endif
+#if SEMU_HAS(VIRTIOINPUT)
+    INIT_EMU_MUTEX(emu->vkeyboard_lock);
+    INIT_EMU_MUTEX(emu->vmouse_lock);
+#endif
+#if SEMU_HAS(VIRTIOGPU)
+    INIT_EMU_MUTEX(emu->vgpu_lock);
+#endif
+#undef INIT_EMU_MUTEX
 
     /* Set up RAM */
     emu->ram = mmap(NULL, RAM_SIZE, PROT_READ | PROT_WRITE,
@@ -987,6 +1108,12 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
         fprintf(stderr, "Failed to allocate %u hart slots.\n", vm->n_hart);
         return 1;
     }
+    vm->reservations = calloc(vm->n_hart, sizeof(*vm->reservations));
+    if (!vm->reservations) {
+        fprintf(stderr, "Failed to allocate %u reservation slots.\n",
+                vm->n_hart);
+        return 1;
+    }
     for (uint32_t i = 0; i < vm->n_hart; i++) {
         hart_t *newhart = calloc(1, sizeof(hart_t));
         if (!newhart) {
@@ -997,7 +1124,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
         newhart->x_regs[RV_R_A0] = i;
         newhart->x_regs[RV_R_A1] = dtb_addr;
         if (i == 0) {
-            newhart->hsm_status = SBI_HSM_STATE_STARTED;
+            hart_hsm_status_store(newhart, SBI_HSM_STATE_STARTED);
             /* Set initial PC for hart 0 to kernel entry point (semu RAM base at
              * 0x0) */
             newhart->pc = 0x00000000;
@@ -1036,11 +1163,11 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #endif
     /* Set up ACLINT */
     semu_timer_init(&emu->mtimer.mtime, CLOCK_FREQ, hart_count);
-    emu->mtimer.mtimecmp = calloc(vm->n_hart, sizeof(uint64_t));
+    emu->mtimer.mtimecmp = calloc(vm->n_hart, sizeof(*emu->mtimer.mtimecmp));
     emu->mtimer.n_hart = vm->n_hart;
-    emu->mswi.msip = calloc(vm->n_hart, sizeof(uint32_t));
+    emu->mswi.msip = calloc(vm->n_hart, sizeof(*emu->mswi.msip));
     emu->mswi.n_hart = vm->n_hart;
-    emu->sswi.ssip = calloc(vm->n_hart, sizeof(uint32_t));
+    emu->sswi.ssip = calloc(vm->n_hart, sizeof(*emu->sswi.ssip));
     emu->sswi.n_hart = vm->n_hart;
 #if SEMU_HAS(VIRTIOSND)
     if (!virtio_snd_init(&(emu->vsnd)))
@@ -1165,7 +1292,7 @@ static void wfi_handler(hart_t *hart)
     /* Per RISC-V spec: WFI returns immediately if interrupt is pending.
      * We check if any interrupt is actually pending (sip & sie != 0).
      */
-    bool interrupt_pending = (hart->sip & hart->sie) != 0;
+    bool interrupt_pending = (hart_sip_load(hart) & hart->sie) != 0;
 
     if (!interrupt_pending) {
         emu_state_t *emu = PRIV(hart);
@@ -1176,15 +1303,15 @@ static void wfi_handler(hart_t *hart)
          * there's no scheduler to resume execution after yield.
          */
         if (vm->n_hart > 1) {
-            hart->in_wfi = true; /* Mark as waiting for interrupt */
-            coro_yield();        /* Suspend until scheduler resumes us */
+            hart_in_wfi_store(hart, true); /* Mark as waiting for interrupt */
+            coro_yield(); /* Suspend until scheduler resumes us */
             /* NOTE: Do NOT clear in_wfi here to avoid race condition.
              * The scheduler needs to see this flag to detect idle state.
              * The flag will be cleared when an interrupt is actually injected.
              */
         }
     } else {
-        hart->in_wfi = false; /* Clear if interrupt already pending */
+        hart_in_wfi_store(hart, false); /* Clear if interrupt already pending */
     }
 }
 
@@ -1195,14 +1322,14 @@ static void wfi_handler(hart_t *hart)
  * the scheduler to allow other harts and I/O coroutines to make progress.
  *
  * Execution model:
- * - Harts execute in batches of 64 instructions before yielding
- * - Peripheral polling and interrupt checks happen before each batch
+ * - Harts execute in batches before yielding to the scheduler
+ * - Peripheral polling and interrupt checks happen every SMP slice
  * - WFI instruction triggers immediate yield (via wfi_handler callback)
  * - Harts in HSM_STATE_STOPPED remain suspended until IPI wakes them
  *
  * This design balances responsiveness and throughput:
- * - Small batch size (64 insns) keeps latency low for I/O and IPI
- * - Cooperative scheduling avoids overhead of preemptive context switches
+ * - Small SMP slices keep latency low for I/O and IPI
+ * - Larger scheduler batches avoid excessive coroutine/poll overhead
  * - WFI-based blocking allows efficient idle when all harts are waiting
  */
 static void hart_exec_loop(void *arg)
@@ -1211,9 +1338,9 @@ static void hart_exec_loop(void *arg)
     emu_state_t *emu = PRIV(hart);
 
     /* Run hart until emulator stops */
-    while (!emu->stopped) {
+    while (!emu_stopped_load(emu)) {
         /* Check HSM (Hart State Management) state via SBI extension */
-        if (hart->hsm_status != SBI_HSM_STATE_STARTED) {
+        if (hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED) {
             /* Hart is STOPPED or SUSPENDED - update peripherals and yield.
              * An IPI (via SBI_HSM__HART_START) will change state to STARTED.
              */
@@ -1228,12 +1355,12 @@ static void hart_exec_loop(void *arg)
          * Keep peripheral polling at the original slice cadence so I/O and
          * external interrupt latency do not scale with the batch size.
          */
-        for (int i = 0; i < 64; i += SEMU_SMP_SLICE_STEPS) {
+        for (int i = 0; i < SEMU_SMP_BATCH_STEPS; i += SEMU_SMP_SLICE_STEPS) {
             emu_tick_peripherals(emu);
             emu_update_timer_interrupt(hart);
             emu_update_swi_interrupt(hart);
             if (unlikely(semu_step_chunk(emu, hart, SEMU_SMP_SLICE_STEPS))) {
-                emu->stopped = true;
+                emu_stopped_store(emu, true);
                 goto cleanup;
             }
         }
@@ -1288,7 +1415,7 @@ static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps)
 
         if (hart->error == ERR_EXCEPTION && hart->exc_cause == RV_EXC_ECALL_S) {
             handle_sbi_ecall(hart);
-            if (unlikely(emu->stopped))
+            if (unlikely(emu_stopped_load(emu)))
                 return 0;
             continue;
         }
@@ -1457,8 +1584,7 @@ static void semu_run(emu_state_t *emu)
          * - Peripherals are polled inline during hart execution (see
          *   emu_tick_peripherals), not via separate coroutines
          * - Non-blocking poll() for network/disk I/O (~200ns overhead)
-         * - Inline polling provides lowest latency (checked every 64
-         * instructions)
+         * - Inline polling provides low latency by checking every SMP slice
          */
 #ifdef __APPLE__
         int kq = kqueue();
@@ -1515,7 +1641,7 @@ static void semu_run(emu_state_t *emu)
         struct pollfd *pfds = NULL;
         size_t poll_capacity = 0;
 
-        while (!emu->stopped) {
+        while (!emu_stopped_load(emu)) {
             /* Break out on SIGINT/SIGTERM so main() returns and atexit
              * hooks (e.g., virtio-blk msync) run before the process dies.
              */
@@ -1560,10 +1686,11 @@ static void semu_run(emu_state_t *emu)
             uint32_t started_harts = 0;
             uint32_t idle_harts = 0;
             for (uint32_t i = 0; i < vm->n_hart; i++) {
-                if (vm->hart[i]->hsm_status == SBI_HSM_STATE_STARTED) {
+                if (hart_hsm_status_load(vm->hart[i]) ==
+                    SBI_HSM_STATE_STARTED) {
                     started_harts++;
                     /* Count hart as idle if it's in WFI or waiting for UART */
-                    if (vm->hart[i]->in_wfi ||
+                    if (hart_in_wfi_load(vm->hart[i]) ||
                         (emu->uart.has_waiting_hart &&
                          emu->uart.waiting_hart_id == i)) {
                         idle_harts++;
@@ -1744,9 +1871,9 @@ static void semu_run(emu_state_t *emu)
 
         /* A closed window is a normal user action, not an error. */
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
-        if (emu->stopped && !g_window.window_is_closed())
+        if (emu_stopped_load(emu) && !g_window.window_is_closed())
 #else
-        if (emu->stopped)
+        if (emu_stopped_load(emu))
 #endif
         {
             emu->exit_code = 1;
@@ -1758,13 +1885,14 @@ static void semu_run(emu_state_t *emu)
     }
 
     /* Single-hart mode: use original scheduling */
-    while (!emu->stopped) {
+    while (!emu_stopped_load(emu)) {
         /* Break out on SIGINT/SIGTERM so atexit hooks fire on graceful exit. */
         if (signal_received)
             break;
 #if SEMU_HAS(VIRTIONET)
         int i = 0;
-        if (emu->vnet.peer.type == NETDEV_IMPL_user && boot_complete) {
+        if (emu->vnet.peer.type == NETDEV_IMPL_user &&
+            semu_boot_complete_load()) {
             net_user_options_t *usr = (net_user_options_t *) emu->vnet.peer.op;
 
             uint32_t timeout = -1;

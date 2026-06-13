@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -11,7 +13,17 @@
  * initial user-mode process, we use this transition to determine whether the
  * boot process has completed.
  */
-extern bool boot_complete;
+extern _Atomic bool boot_complete;
+
+static inline bool semu_boot_complete_load(void)
+{
+    return atomic_load_explicit(&boot_complete, memory_order_acquire);
+}
+
+static inline void semu_boot_complete_store(bool value)
+{
+    atomic_store_explicit(&boot_complete, value, memory_order_release);
+}
 
 /* TIMER */
 typedef struct {
