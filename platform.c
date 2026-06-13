@@ -102,20 +102,31 @@ const struct semu_platform_device *semu_platform_devices(size_t *count)
     return fixed_devices;
 }
 
-bool semu_platform_register_fixed_mmio(struct semu_mmio_bus *bus)
+bool semu_platform_register_fixed_mmio_configured(
+    struct semu_mmio_bus *bus,
+    semu_platform_mmio_configure_fn configure,
+    void *opaque)
 {
     for (size_t i = 0; i < PLATFORM_ARRAY_SIZE(fixed_devices); i++) {
         const struct semu_platform_device *device = &fixed_devices[i];
-        const struct semu_mmio_region region = {
+        struct semu_mmio_region region = {
             .base = device->base,
             .size = device->size,
             .name = device->name,
             .irq_source = device->irq_source,
         };
 
+        if (configure)
+            configure(device, &region, opaque);
+
         if (!semu_mmio_bus_register(bus, &region))
             return false;
     }
 
     return true;
+}
+
+bool semu_platform_register_fixed_mmio(struct semu_mmio_bus *bus)
+{
+    return semu_platform_register_fixed_mmio_configured(bus, NULL, NULL);
 }

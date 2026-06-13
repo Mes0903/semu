@@ -5,6 +5,7 @@
 #if SEMU_HAS(VIRTIONET)
 #include "netdev.h"
 #endif
+#include "mmio-bus.h"
 #include "ram_access.h"
 #include "riscv.h"
 #include "virtio.h"
@@ -584,6 +585,7 @@ typedef struct {
     ram_dma_t ram_dma;
     uint32_t *disk;
     vm_t vm;
+    struct semu_mmio_bus mmio_bus;
     plic_state_t plic;
     pthread_mutex_t plic_lock;
     u8250_state_t uart;

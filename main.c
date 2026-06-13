@@ -20,6 +20,8 @@
 
 #include "device.h"
 #include "mini-gdbstub/include/gdbstub.h"
+#include "mmio-bus.h"
+#include "platform.h"
 #if SEMU_HAS(VIRTIOINPUT)
 #include "virtio-input-event.h"
 #endif
@@ -591,112 +593,619 @@ static inline void emu_tick_peripherals(emu_state_t *emu)
         io_poll_peripherals(emu);
 }
 
+typedef bool (*semu_runtime_mmio_read_fn)(hart_t *hart,
+                                          void *opaque,
+                                          uint64_t off,
+                                          uint8_t width,
+                                          uint32_t *value);
+typedef bool (*semu_runtime_mmio_write_fn)(hart_t *hart,
+                                           void *opaque,
+                                           uint64_t off,
+                                           uint8_t width,
+                                           uint32_t value);
+
+static void semu_runtime_mmio_set_callbacks(struct semu_mmio_region *region,
+                                            void *opaque,
+                                            semu_runtime_mmio_read_fn read,
+                                            semu_runtime_mmio_write_fn write)
+{
+    region->opaque = opaque;
+    region->read = read;
+    region->write = write;
+}
+
+static uint32_t semu_plic_legacy_offset(uint64_t window_base, uint64_t off)
+{
+    return (uint32_t) ((window_base & UINT64_C(0x03ffffff)) + off);
+}
+
+static bool semu_mmio_plic_read_window(hart_t *hart,
+                                       void *opaque,
+                                       uint64_t off,
+                                       uint8_t width,
+                                       uint32_t *value,
+                                       uint64_t window_base)
+{
+    emu_state_t *data = opaque;
+    uint32_t plic_addr = semu_plic_legacy_offset(window_base, off);
+
+    EMU_DEVICE_CALL(data->plic_lock,
+                    plic_read(hart, &data->plic, plic_addr, width, value);
+                    plic_update_interrupts(hart->vm, &data->plic));
+    semu_wake_interruptible_harts(data);
+    return true;
+}
+
+static bool semu_mmio_plic_write_window(hart_t *hart,
+                                        void *opaque,
+                                        uint64_t off,
+                                        uint8_t width,
+                                        uint32_t value,
+                                        uint64_t window_base)
+{
+    emu_state_t *data = opaque;
+    uint32_t plic_addr = semu_plic_legacy_offset(window_base, off);
+
+    EMU_DEVICE_CALL(data->plic_lock,
+                    plic_write(hart, &data->plic, plic_addr, width, value);
+                    plic_update_interrupts(hart->vm, &data->plic));
+    semu_wake_interruptible_harts(data);
+    return true;
+}
+
+static bool semu_mmio_plic_window0_read(hart_t *hart,
+                                        void *opaque,
+                                        uint64_t off,
+                                        uint8_t width,
+                                        uint32_t *value)
+{
+    return semu_mmio_plic_read_window(hart, opaque, off, width, value,
+                                      SEMU_PLATFORM_MMIO_PLIC_WINDOW0_BASE);
+}
+
+static bool semu_mmio_plic_window0_write(hart_t *hart,
+                                         void *opaque,
+                                         uint64_t off,
+                                         uint8_t width,
+                                         uint32_t value)
+{
+    return semu_mmio_plic_write_window(hart, opaque, off, width, value,
+                                       SEMU_PLATFORM_MMIO_PLIC_WINDOW0_BASE);
+}
+
+static bool semu_mmio_plic_window2_read(hart_t *hart,
+                                        void *opaque,
+                                        uint64_t off,
+                                        uint8_t width,
+                                        uint32_t *value)
+{
+    return semu_mmio_plic_read_window(hart, opaque, off, width, value,
+                                      SEMU_PLATFORM_MMIO_PLIC_WINDOW2_BASE);
+}
+
+static bool semu_mmio_plic_window2_write(hart_t *hart,
+                                         void *opaque,
+                                         uint64_t off,
+                                         uint8_t width,
+                                         uint32_t value)
+{
+    return semu_mmio_plic_write_window(hart, opaque, off, width, value,
+                                       SEMU_PLATFORM_MMIO_PLIC_WINDOW2_BASE);
+}
+
+static bool semu_mmio_uart_read(hart_t *hart,
+                                void *opaque,
+                                uint64_t off,
+                                uint8_t width,
+                                uint32_t *value)
+{
+    emu_state_t *data = opaque;
+    bool pending;
+
+    EMU_DEVICE_CALL(data->uart_lock,
+                    u8250_read(hart, &data->uart, (uint32_t) off, width, value);
+                    u8250_update_interrupts(&data->uart);
+                    pending = data->uart.pending_ints != 0);
+    emu_update_plic_irq(data, IRQ_UART_BIT, pending);
+    return true;
+}
+
+static bool semu_mmio_uart_write(hart_t *hart,
+                                 void *opaque,
+                                 uint64_t off,
+                                 uint8_t width,
+                                 uint32_t value)
+{
+    emu_state_t *data = opaque;
+    bool pending;
+
+    EMU_DEVICE_CALL(data->uart_lock, u8250_write(hart, &data->uart,
+                                                 (uint32_t) off, width, value);
+                    u8250_update_interrupts(&data->uart);
+                    pending = data->uart.pending_ints != 0);
+    emu_update_plic_irq(data, IRQ_UART_BIT, pending);
+    return true;
+}
+
+#if SEMU_HAS(VIRTIONET)
+static bool semu_mmio_vnet_read(hart_t *hart,
+                                void *opaque,
+                                uint64_t off,
+                                uint8_t width,
+                                uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(
+        data->vnet_lock,
+        virtio_net_read(hart, &data->vnet, (uint32_t) off, width, value));
+    return true;
+}
+
+static bool semu_mmio_vnet_write(hart_t *hart,
+                                 void *opaque,
+                                 uint64_t off,
+                                 uint8_t width,
+                                 uint32_t value)
+{
+    emu_state_t *data = opaque;
+    bool pending;
+
+    EMU_DEVICE_CALL(
+        data->vnet_lock,
+        virtio_net_write(hart, &data->vnet, (uint32_t) off, width, value);
+        pending = data->vnet.InterruptStatus != 0);
+    emu_update_plic_irq(data, IRQ_VNET_BIT, pending);
+    return true;
+}
+#endif
+
+#if SEMU_HAS(VIRTIOBLK)
+static bool semu_mmio_vblk_read(hart_t *hart,
+                                void *opaque,
+                                uint64_t off,
+                                uint8_t width,
+                                uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(
+        data->vblk_lock,
+        virtio_blk_read(hart, &data->vblk, (uint32_t) off, width, value));
+    return true;
+}
+
+static bool semu_mmio_vblk_write(hart_t *hart,
+                                 void *opaque,
+                                 uint64_t off,
+                                 uint8_t width,
+                                 uint32_t value)
+{
+    emu_state_t *data = opaque;
+    bool pending;
+
+    EMU_DEVICE_CALL(
+        data->vblk_lock,
+        virtio_blk_write(hart, &data->vblk, (uint32_t) off, width, value);
+        pending = data->vblk.InterruptStatus != 0);
+    emu_update_plic_irq(data, IRQ_VBLK_BIT, pending);
+    return true;
+}
+#endif
+
+static bool semu_mmio_mtimer_read(hart_t *hart,
+                                  void *opaque,
+                                  uint64_t off,
+                                  uint8_t width,
+                                  uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(
+        data->mtimer_lock,
+        aclint_mtimer_read(hart, &data->mtimer, (uint32_t) off, width, value));
+    return true;
+}
+
+static bool semu_mmio_mtimer_write(hart_t *hart,
+                                   void *opaque,
+                                   uint64_t off,
+                                   uint8_t width,
+                                   uint32_t value)
+{
+    emu_state_t *data = opaque;
+    uint32_t mtimer_addr = (uint32_t) off;
+    uint32_t target_hartid = mtimer_addr >> 3;
+    bool update_all_timers = mtimer_addr >= 0x7FF8 && mtimer_addr < 0x8000;
+
+    EMU_DEVICE_CALL(
+        data->mtimer_lock,
+        aclint_mtimer_write(hart, &data->mtimer, mtimer_addr, width, value));
+    if (hart->error)
+        return true;
+
+    if (update_all_timers) {
+        for (uint32_t i = 0; i < hart->vm->n_hart; i++) {
+            emu_update_timer_interrupt(hart->vm->hart[i]);
+            semu_wake_hart_if_interrupt_pending(data, i);
+        }
+    } else if (target_hartid < hart->vm->n_hart) {
+        emu_update_timer_interrupt(hart->vm->hart[target_hartid]);
+        semu_wake_hart_if_interrupt_pending(data, target_hartid);
+    }
+    return true;
+}
+
+static bool semu_mmio_mswi_read(hart_t *hart,
+                                void *opaque,
+                                uint64_t off,
+                                uint8_t width,
+                                uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(
+        data->mswi_lock,
+        aclint_mswi_read(hart, &data->mswi, (uint32_t) off, width, value));
+    return true;
+}
+
+static bool semu_mmio_mswi_write(hart_t *hart,
+                                 void *opaque,
+                                 uint64_t off,
+                                 uint8_t width,
+                                 uint32_t value)
+{
+    emu_state_t *data = opaque;
+    uint32_t target_hartid = ((uint32_t) off) >> 2;
+
+    EMU_DEVICE_CALL(
+        data->mswi_lock,
+        aclint_mswi_write(hart, &data->mswi, (uint32_t) off, width, value);
+        aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi));
+    if (target_hartid < hart->vm->n_hart)
+        emu_update_swi_interrupt(hart->vm->hart[target_hartid]);
+    semu_wake_hart_if_interrupt_pending(data, target_hartid);
+    return true;
+}
+
+static bool semu_mmio_sswi_read(hart_t *hart,
+                                void *opaque,
+                                uint64_t off,
+                                uint8_t width,
+                                uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(
+        data->sswi_lock,
+        aclint_sswi_read(hart, &data->sswi, (uint32_t) off, width, value));
+    return true;
+}
+
+static bool semu_mmio_sswi_write(hart_t *hart,
+                                 void *opaque,
+                                 uint64_t off,
+                                 uint8_t width,
+                                 uint32_t value)
+{
+    emu_state_t *data = opaque;
+    uint32_t target_hartid = ((uint32_t) off) >> 2;
+
+    EMU_DEVICE_CALL(
+        data->sswi_lock,
+        aclint_sswi_write(hart, &data->sswi, (uint32_t) off, width, value);
+        aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi));
+    if (target_hartid < hart->vm->n_hart)
+        emu_update_swi_interrupt(hart->vm->hart[target_hartid]);
+    semu_wake_hart_if_interrupt_pending(data, target_hartid);
+    return true;
+}
+
+#if SEMU_HAS(VIRTIORNG)
+static bool semu_mmio_vrng_read(hart_t *hart,
+                                void *opaque,
+                                uint64_t off,
+                                uint8_t width,
+                                uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(
+        data->vrng_lock,
+        virtio_rng_read(hart, &data->vrng, (uint32_t) off, width, value));
+    return true;
+}
+
+static bool semu_mmio_vrng_write(hart_t *hart,
+                                 void *opaque,
+                                 uint64_t off,
+                                 uint8_t width,
+                                 uint32_t value)
+{
+    emu_state_t *data = opaque;
+    bool pending;
+
+    EMU_DEVICE_CALL(
+        data->vrng_lock,
+        virtio_rng_write(hart, &data->vrng, (uint32_t) off, width, value);
+        pending = data->vrng.InterruptStatus != 0);
+    emu_update_plic_irq(data, IRQ_VRNG_BIT, pending);
+    return true;
+}
+#endif
+
+#if SEMU_HAS(VIRTIOSND)
+static bool semu_mmio_vsnd_read(hart_t *hart,
+                                void *opaque,
+                                uint64_t off,
+                                uint8_t width,
+                                uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(
+        data->vsnd_lock,
+        virtio_snd_read(hart, &data->vsnd, (uint32_t) off, width, value));
+    return true;
+}
+
+static bool semu_mmio_vsnd_write(hart_t *hart,
+                                 void *opaque,
+                                 uint64_t off,
+                                 uint8_t width,
+                                 uint32_t value)
+{
+    emu_state_t *data = opaque;
+    bool pending;
+
+    EMU_DEVICE_CALL(
+        data->vsnd_lock,
+        virtio_snd_write(hart, &data->vsnd, (uint32_t) off, width, value);
+        pending = __atomic_load_n(&data->vsnd.InterruptStatus,
+                                  __ATOMIC_ACQUIRE) != 0);
+    emu_update_plic_irq(data, IRQ_VSND_BIT, pending);
+    return true;
+}
+#endif
+
+#if SEMU_HAS(VIRTIOFS)
+static bool semu_mmio_vfs_read(hart_t *hart,
+                               void *opaque,
+                               uint64_t off,
+                               uint8_t width,
+                               uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(
+        data->vfs_lock,
+        virtio_fs_read(hart, &data->vfs, (uint32_t) off, width, value));
+    return true;
+}
+
+static bool semu_mmio_vfs_write(hart_t *hart,
+                                void *opaque,
+                                uint64_t off,
+                                uint8_t width,
+                                uint32_t value)
+{
+    emu_state_t *data = opaque;
+    bool pending;
+
+    EMU_DEVICE_CALL(
+        data->vfs_lock,
+        virtio_fs_write(hart, &data->vfs, (uint32_t) off, width, value);
+        pending = data->vfs.InterruptStatus != 0);
+    emu_update_plic_irq(data, IRQ_VFS_BIT, pending);
+    return true;
+}
+#endif
+
+#if SEMU_HAS(VIRTIOINPUT)
+static bool semu_mmio_vkeyboard_read(hart_t *hart,
+                                     void *opaque,
+                                     uint64_t off,
+                                     uint8_t width,
+                                     uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(data->vkeyboard_lock,
+                    virtio_input_read(hart, &data->vkeyboard, (uint32_t) off,
+                                      width, value));
+    return true;
+}
+
+static bool semu_mmio_vkeyboard_write(hart_t *hart,
+                                      void *opaque,
+                                      uint64_t off,
+                                      uint8_t width,
+                                      uint32_t value)
+{
+    emu_state_t *data = opaque;
+    bool pending;
+
+    EMU_DEVICE_CALL(data->vkeyboard_lock,
+                    virtio_input_write(hart, &data->vkeyboard, (uint32_t) off,
+                                       width, value);
+                    pending = virtio_input_irq_pending(&data->vkeyboard));
+    emu_update_plic_irq(data, IRQ_VINPUT_KEYBOARD_BIT, pending);
+    return true;
+}
+
+static bool semu_mmio_vmouse_read(hart_t *hart,
+                                  void *opaque,
+                                  uint64_t off,
+                                  uint8_t width,
+                                  uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(
+        data->vmouse_lock,
+        virtio_input_read(hart, &data->vmouse, (uint32_t) off, width, value));
+    return true;
+}
+
+static bool semu_mmio_vmouse_write(hart_t *hart,
+                                   void *opaque,
+                                   uint64_t off,
+                                   uint8_t width,
+                                   uint32_t value)
+{
+    emu_state_t *data = opaque;
+    bool pending;
+
+    EMU_DEVICE_CALL(
+        data->vmouse_lock,
+        virtio_input_write(hart, &data->vmouse, (uint32_t) off, width, value);
+        pending = virtio_input_irq_pending(&data->vmouse));
+    emu_update_plic_irq(data, IRQ_VINPUT_MOUSE_BIT, pending);
+    return true;
+}
+#endif
+
+#if SEMU_HAS(VIRTIOGPU)
+static bool semu_mmio_vgpu_read(hart_t *hart,
+                                void *opaque,
+                                uint64_t off,
+                                uint8_t width,
+                                uint32_t *value)
+{
+    emu_state_t *data = opaque;
+
+    EMU_DEVICE_CALL(
+        data->vgpu_lock,
+        virtio_gpu_read(hart, &data->vgpu, (uint32_t) off, width, value));
+    return true;
+}
+
+static bool semu_mmio_vgpu_write(hart_t *hart,
+                                 void *opaque,
+                                 uint64_t off,
+                                 uint8_t width,
+                                 uint32_t value)
+{
+    emu_state_t *data = opaque;
+    bool pending;
+
+    EMU_DEVICE_CALL(
+        data->vgpu_lock,
+        virtio_gpu_write(hart, &data->vgpu, (uint32_t) off, width, value);
+        pending = data->vgpu.InterruptStatus != 0);
+    emu_update_plic_irq(data, IRQ_VGPU_BIT, pending);
+    return true;
+}
+#endif
+
+static void semu_configure_runtime_mmio(
+    const struct semu_platform_device *device,
+    struct semu_mmio_region *region,
+    void *opaque)
+{
+    switch (device->base) {
+    case SEMU_PLATFORM_MMIO_PLIC_WINDOW0_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque,
+                                        semu_mmio_plic_window0_read,
+                                        semu_mmio_plic_window0_write);
+        break;
+    case SEMU_PLATFORM_MMIO_PLIC_WINDOW2_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque,
+                                        semu_mmio_plic_window2_read,
+                                        semu_mmio_plic_window2_write);
+        break;
+    case SEMU_PLATFORM_MMIO_UART_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_uart_read,
+                                        semu_mmio_uart_write);
+        break;
+#if SEMU_HAS(VIRTIONET)
+    case SEMU_PLATFORM_MMIO_VNET_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_vnet_read,
+                                        semu_mmio_vnet_write);
+        break;
+#endif
+#if SEMU_HAS(VIRTIOBLK)
+    case SEMU_PLATFORM_MMIO_VBLK_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_vblk_read,
+                                        semu_mmio_vblk_write);
+        break;
+#endif
+    case SEMU_PLATFORM_MMIO_MTIMER_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_mtimer_read,
+                                        semu_mmio_mtimer_write);
+        break;
+    case SEMU_PLATFORM_MMIO_MSWI_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_mswi_read,
+                                        semu_mmio_mswi_write);
+        break;
+    case SEMU_PLATFORM_MMIO_SSWI_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_sswi_read,
+                                        semu_mmio_sswi_write);
+        break;
+#if SEMU_HAS(VIRTIORNG)
+    case SEMU_PLATFORM_MMIO_VRNG_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_vrng_read,
+                                        semu_mmio_vrng_write);
+        break;
+#endif
+#if SEMU_HAS(VIRTIOSND)
+    case SEMU_PLATFORM_MMIO_VSND_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_vsnd_read,
+                                        semu_mmio_vsnd_write);
+        break;
+#endif
+#if SEMU_HAS(VIRTIOFS)
+    case SEMU_PLATFORM_MMIO_VFS_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_vfs_read,
+                                        semu_mmio_vfs_write);
+        break;
+#endif
+#if SEMU_HAS(VIRTIOINPUT)
+    case SEMU_PLATFORM_MMIO_VINPUT_KEYBOARD_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque,
+                                        semu_mmio_vkeyboard_read,
+                                        semu_mmio_vkeyboard_write);
+        break;
+    case SEMU_PLATFORM_MMIO_VINPUT_MOUSE_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_vmouse_read,
+                                        semu_mmio_vmouse_write);
+        break;
+#endif
+#if SEMU_HAS(VIRTIOGPU)
+    case SEMU_PLATFORM_MMIO_VGPU_BASE:
+        semu_runtime_mmio_set_callbacks(region, opaque, semu_mmio_vgpu_read,
+                                        semu_mmio_vgpu_write);
+        break;
+#endif
+    default:
+        break;
+    }
+}
+
+static bool semu_register_runtime_mmio(emu_state_t *emu)
+{
+    semu_mmio_bus_init(&emu->mmio_bus);
+    return semu_platform_register_fixed_mmio_configured(
+        &emu->mmio_bus, semu_configure_runtime_mmio, emu);
+}
+
 static void mem_load(hart_t *hart,
                      uint32_t addr,
                      uint8_t width,
                      uint32_t *value)
 {
     emu_state_t *data = PRIV(hart);
+
     /* RAM at 0x00000000 + RAM_SIZE */
     if (addr < RAM_SIZE) {
         ram_read(hart, data->ram, addr, width, value);
         return;
     }
 
-    if ((addr >> 28) == 0xF) { /* MMIO at 0xF_______ */
-        /* 256 regions of 1MiB */
-        switch ((addr >> 20) & MASK(8)) {
-        case 0x0:
-        case 0x2: /* PLIC (0 - 0x3F) */
-            EMU_DEVICE_CALL(
-                data->plic_lock,
-                plic_read(hart, &data->plic, addr & 0x3FFFFFF, width, value);
-                plic_update_interrupts(hart->vm, &data->plic));
-            semu_wake_interruptible_harts(data);
-            return;
-        case 0x40: { /* UART */
-            bool pending;
-            EMU_DEVICE_CALL(
-                data->uart_lock,
-                u8250_read(hart, &data->uart, addr & 0xFFFFF, width, value);
-                u8250_update_interrupts(&data->uart);
-                pending = data->uart.pending_ints != 0);
-            emu_update_plic_irq(data, IRQ_UART_BIT, pending);
-            return;
-        }
-#if SEMU_HAS(VIRTIONET)
-        case 0x41: /* virtio-net */
-            EMU_DEVICE_CALL(data->vnet_lock,
-                            virtio_net_read(hart, &data->vnet, addr & 0xFFFFF,
-                                            width, value));
-            return;
-#endif
-#if SEMU_HAS(VIRTIOBLK)
-        case 0x42: /* virtio-blk */
-            EMU_DEVICE_CALL(data->vblk_lock,
-                            virtio_blk_read(hart, &data->vblk, addr & 0xFFFFF,
-                                            width, value));
-            return;
-#endif
-        case 0x43: /* mtimer */
-            EMU_DEVICE_CALL(data->mtimer_lock,
-                            aclint_mtimer_read(hart, &data->mtimer,
-                                               addr & 0xFFFFF, width, value));
-            return;
-        case 0x44: /* mswi */
-            EMU_DEVICE_CALL(data->mswi_lock,
-                            aclint_mswi_read(hart, &data->mswi, addr & 0xFFFFF,
-                                             width, value));
-            return;
-        case 0x45: /* sswi */
-            EMU_DEVICE_CALL(data->sswi_lock,
-                            aclint_sswi_read(hart, &data->sswi, addr & 0xFFFFF,
-                                             width, value));
-            return;
-#if SEMU_HAS(VIRTIORNG)
-        case 0x46: /* virtio-rng */
-            EMU_DEVICE_CALL(data->vrng_lock,
-                            virtio_rng_read(hart, &data->vrng, addr & 0xFFFFF,
-                                            width, value));
-            return;
-#endif
+    if (semu_mmio_bus_read(&data->mmio_bus, hart, addr, width, value))
+        return;
 
-#if SEMU_HAS(VIRTIOSND)
-        case 0x47: /* virtio-snd */
-            EMU_DEVICE_CALL(data->vsnd_lock,
-                            virtio_snd_read(hart, &data->vsnd, addr & 0xFFFFF,
-                                            width, value));
-            return;
-#endif
-
-#if SEMU_HAS(VIRTIOFS)
-        case 0x48: /* virtio-fs */
-            EMU_DEVICE_CALL(
-                data->vfs_lock,
-                virtio_fs_read(hart, &data->vfs, addr & 0xFFFFF, width, value));
-            return;
-#endif
-#if SEMU_HAS(VIRTIOINPUT)
-        case 0x49: /* virtio-input keyboard */
-            EMU_DEVICE_CALL(data->vkeyboard_lock,
-                            virtio_input_read(hart, &data->vkeyboard,
-                                              addr & 0xFFFFF, width, value));
-            return;
-        case 0x4A: /* virtio-input mouse */
-            EMU_DEVICE_CALL(data->vmouse_lock,
-                            virtio_input_read(hart, &data->vmouse,
-                                              addr & 0xFFFFF, width, value));
-            return;
-#endif
-#if SEMU_HAS(VIRTIOGPU)
-        case 0x4B: /* virtio-gpu */
-            EMU_DEVICE_CALL(data->vgpu_lock,
-                            virtio_gpu_read(hart, &data->vgpu, addr & 0xFFFFF,
-                                            width, value));
-            return;
-#endif
-        }
-    }
     vm_set_exception(hart, RV_EXC_LOAD_FAULT, hart->exc_val);
 }
 
@@ -706,174 +1215,16 @@ static void mem_store(hart_t *hart,
                       uint32_t value)
 {
     emu_state_t *data = PRIV(hart);
+
     /* RAM at 0x00000000 + RAM_SIZE */
     if (addr < RAM_SIZE) {
         ram_write(hart, data->ram, addr, width, value);
         return;
     }
 
-    if ((addr >> 28) == 0xF) { /* MMIO at 0xF_______ */
-        /* 256 regions of 1MiB */
-        switch ((addr >> 20) & MASK(8)) {
-        case 0x0:
-        case 0x2: /* PLIC (0 - 0x3F) */
-            EMU_DEVICE_CALL(
-                data->plic_lock,
-                plic_write(hart, &data->plic, addr & 0x3FFFFFF, width, value);
-                plic_update_interrupts(hart->vm, &data->plic));
-            semu_wake_interruptible_harts(data);
-            return;
-        case 0x40: { /* UART */
-            bool pending;
-            EMU_DEVICE_CALL(
-                data->uart_lock,
-                u8250_write(hart, &data->uart, addr & 0xFFFFF, width, value);
-                u8250_update_interrupts(&data->uart);
-                pending = data->uart.pending_ints != 0);
-            emu_update_plic_irq(data, IRQ_UART_BIT, pending);
-            return;
-        }
-#if SEMU_HAS(VIRTIONET)
-        case 0x41: { /* virtio-net */
-            bool pending;
-            EMU_DEVICE_CALL(data->vnet_lock,
-                            virtio_net_write(hart, &data->vnet, addr & 0xFFFFF,
-                                             width, value);
-                            pending = data->vnet.InterruptStatus != 0);
-            emu_update_plic_irq(data, IRQ_VNET_BIT, pending);
-            return;
-        }
-#endif
-#if SEMU_HAS(VIRTIOBLK)
-        case 0x42: { /* virtio-blk */
-            bool pending;
-            EMU_DEVICE_CALL(data->vblk_lock,
-                            virtio_blk_write(hart, &data->vblk, addr & 0xFFFFF,
-                                             width, value);
-                            pending = data->vblk.InterruptStatus != 0);
-            emu_update_plic_irq(data, IRQ_VBLK_BIT, pending);
-            return;
-        }
-#endif
-        case 0x43: { /* mtimer */
-            uint32_t mtimer_addr = addr & 0xFFFFF;
-            uint32_t target_hartid = mtimer_addr >> 3;
-            bool update_all_timers =
-                mtimer_addr >= 0x7FF8 && mtimer_addr < 0x8000;
-            EMU_DEVICE_CALL(data->mtimer_lock,
-                            aclint_mtimer_write(hart, &data->mtimer,
-                                                mtimer_addr, width, value));
-            if (hart->error)
-                return;
+    if (semu_mmio_bus_write(&data->mmio_bus, hart, addr, width, value))
+        return;
 
-            if (update_all_timers) {
-                for (uint32_t i = 0; i < hart->vm->n_hart; i++) {
-                    emu_update_timer_interrupt(hart->vm->hart[i]);
-                    semu_wake_hart_if_interrupt_pending(data, i);
-                }
-            } else if (target_hartid < hart->vm->n_hart) {
-                emu_update_timer_interrupt(hart->vm->hart[target_hartid]);
-                semu_wake_hart_if_interrupt_pending(data, target_hartid);
-            }
-            return;
-        }
-        case 0x44: /* mswi */
-            EMU_DEVICE_CALL(
-                data->mswi_lock,
-                aclint_mswi_write(hart, &data->mswi, addr & 0xFFFFF, width,
-                                  value);
-                aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi));
-            {
-                uint32_t target_hartid = (addr & 0xFFFFF) >> 2;
-                if (target_hartid < hart->vm->n_hart)
-                    emu_update_swi_interrupt(hart->vm->hart[target_hartid]);
-                semu_wake_hart_if_interrupt_pending(data, target_hartid);
-            }
-            return;
-        case 0x45: /* sswi */
-            EMU_DEVICE_CALL(
-                data->sswi_lock,
-                aclint_sswi_write(hart, &data->sswi, addr & 0xFFFFF, width,
-                                  value);
-                aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi));
-            {
-                uint32_t target_hartid = (addr & 0xFFFFF) >> 2;
-                if (target_hartid < hart->vm->n_hart)
-                    emu_update_swi_interrupt(hart->vm->hart[target_hartid]);
-                semu_wake_hart_if_interrupt_pending(data, target_hartid);
-            }
-            return;
-
-#if SEMU_HAS(VIRTIORNG)
-        case 0x46: { /* virtio-rng */
-            bool pending;
-            EMU_DEVICE_CALL(data->vrng_lock,
-                            virtio_rng_write(hart, &data->vrng, addr & 0xFFFFF,
-                                             width, value);
-                            pending = data->vrng.InterruptStatus != 0);
-            emu_update_plic_irq(data, IRQ_VRNG_BIT, pending);
-            return;
-        }
-#endif
-
-#if SEMU_HAS(VIRTIOSND)
-        case 0x47: { /* virtio-snd */
-            bool pending;
-            EMU_DEVICE_CALL(
-                data->vsnd_lock, virtio_snd_write(hart, &data->vsnd,
-                                                  addr & 0xFFFFF, width, value);
-                pending = __atomic_load_n(&data->vsnd.InterruptStatus,
-                                          __ATOMIC_ACQUIRE) != 0);
-            emu_update_plic_irq(data, IRQ_VSND_BIT, pending);
-            return;
-        }
-#endif
-
-#if SEMU_HAS(VIRTIOFS)
-        case 0x48: { /* virtio-fs */
-            bool pending;
-            EMU_DEVICE_CALL(
-                data->vfs_lock,
-                virtio_fs_write(hart, &data->vfs, addr & 0xFFFFF, width, value);
-                pending = data->vfs.InterruptStatus != 0);
-            emu_update_plic_irq(data, IRQ_VFS_BIT, pending);
-            return;
-        }
-#endif
-#if SEMU_HAS(VIRTIOINPUT)
-        case 0x49: { /* virtio-input keyboard */
-            bool pending;
-            EMU_DEVICE_CALL(
-                data->vkeyboard_lock,
-                virtio_input_write(hart, &data->vkeyboard, addr & 0xFFFFF,
-                                   width, value);
-                pending = virtio_input_irq_pending(&data->vkeyboard));
-            emu_update_plic_irq(data, IRQ_VINPUT_KEYBOARD_BIT, pending);
-            return;
-        }
-        case 0x4A: { /* virtio-input mouse */
-            bool pending;
-            EMU_DEVICE_CALL(data->vmouse_lock,
-                            virtio_input_write(hart, &data->vmouse,
-                                               addr & 0xFFFFF, width, value);
-                            pending = virtio_input_irq_pending(&data->vmouse));
-            emu_update_plic_irq(data, IRQ_VINPUT_MOUSE_BIT, pending);
-            return;
-        }
-#endif
-#if SEMU_HAS(VIRTIOGPU)
-        case 0x4B: { /* virtio-gpu */
-            bool pending;
-            EMU_DEVICE_CALL(data->vgpu_lock,
-                            virtio_gpu_write(hart, &data->vgpu, addr & 0xFFFFF,
-                                             width, value);
-                            pending = data->vgpu.InterruptStatus != 0);
-            emu_update_plic_irq(data, IRQ_VGPU_BIT, pending);
-            return;
-        }
-#endif
-        }
-    }
     vm_set_exception(hart, RV_EXC_STORE_FAULT, hart->exc_val);
 }
 
@@ -1526,6 +1877,11 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     INIT_EMU_MUTEX(emu->vgpu_lock);
 #endif
 #undef INIT_EMU_MUTEX
+
+    if (!semu_register_runtime_mmio(emu)) {
+        fprintf(stderr, "Failed to register runtime MMIO bus.\n");
+        return 1;
+    }
 
     /* Set up RAM */
     emu->ram = mmap(NULL, RAM_SIZE, PROT_READ | PROT_WRITE,

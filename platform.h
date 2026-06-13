@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 struct semu_mmio_bus;
+struct semu_mmio_region;
 
 /*
  * irq_source stores the PLIC source ID for devices that raise an external
@@ -49,5 +50,14 @@ struct semu_platform_device {
     uint32_t irq_source;
 };
 
+typedef void (*semu_platform_mmio_configure_fn)(
+    const struct semu_platform_device *device,
+    struct semu_mmio_region *region,
+    void *opaque);
+
 const struct semu_platform_device *semu_platform_devices(size_t *count);
+bool semu_platform_register_fixed_mmio_configured(
+    struct semu_mmio_bus *bus,
+    semu_platform_mmio_configure_fn configure,
+    void *opaque);
 bool semu_platform_register_fixed_mmio(struct semu_mmio_bus *bus);
