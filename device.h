@@ -106,26 +106,14 @@ void capture_keyboard_input();
 #define IRQ_VNET_BIT (1 << IRQ_VNET)
 
 typedef struct {
-    uint32_t QueueNum;
-    uint32_t QueueDesc;
-    uint32_t QueueAvail;
-    uint32_t QueueUsed;
-    uint16_t last_avail;
-    bool ready;
-    bool fd_ready;
+    atomic_bool fd_ready;
 } virtio_net_queue_t;
 
 typedef struct {
-    /* feature negotiation */
-    uint32_t DeviceFeaturesSel;
-    uint32_t DriverFeatures;
-    uint32_t DriverFeaturesSel;
-    /* queue config */
-    uint32_t QueueSel;
+    struct virtio_device_common common;
+    struct virtio_actor actor;
+    bool actor_initialized;
     virtio_net_queue_t queues[2];
-    /* status */
-    uint32_t Status;
-    uint32_t InterruptStatus;
     /* supplied by environment */
     netdev_t peer;
     uint32_t *ram;
@@ -147,7 +135,11 @@ void virtio_net_refresh_queue(virtio_net_state_t *vnet);
 
 void virtio_net_recv_from_peer(void *peer);
 
-bool virtio_net_init(virtio_net_state_t *vnet, const char *name);
+bool virtio_net_irq_pending(virtio_net_state_t *vnet);
+bool virtio_net_init(virtio_net_state_t *vnet,
+                     emu_state_t *emu,
+                     const char *name);
+void virtio_net_destroy(virtio_net_state_t *vnet);
 #endif /* SEMU_HAS(VIRTIONET) */
 
 /* VirtIO-Block */

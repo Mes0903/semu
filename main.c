@@ -76,7 +76,6 @@ enum {
     SEMU_SMP_SLICE_STEPS = 8,
     SEMU_SMP_BATCH_STEPS = 4096,
     SEMU_SINGLE_SLICE_STEPS = 512,
-    SEMU_SLIRP_SLICE_STEPS = 8,
 };
 
 enum {
@@ -708,7 +707,8 @@ static void UNUSED emu_update_vnet_interrupts(vm_t *vm)
     emu_state_t *data = PRIV(vm->hart[0]);
     bool pending;
 
-    EMU_DEVICE_CALL(data->vnet_lock, pending = data->vnet.InterruptStatus != 0);
+    EMU_DEVICE_CALL(data->vnet_lock,
+                    pending = virtio_net_irq_pending(&data->vnet));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VNET, pending);
 }
 #endif
@@ -840,7 +840,7 @@ static void io_poll_peripherals(emu_state_t *emu)
 
 #if SEMU_HAS(VIRTIONET)
     EMU_DEVICE_CALL(emu->vnet_lock, virtio_net_refresh_queue(&emu->vnet);
-                    pending = emu->vnet.InterruptStatus != 0);
+                    pending = virtio_net_irq_pending(&emu->vnet));
     emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VNET, pending);
 #endif
 
@@ -1062,7 +1062,7 @@ static bool semu_mmio_vnet_write(hart_t *hart,
     EMU_DEVICE_CALL(
         data->vnet_lock,
         virtio_net_write(hart, &data->vnet, (uint32_t) off, width, value);
-        pending = data->vnet.InterruptStatus != 0);
+        pending = virtio_net_irq_pending(&data->vnet));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VNET, pending);
     return true;
 }
@@ -2400,15 +2400,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     emu->uart.in_fd = 0, emu->uart.out_fd = 1;
     capture_keyboard_input(); /* set up uart */
 #if SEMU_HAS(VIRTIONET)
-    /* Always set ram pointer, even if netdev is not configured.
-     * Device tree may still expose the device to guest.
-     */
-    emu->vnet.ram = emu->ram;
-    if (netdev) {
-        if (!virtio_net_init(&emu->vnet, netdev)) {
-            fprintf(stderr, "Failed to initialize virtio-net device.\n");
-            return 1;
-        }
+    if (!virtio_net_init(&emu->vnet, emu, netdev)) {
+        fprintf(stderr, "Failed to initialize virtio-net device.\n");
+        return 1;
     }
 #endif
 #if SEMU_HAS(VIRTIOBLK)
@@ -2459,6 +2453,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             virtio_gpu_destroy(&emu->vgpu);
             vgpu_display_shutdown_after_producer_stopped();
 #endif
+#if SEMU_HAS(VIRTIONET)
+            virtio_net_destroy(&emu->vnet);
+#endif
 #if SEMU_HAS(VIRTIOBLK)
             virtio_blk_destroy(&emu->vblk);
 #endif
@@ -2488,6 +2485,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #if SEMU_HAS(VIRTIOGPU)
             virtio_gpu_destroy(&emu->vgpu);
             vgpu_display_shutdown_after_producer_stopped();
+#endif
+#if SEMU_HAS(VIRTIONET)
+            virtio_net_destroy(&emu->vnet);
 #endif
 #if SEMU_HAS(VIRTIOBLK)
             virtio_blk_destroy(&emu->vblk);
@@ -2712,7 +2712,6 @@ static void *hart_thread_func(void *arg)
                 break;
             semu_process_hsm_resume_if_started(hart);
 
-            emu_tick_peripherals(emu);
             emu_update_timer_interrupt(hart);
             emu_update_swi_interrupt(hart);
             if (unlikely(semu_step_chunk(emu, hart, SEMU_SMP_SLICE_STEPS))) {
@@ -3092,47 +3091,11 @@ static void semu_run(emu_state_t *emu)
         /* Break out on SIGINT/SIGTERM so atexit hooks fire on graceful exit. */
         if (signal_received)
             break;
-#if SEMU_HAS(VIRTIONET)
-        int i = 0;
-        if (emu->vnet.peer.type == NETDEV_IMPL_user &&
-            semu_boot_complete_load()) {
-            net_user_options_t *usr = (net_user_options_t *) emu->vnet.peer.op;
-
-            uint32_t timeout = -1;
-            usr->pfd_len = 1;
-            slirp_pollfds_fill_socket(usr->slirp, &timeout,
-                                      semu_slirp_add_poll_socket, usr);
-
-            /* Poll the internal pipe for incoming data. If data is
-             * available (POLL_IN), process it and forward it to the
-             * virtio-net device.
-             */
-            int pollout = poll(usr->pfd, usr->pfd_len, 1);
-            if (usr->pfd[0].revents & POLLIN) {
-                virtio_net_recv_from_peer(usr->peer);
-            }
-            slirp_pollfds_poll(usr->slirp, (pollout <= 0),
-                               semu_slirp_get_revents, usr);
-            for (i = 0; i < SLIRP_POLL_INTERVAL; i += SEMU_SLIRP_SLICE_STEPS) {
-                int steps =
-                    MIN(SEMU_SLIRP_SLICE_STEPS, SLIRP_POLL_INTERVAL - i);
-
-                ret = semu_run_chunk(emu, steps, &next_hart);
-                if (ret) {
-                    semu_runtime_enter_failed(emu);
-                    emu->exit_code = ret;
-                    return;
-                }
-            }
-        } else
-#endif
-        {
-            ret = semu_run_chunk(emu, SEMU_SINGLE_SLICE_STEPS, &next_hart);
-            if (ret) {
-                semu_runtime_enter_failed(emu);
-                emu->exit_code = ret;
-                return;
-            }
+        ret = semu_run_chunk(emu, SEMU_SINGLE_SLICE_STEPS, &next_hart);
+        if (ret) {
+            semu_runtime_enter_failed(emu);
+            emu->exit_code = ret;
+            return;
         }
     }
 
@@ -3419,6 +3382,9 @@ int main(int argc, char **argv)
             virtio_gpu_destroy(&emu.vgpu);
             vgpu_display_shutdown_after_producer_stopped();
 #endif
+#if SEMU_HAS(VIRTIONET)
+            virtio_net_destroy(&emu.vnet);
+#endif
 #if SEMU_HAS(VIRTIOBLK)
             virtio_blk_destroy(&emu.vblk);
 #endif
@@ -3464,6 +3430,9 @@ int main(int argc, char **argv)
     g_window.window_cleanup();
 #endif
 
+#if SEMU_HAS(VIRTIONET)
+    virtio_net_destroy(&emu.vnet);
+#endif
 #if SEMU_HAS(VIRTIOBLK)
     virtio_blk_destroy(&emu.vblk);
 #endif

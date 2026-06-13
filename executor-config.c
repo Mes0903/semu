@@ -62,9 +62,10 @@ static const struct semu_executor_virtio_host_io_policy
         {
             .device_name = "virtio-net",
             .build_enabled = SEMU_HAS(VIRTIONET),
-            .actor_mode_allowed = false,
-            .actor_mode_policy = "host fd/slirp/vmnet events need device event "
-                                 "loop or actor wake path; no tick polling",
+            .actor_mode_allowed = true,
+            .actor_mode_policy =
+                "actor-backed; QueueNotify wakes actor, host fd/slirp/vmnet "
+                "read/write runs outside vCPU",
         },
         {
             .device_name = "virtio-snd",

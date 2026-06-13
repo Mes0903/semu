@@ -1,38 +1,32 @@
-#include <assert.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/poll.h>
 #include <sys/uio.h>
-
-#if !defined(__APPLE__)
-#include <linux/if.h>
-#include <linux/if_tun.h>
-#include <sys/ioctl.h>
-#endif
+#include <unistd.h>
 
 #include "common.h"
 #include "device.h"
 #include "ram_access.h"
 #include "riscv.h"
 #include "riscv_private.h"
+#include "virtio-irq.h"
+#include "virtio-mmio.h"
 #include "virtio.h"
+#include "virtq.h"
 
-#define TAP_INTERFACE "tap%d"
+#define VIRTIO_NET_F_MRG_RXBUF (UINT64_C(1) << 15)
+#define VIRTIO_NET_F_VERSION_1 (UINT64_C(1) << 32)
 
-#define VNET_DEV_CNT_MAX 1
-
-#define VNET_FEATURES_0 0
-#define VNET_FEATURES_1 1 /* VIRTIO_F_VERSION_1 */
 #define VNET_QUEUE_NUM_MAX 1024
-#define VNET_QUEUE (vnet->queues[vnet->QueueSel])
+#define VNET_LEGACY_HEADER_LEN 10
+#define VNET_V1_HEADER_LEN 12
+#define VNET_PACKET_MAX SLIRP_PKT_MAX
 
-#define PRIV(x) ((struct virtio_net_config *) x->priv)
-
-enum { VNET_QUEUE_RX = 0, VNET_QUEUE_TX = 1 };
+enum { VNET_QUEUE_RX = 0, VNET_QUEUE_TX = 1, VNET_QUEUE_COUNT = 2 };
 
 PACKED(struct virtio_net_config {
     uint8_t mac[6];
@@ -41,541 +35,849 @@ PACKED(struct virtio_net_config {
     uint16_t mtu;
 });
 
-static struct virtio_net_config vnet_configs[VNET_DEV_CNT_MAX];
-static int vnet_dev_cnt = 0;
+struct virtio_net_priv {
+    struct virtio_net_config config;
+    bool peer_owned;
+    atomic_uint header_len;
+};
+
+#define PRIV(vnet) (&((struct virtio_net_priv *) (vnet)->priv)->config)
+#define VNET_PRIV(vnet) ((struct virtio_net_priv *) (vnet)->priv)
+
+static inline unsigned virtio_net_status_load(virtio_net_state_t *vnet)
+{
+    return atomic_load_explicit(&vnet->common.status, memory_order_acquire);
+}
+
+static unsigned virtio_net_features_header_len(uint64_t features)
+{
+    if (features & (VIRTIO_NET_F_VERSION_1 | VIRTIO_NET_F_MRG_RXBUF))
+        return VNET_V1_HEADER_LEN;
+    return VNET_LEGACY_HEADER_LEN;
+}
+
+static unsigned virtio_net_header_len(virtio_net_state_t *vnet)
+{
+    struct virtio_net_priv *priv = vnet ? VNET_PRIV(vnet) : NULL;
+    unsigned header_len;
+
+    if (!priv)
+        return VNET_LEGACY_HEADER_LEN;
+
+    header_len = atomic_load_explicit(&priv->header_len, memory_order_acquire);
+    return header_len ? header_len : VNET_LEGACY_HEADER_LEN;
+}
+
+static void virtio_net_set_queue_fd_ready(virtio_net_state_t *vnet,
+                                          uint16_t queue_index,
+                                          bool ready)
+{
+    if (!vnet || queue_index >= VNET_QUEUE_COUNT)
+        return;
+
+    atomic_store_explicit(&vnet->queues[queue_index].fd_ready, ready,
+                          memory_order_release);
+}
+
+static bool virtio_net_queue_fd_ready(virtio_net_state_t *vnet,
+                                      uint16_t queue_index)
+{
+    if (!vnet || queue_index >= VNET_QUEUE_COUNT)
+        return false;
+
+    return atomic_load_explicit(&vnet->queues[queue_index].fd_ready,
+                                memory_order_acquire);
+}
 
 static void virtio_net_set_fail(virtio_net_state_t *vnet)
 {
-    vnet->Status |= VIRTIO_STATUS__DEVICE_NEEDS_RESET;
-    if (vnet->Status & VIRTIO_STATUS__DRIVER_OK)
-        vnet->InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
+    unsigned status = virtio_net_status_load(vnet);
+
+    virtio_device_common_set_needs_reset(&vnet->common);
+    if (status & VIRTIO_STATUS__DRIVER_OK)
+        virtio_irq_trigger(&vnet->common.irq, VIRTIO_INT__CONF_CHANGE);
 }
 
-static inline uint32_t vnet_preprocess(virtio_net_state_t *vnet, uint32_t addr)
+static bool virtio_net_config_range_valid(uint32_t offset, uint32_t size)
 {
-    if ((addr >= RAM_SIZE) || (addr & 0b11))
-        return virtio_net_set_fail(vnet), 0;
-
-    return addr >> 2;
+    return size != 0 && offset < sizeof(struct virtio_net_config) &&
+           size <= sizeof(struct virtio_net_config) - offset;
 }
 
-static void virtio_net_update_status(virtio_net_state_t *vnet, uint32_t status)
+static uint32_t virtio_net_read_config(void *opaque,
+                                       uint32_t offset,
+                                       uint32_t size)
 {
-    vnet->Status |= status;
-    if (status)
+    virtio_net_state_t *vnet = opaque;
+    uint32_t value = 0;
+
+    if (!vnet || !vnet->priv || !virtio_net_config_range_valid(offset, size))
+        return 0;
+
+    memcpy(&value, (uint8_t *) PRIV(vnet) + offset, size);
+    return value;
+}
+
+static void virtio_net_write_config(void *opaque,
+                                    uint32_t offset,
+                                    uint32_t size,
+                                    uint32_t value)
+{
+    virtio_net_state_t *vnet = opaque;
+
+    if (!vnet || !vnet->priv || !virtio_net_config_range_valid(offset, size))
         return;
 
-    /* Reset */
-    netdev_t peer = vnet->peer;
-    uint32_t *ram = vnet->ram;
-    void *priv = vnet->priv;
-    memset(vnet, 0, sizeof(*vnet));
-    vnet->peer = peer, vnet->ram = ram;
-    vnet->priv = priv;
+    memcpy((uint8_t *) PRIV(vnet) + offset, &value, size);
 }
 
-static int vnet_iovec_write(struct iovec **vecs,
-                            size_t *nvecs,
-                            const uint8_t *src,
-                            size_t n)
+static bool virtio_net_queue_ready_for_actor(virtio_net_state_t *vnet,
+                                             const struct virtq *queue,
+                                             uint16_t queue_index)
 {
-    while (n > 0 && *nvecs > 0) {
-        size_t to_copy = MIN(n, (*vecs)->iov_len);
-        memcpy((*vecs)->iov_base, src, to_copy);
-        src += to_copy;
-        n -= to_copy;
-        (*vecs)->iov_base = (void *) ((uintptr_t) (*vecs)->iov_base + to_copy);
-        (*vecs)->iov_len -= to_copy;
+    unsigned status;
 
-        if ((*vecs)->iov_len == 0) {
-            (*vecs)++;
-            (*nvecs)--;
-        }
-    }
-    return n > 0;
-}
-
-static bool vnet_iovec_read(struct iovec **vecs,
-                            size_t *nvecs,
-                            uint8_t *dst,
-                            size_t n)
-{
-    while (n && *nvecs) {
-        if (n < (*vecs)->iov_len) {
-            memcpy(dst, (*vecs)->iov_base, n);
-            (*vecs)->iov_base = (void *) ((uintptr_t) (*vecs)->iov_base + n);
-            (*vecs)->iov_len -= n;
-            /* Success: all data read, buffer has space left */
-            return false;
-        }
-        memcpy(dst, (*vecs)->iov_base, (*vecs)->iov_len);
-        dst += (*vecs)->iov_len;
-        n -= (*vecs)->iov_len;
-        (*vecs)++;
-        (*nvecs)--;
-    }
-    return n && !*nvecs;
-}
-
-static ssize_t handle_read(netdev_t *netdev,
-                           virtio_net_queue_t *queue,
-                           struct iovec *iovs_cursor,
-                           size_t niovs)
-{
-    ssize_t plen = 0;
-#define _(dev) NETDEV_IMPL_##dev
-    switch (netdev->type) {
-#if defined(__APPLE__)
-    case _(vmnet): {
-        net_vmnet_state_t *vmnet = (net_vmnet_state_t *) netdev->op;
-        uint8_t buf[2048];
-
-        plen = net_vmnet_read(vmnet, buf, sizeof(buf));
-        if (plen < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
-            queue->fd_ready = false;
-            return -1;
-        }
-        if (plen < 0) {
-            fprintf(stderr, "[VNET] could not read packet from vmnet\n");
-            return -1;
-        }
-
-        /* Copy to iovec */
-        struct iovec *vecs = iovs_cursor;
-        size_t nvecs = niovs;
-        const uint8_t *src = buf;
-        if (vnet_iovec_write(&vecs, &nvecs, src, plen)) {
-            fprintf(stderr, "[VNET] packet too large for iovec\n");
-            return -1;
-        }
-        break;
-    }
-#else
-    case _(tap): {
-        net_tap_options_t *tap = (net_tap_options_t *) netdev->op;
-        plen = readv(tap->tap_fd, iovs_cursor, niovs);
-        if (plen < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
-            queue->fd_ready = false;
-            return -1;
-        }
-        if (plen < 0) {
-            plen = 0;
-            fprintf(stderr, "[VNET] could not read packet: %s\n",
-                    strerror(errno));
-        }
-        break;
-    }
-#endif
-    case _(user): {
-        net_user_options_t *usr = (net_user_options_t *) netdev->op;
-
-        plen = readv(usr->guest_to_host_channel[SLIRP_READ_SIDE], iovs_cursor,
-                     niovs);
-        if (plen < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
-            queue->fd_ready = false;
-            return -1;
-        }
-
-        if (plen < 0) {
-            plen = 0;
-            fprintf(stderr, "[VNET] could not read packet: %s\n",
-                    strerror(errno));
-        }
-
-        break;
-    }
-    default:
-        break;
-    }
-#undef _
-    return plen;
-}
-
-static ssize_t handle_write(netdev_t *netdev,
-                            virtio_net_queue_t *queue,
-                            struct iovec *iovs_cursor,
-                            size_t niovs)
-{
-    ssize_t plen = 0;
-#define _(dev) NETDEV_IMPL_##dev
-    switch (netdev->type) {
-#if defined(__APPLE__)
-    case _(vmnet): {
-        net_vmnet_state_t *vmnet = (net_vmnet_state_t *) netdev->op;
-
-        /* Use zero-copy writev to avoid intermediate buffer */
-        ssize_t written = net_vmnet_writev(vmnet, iovs_cursor, niovs);
-        if (written < 0) {
-            queue->fd_ready = false;
-            return -1;
-        }
-        plen = written;
-        break;
-    }
-#else
-    case _(tap): {
-        net_tap_options_t *tap = (net_tap_options_t *) netdev->op;
-        plen = writev(tap->tap_fd, iovs_cursor, niovs);
-        if (plen < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
-            queue->fd_ready = false;
-            return -1;
-        }
-        if (plen < 0) {
-            plen = 0;
-            fprintf(stderr, "[VNET] could not write packet: %s\n",
-                    strerror(errno));
-        }
-        break;
-    }
-#endif
-    case _(user): {
-        net_user_options_t *usr = (net_user_options_t *) netdev->op;
-        ssize_t written = writev(usr->host_to_guest_channel[SLIRP_WRITE_SIDE],
-                                 iovs_cursor, niovs);
-        if (written < 0) {
-            queue->fd_ready = false;
-            return -1;
-        }
-        plen = written;
-        break;
-    }
-    default:
-        break;
-    }
-#undef _
-    return plen;
-}
-
-/* Require existing 'desc_idx' to use as iteration variable, and input
- * 'buffer_idx'.
- */
-#define VNET_ITERATE_BUFFER(checked, body)                               \
-    desc_idx = buffer_idx;                                               \
-    while (1) {                                                          \
-        if (checked && desc_idx >= queue->QueueNum)                      \
-            return virtio_net_set_fail(vnet);                            \
-        const struct virtq_desc *desc =                                  \
-            (struct virtq_desc *) &ram[queue->QueueDesc + desc_idx * 4]; \
-        uint16_t desc_flags = desc->flags;                               \
-        body if (!(desc_flags & VIRTIO_DESC_F_NEXT)) break;              \
-        desc_idx = desc->next;                                           \
-    }
-
-/* Input: 'buffer_idx'.
- * Output: 'buffer_niovs' and 'buffer_iovs'
- */
-#define VNET_BUFFER_TO_IOV(expect_readable)                                    \
-    uint16_t desc_idx;                                                         \
-    /* do a first pass to validate flags and count buffers */                  \
-    size_t buffer_niovs = 0;                                                   \
-    VNET_ITERATE_BUFFER(                                                       \
-        true, if ((!!(desc_flags & VIRTIO_DESC_F_WRITE)) !=                    \
-                  (expect_readable)) return virtio_net_set_fail(vnet);         \
-        buffer_niovs++;)                                                       \
-    /* convert to iov */                                                       \
-    struct iovec buffer_iovs[buffer_niovs];                                    \
-    buffer_niovs = 0;                                                          \
-    VNET_ITERATE_BUFFER(                                                       \
-        false, uint64_t desc_addr = desc->addr; uint32_t desc_len = desc->len; \
-        buffer_iovs[buffer_niovs].iov_base =                                   \
-            (void *) ((uintptr_t) ram + desc_addr);                            \
-        buffer_iovs[buffer_niovs].iov_len = desc_len; buffer_niovs++;)
-
-#define VNET_GENERATE_QUEUE_HANDLER(NAME_SUFFIX, VERB, QUEUE_IDX, READ)        \
-    static void virtio_net_try_##NAME_SUFFIX(virtio_net_state_t *vnet)         \
-    {                                                                          \
-        uint32_t *ram = vnet->ram;                                             \
-        virtio_net_queue_t *queue = &vnet->queues[QUEUE_IDX];                  \
-        if ((vnet->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) ||              \
-            !queue->fd_ready)                                                  \
-            return;                                                            \
-        if (!((vnet->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready))      \
-            return virtio_net_set_fail(vnet);                                  \
-                                                                               \
-        /* check for new buffers */                                            \
-        uint16_t new_avail = ram_load_high16_acquire(&ram[queue->QueueAvail]); \
-        if (new_avail - queue->last_avail > (uint16_t) queue->QueueNum)        \
-            return (fprintf(stderr, "size check fail\n"),                      \
-                    virtio_net_set_fail(vnet));                                \
-        if (queue->last_avail == new_avail)                                    \
-            return;                                                            \
-                                                                               \
-        /* process them */                                                     \
-        uint16_t new_used = ram_load_high16(&ram[queue->QueueUsed]);           \
-        while (queue->last_avail != new_avail) {                               \
-            uint16_t queue_idx = queue->last_avail % queue->QueueNum;          \
-            uint16_t buffer_idx =                                              \
-                ram_load_w_acquire(                                            \
-                    &ram[queue->QueueAvail + 1 + queue_idx / 2]) >>            \
-                (16 * (queue_idx % 2));                                        \
-            VNET_BUFFER_TO_IOV(READ)                                           \
-            struct iovec *buffer_iovs_cursor = buffer_iovs;                    \
-            uint8_t virtio_header[12];                                         \
-            if (READ) {                                                        \
-                memset(virtio_header, 0, sizeof(virtio_header));               \
-                virtio_header[10] = 1;                                         \
-                vnet_iovec_write(&buffer_iovs_cursor, &buffer_niovs,           \
-                                 virtio_header, sizeof(virtio_header));        \
-            } else {                                                           \
-                vnet_iovec_read(&buffer_iovs_cursor, &buffer_niovs,            \
-                                virtio_header, sizeof(virtio_header));         \
-            }                                                                  \
-                                                                               \
-            ssize_t plen = handle_##VERB(&vnet->peer, queue,                   \
-                                         buffer_iovs_cursor, buffer_niovs);    \
-            if (plen < 0)                                                      \
-                break;                                                         \
-            /* consume from available queue, write to used queue */            \
-            queue->last_avail++;                                               \
-            ram_store_w(                                                       \
-                &ram[queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2], \
-                buffer_idx);                                                   \
-            ram_store_w(&ram[queue->QueueUsed + 1 +                            \
-                             (new_used % queue->QueueNum) * 2 + 1],            \
-                        READ ? (plen + sizeof(virtio_header)) : 0);            \
-            new_used++;                                                        \
-        }                                                                      \
-        ram_store_high16_release(&vnet->ram[queue->QueueUsed], new_used);      \
-                                                                               \
-        /* send interrupt, unless VIRTQ_AVAIL_F_NO_INTERRUPT is set */         \
-        if (!(ram_load_w_acquire(&ram[queue->QueueAvail]) & 1))                \
-            vnet->InterruptStatus |= VIRTIO_INT__USED_RING;                    \
-    }
-
-VNET_GENERATE_QUEUE_HANDLER(rx, read, VNET_QUEUE_RX, true)
-VNET_GENERATE_QUEUE_HANDLER(tx, write, VNET_QUEUE_TX, false)
-
-void virtio_net_refresh_queue(virtio_net_state_t *vnet)
-{
-    if (!(vnet->Status & VIRTIO_STATUS__DRIVER_OK) ||
-        (vnet->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
-        return;
-
-    /* Skip if peer network device is not initialized */
+    if (!vnet || !queue || !queue->ready)
+        return false;
     if (!vnet->peer.op)
+        return false;
+    if (!virtio_net_queue_fd_ready(vnet, queue_index))
+        return false;
+
+    status = virtio_net_status_load(vnet);
+    return !(status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) &&
+           (status & VIRTIO_STATUS__DRIVER_OK);
+}
+
+static int virtio_net_queue_available(virtio_net_state_t *vnet,
+                                      struct virtq *queue,
+                                      uint16_t *available)
+{
+    uint16_t avail_idx;
+    uint16_t delta;
+
+    if (!vnet || !queue || !queue->ready || !available)
+        return -EINVAL;
+
+    if (!ram_dma_read(vnet->common.dma, queue->driver_addr + 2, &avail_idx,
+                      sizeof(avail_idx)))
+        return -EFAULT;
+
+    delta = (uint16_t) (avail_idx - queue->last_avail);
+    if (delta > queue->queue_size)
+        return -EINVAL;
+
+    *available = delta;
+    return 0;
+}
+
+static bool virtio_net_actor_generation_current(virtio_net_state_t *vnet,
+                                                struct virtio_actor *actor,
+                                                uint64_t generation)
+{
+    (void) vnet;
+    return actor && virtio_actor_generation(actor) == generation;
+}
+
+static bool virtio_net_common_generation_current(virtio_net_state_t *vnet,
+                                                 uint64_t generation)
+{
+    bool current;
+
+    if (!vnet || !vnet->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vnet->common.transport_lock);
+    current = vnet->common.generation == generation &&
+              !vnet->common.reset_in_progress;
+    pthread_mutex_unlock(&vnet->common.transport_lock);
+    return current;
+}
+
+static bool virtio_net_capture_common_generation(virtio_net_state_t *vnet,
+                                                 uint64_t *generation)
+{
+    unsigned status;
+    bool current;
+
+    if (!vnet || !vnet->common.initialized || !generation)
+        return false;
+
+    pthread_mutex_lock(&vnet->common.transport_lock);
+    status = virtio_net_status_load(vnet);
+    current = !vnet->common.reset_in_progress &&
+              (status & VIRTIO_STATUS__DRIVER_OK) &&
+              !(status & VIRTIO_STATUS__DEVICE_NEEDS_RESET);
+    if (current)
+        *generation = vnet->common.generation;
+    pthread_mutex_unlock(&vnet->common.transport_lock);
+    return current;
+}
+
+static bool virtio_net_begin_actor_completion(virtio_net_state_t *vnet,
+                                              uint64_t actor_generation,
+                                              uint64_t common_generation)
+{
+    bool common_current;
+
+    if (!vnet || !vnet->actor_initialized || !vnet->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vnet->common.transport_lock);
+    common_current = vnet->common.generation == common_generation &&
+                     !vnet->common.reset_in_progress;
+    if (!common_current) {
+        pthread_mutex_unlock(&vnet->common.transport_lock);
+        return false;
+    }
+
+    if (!virtio_actor_begin_completion(&vnet->actor, actor_generation)) {
+        pthread_mutex_unlock(&vnet->common.transport_lock);
+        return false;
+    }
+    return true;
+}
+
+static void virtio_net_end_actor_completion(virtio_net_state_t *vnet)
+{
+    if (!vnet || !vnet->actor_initialized)
         return;
 
-    netdev_impl_t dev_type = vnet->peer.type;
-#define _(dev) NETDEV_IMPL_##dev
-    switch (dev_type) {
+    virtio_actor_end_completion(&vnet->actor);
+    pthread_mutex_unlock(&vnet->common.transport_lock);
+}
+
+static void virtio_net_set_fail_for_actor(virtio_net_state_t *vnet,
+                                          uint64_t actor_generation,
+                                          uint64_t common_generation)
+{
+    if (!virtio_net_begin_actor_completion(vnet, actor_generation,
+                                           common_generation))
+        return;
+    virtio_net_set_fail(vnet);
+    virtio_net_end_actor_completion(vnet);
+}
+
+static bool virtio_net_iovs_have_bytes(const struct virtq_iov *iov,
+                                       size_t count,
+                                       guest_size_t bytes)
+{
+    guest_size_t total = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        if (iov[i].len > UINT64_MAX - total)
+            return true;
+        total += iov[i].len;
+        if (total >= bytes)
+            return true;
+    }
+    return false;
+}
+
+static bool virtio_net_read_iovs(virtio_net_state_t *vnet,
+                                 const struct virtq_iov *iov,
+                                 size_t count,
+                                 guest_size_t skip,
+                                 void *dst,
+                                 guest_size_t len)
+{
+    uint8_t *out = dst;
+
+    for (size_t i = 0; i < count && len > 0; i++) {
+        guest_paddr_t addr = iov[i].addr;
+        guest_size_t iov_len = iov[i].len;
+        guest_size_t n;
+
+        if (skip >= iov_len) {
+            skip -= iov_len;
+            continue;
+        }
+
+        addr += skip;
+        iov_len -= skip;
+        skip = 0;
+        n = MIN(iov_len, len);
+        if (!ram_dma_read(vnet->common.dma, addr, out, n))
+            return false;
+        out += n;
+        len -= n;
+    }
+    return len == 0;
+}
+
+static bool virtio_net_write_iovs(virtio_net_state_t *vnet,
+                                  const struct virtq_iov *iov,
+                                  size_t count,
+                                  guest_size_t skip,
+                                  const void *src,
+                                  guest_size_t len)
+{
+    const uint8_t *in = src;
+
+    for (size_t i = 0; i < count && len > 0; i++) {
+        guest_paddr_t addr = iov[i].addr;
+        guest_size_t iov_len = iov[i].len;
+        guest_size_t n;
+
+        if (skip >= iov_len) {
+            skip -= iov_len;
+            continue;
+        }
+
+        addr += skip;
+        iov_len -= skip;
+        skip = 0;
+        n = MIN(iov_len, len);
+        if (!ram_dma_write(vnet->common.dma, addr, in, n))
+            return false;
+        in += n;
+        len -= n;
+    }
+    return len == 0;
+}
+
+static bool virtio_net_guest_ptr(virtio_net_state_t *vnet,
+                                 guest_paddr_t addr,
+                                 guest_size_t len,
+                                 void **ptr)
+{
+    ram_dma_t *dma;
+
+    if (!vnet || !ptr)
+        return false;
+    dma = vnet->common.dma;
+    if (!dma || !dma->words)
+        return false;
+    if (len == 0) {
+        if (addr > dma->byte_size)
+            return false;
+    } else {
+        if (addr >= dma->byte_size || len > dma->byte_size - addr)
+            return false;
+    }
+
+    *ptr = (void *) ((uintptr_t) dma->words + (uintptr_t) addr);
+    return true;
+}
+
+static int virtio_net_tx_build_iovs(virtio_net_state_t *vnet,
+                                    const struct virtq_chain *chain,
+                                    struct iovec *iovs,
+                                    size_t *iov_count)
+{
+    guest_size_t skip = virtio_net_header_len(vnet);
+    size_t out = 0;
+
+    if (!virtio_net_iovs_have_bytes(chain->readable, chain->readable_count,
+                                    skip))
+        return -EINVAL;
+
+    for (size_t i = 0; i < chain->readable_count; i++) {
+        guest_paddr_t addr = chain->readable[i].addr;
+        guest_size_t len = chain->readable[i].len;
+        void *base = NULL;
+
+        if (skip >= len) {
+            skip -= len;
+            continue;
+        }
+
+        addr += skip;
+        len -= skip;
+        skip = 0;
+        if (len == 0)
+            continue;
+        if (out >= *iov_count)
+            return -ENOSPC;
+        if (!virtio_net_guest_ptr(vnet, addr, len, &base))
+            return -EFAULT;
+        iovs[out].iov_base = base;
+        iovs[out].iov_len = len;
+        out++;
+    }
+
+    *iov_count = out;
+    return 0;
+}
+
+static ssize_t virtio_net_retrying_writev(int fd,
+                                          const struct iovec *iov,
+                                          int iovcnt)
+{
+    for (;;) {
+        ssize_t ret = writev(fd, iov, iovcnt);
+
+        if (ret >= 0)
+            return ret;
+        if (errno != EINTR)
+            return ret;
+    }
+}
+
+static ssize_t virtio_net_retrying_read(int fd, void *buf, size_t len)
+{
+    for (;;) {
+        ssize_t ret = read(fd, buf, len);
+
+        if (ret >= 0)
+            return ret;
+        if (errno != EINTR)
+            return ret;
+    }
+}
+
+static int virtio_net_host_read(virtio_net_state_t *vnet,
+                                uint8_t *buf,
+                                size_t len,
+                                ssize_t *packet_len)
+{
+    ssize_t ret = 0;
+
+    *packet_len = 0;
+    if (!vnet->peer.op)
+        return 0;
+
+    switch (vnet->peer.type) {
 #if defined(__APPLE__)
-    case _(vmnet): {
-        net_vmnet_state_t *vmnet = (net_vmnet_state_t *) vnet->peer.op;
-        int fd = net_vmnet_get_fd(vmnet);
-        struct pollfd pfd = {fd, POLLIN, 0};
-        poll(&pfd, 1, 0);
-        if (pfd.revents & POLLIN) {
-            vnet->queues[VNET_QUEUE_RX].fd_ready = true;
-            virtio_net_try_rx(vnet);
-        }
-        /* vmnet writes asynchronously; treat TX queue as always ready */
-        vnet->queues[VNET_QUEUE_TX].fd_ready = true;
-        virtio_net_try_tx(vnet);
+    case NETDEV_IMPL_vmnet:
+        ret = net_vmnet_read((net_vmnet_state_t *) vnet->peer.op, buf, len);
         break;
-    }
 #else
-    case _(tap): {
-        net_tap_options_t *tap = (net_tap_options_t *) vnet->peer.op;
-        struct pollfd pfd = {tap->tap_fd, POLLIN | POLLOUT, 0};
-        poll(&pfd, 1, 0);
-        if (pfd.revents & POLLIN) {
-            vnet->queues[VNET_QUEUE_RX].fd_ready = true;
-            virtio_net_try_rx(vnet);
-        }
-        if (pfd.revents & POLLOUT) {
-            vnet->queues[VNET_QUEUE_TX].fd_ready = true;
-            virtio_net_try_tx(vnet);
-        }
+    case NETDEV_IMPL_tap:
+        ret = virtio_net_retrying_read(
+            ((net_tap_options_t *) vnet->peer.op)->tap_fd, buf, len);
         break;
-    }
 #endif
-    case _(user): {
+    case NETDEV_IMPL_user:
+        ret = virtio_net_retrying_read(
+            ((net_user_options_t *) vnet->peer.op)
+                ->guest_to_host_channel[SLIRP_READ_SIDE],
+            buf, len);
+        break;
+    default:
+        return 0;
+    }
+
+    if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_RX, false);
+        return -EAGAIN;
+    }
+    if (ret < 0) {
+        fprintf(stderr, "[VNET] could not read packet: %s\n", strerror(errno));
+        return -EIO;
+    }
+
+    *packet_len = ret;
+    return 0;
+}
+
+static int virtio_net_host_write(virtio_net_state_t *vnet,
+                                 const struct iovec *iovs,
+                                 size_t iov_count,
+                                 ssize_t *written)
+{
+    ssize_t ret = 0;
+
+    *written = 0;
+    if (!vnet->peer.op)
+        return 0;
+    if (iov_count == 0)
+        return 0;
+    if (iov_count > INT32_MAX)
+        return -EINVAL;
+
+    switch (vnet->peer.type) {
+#if defined(__APPLE__)
+    case NETDEV_IMPL_vmnet:
+        ret = net_vmnet_writev((net_vmnet_state_t *) vnet->peer.op, iovs,
+                               iov_count);
+        break;
+#else
+    case NETDEV_IMPL_tap:
+        ret = virtio_net_retrying_writev(
+            ((net_tap_options_t *) vnet->peer.op)->tap_fd, iovs,
+            (int) iov_count);
+        break;
+#endif
+    case NETDEV_IMPL_user: {
         net_user_options_t *usr = (net_user_options_t *) vnet->peer.op;
-        struct pollfd pfd[3] = {
-            {usr->guest_to_host_channel[SLIRP_READ_SIDE], POLLIN, 0},
-            {usr->host_to_guest_channel[SLIRP_READ_SIDE], POLLIN, 0},
-            {usr->host_to_guest_channel[SLIRP_WRITE_SIDE], POLLOUT, 0}};
-        poll(pfd, 3, 0);
-        if (pfd[0].revents & POLLIN) {
-            vnet->queues[VNET_QUEUE_RX].fd_ready = true;
-            virtio_net_try_rx(vnet);
-        }
-        if (pfd[1].revents & POLLIN) {
-            net_slirp_read(usr);
-        }
-        if (pfd[2].revents & POLLOUT) {
-            vnet->queues[VNET_QUEUE_TX].fd_ready = true;
-            virtio_net_try_tx(vnet);
-        }
+
+        ret = virtio_net_retrying_writev(
+            usr->host_to_guest_channel[SLIRP_WRITE_SIDE], iovs,
+            (int) iov_count);
         break;
     }
     default:
-        break;
+        return 0;
     }
-#undef _
-}
 
-void virtio_net_recv_from_peer(void *peer)
-{
-    virtio_net_state_t *vnet = (virtio_net_state_t *) peer;
-    vnet->queues[VNET_QUEUE_RX].fd_ready = true;
-
-    virtio_net_try_rx(vnet);
-}
-
-static bool virtio_net_reg_read(virtio_net_state_t *vnet,
-                                uint32_t addr,
-                                uint32_t *value)
-{
-#define _(reg) VIRTIO_##reg
-    switch (addr) {
-    case _(MagicValue):
-        *value = 0x74726976;
-        return true;
-    case _(Version):
-        *value = 2;
-        return true;
-    case _(DeviceID):
-        *value = 1;
-        return true;
-    case _(VendorID):
-        *value = VIRTIO_VENDOR_ID;
-        return true;
-
-    case _(DeviceFeatures):
-        *value = vnet->DeviceFeaturesSel == 0
-                     ? VNET_FEATURES_0
-                     : (vnet->DeviceFeaturesSel == 1 ? VNET_FEATURES_1 : 0);
-        return true;
-
-    case _(QueueNumMax):
-        *value = VNET_QUEUE_NUM_MAX;
-        return true;
-    case _(QueueReady):
-        *value = VNET_QUEUE.ready ? 1 : 0;
-        return true;
-
-    case _(InterruptStatus):
-        *value = vnet->InterruptStatus;
-        return true;
-    case _(Status):
-        *value = vnet->Status;
-        return true;
-
-    case _(ConfigGeneration):
-        *value = 0;
-        return true;
-
-    /* TODO: May want to check the occasion that the Linux kernel
-     * touches the MAC address of the virtio-net under 8-bit accesses
-     */
-    default:
-        /* Invalid address which exceeded the range */
-        if (!RANGE_CHECK(addr, _(Config), sizeof(struct virtio_net_config)))
-            return false;
-
-        /* Read configuration from the corresponding register */
-        *value = ((uint32_t *) PRIV(vnet))[addr - _(Config)];
-
-        return true;
+    if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_TX, false);
+        return -EAGAIN;
     }
-#undef _
+    if (ret < 0) {
+        fprintf(stderr, "[VNET] could not write packet: %s\n", strerror(errno));
+        return -EIO;
+    }
+
+    *written = ret;
+    return 0;
 }
 
-static bool virtio_net_reg_write(virtio_net_state_t *vnet,
-                                 uint32_t addr,
-                                 uint32_t value)
+static int virtio_net_process_rx_chain(virtio_net_state_t *vnet,
+                                       const struct virtq_chain *chain,
+                                       uint32_t *used_len)
 {
-#define _(reg) VIRTIO_##reg
-    switch (addr) {
-    case _(DeviceFeaturesSel):
-        vnet->DeviceFeaturesSel = value;
-        return true;
-    case _(DriverFeatures):
-        vnet->DriverFeaturesSel == 0 ? (vnet->DriverFeatures = value) : 0;
-        return true;
-    case _(DriverFeaturesSel):
-        vnet->DriverFeaturesSel = value;
-        return true;
+    uint8_t header[VNET_V1_HEADER_LEN] = {0};
+    uint8_t packet[VNET_PACKET_MAX];
+    unsigned header_len = virtio_net_header_len(vnet);
+    ssize_t packet_len = 0;
+    int ret;
 
-    case _(QueueSel):
-        if (value < ARRAY_SIZE(vnet->queues))
-            vnet->QueueSel = value;
-        else
-            virtio_net_set_fail(vnet);
-        return true;
-    case _(QueueNum):
-        if (value > 0 && value <= VNET_QUEUE_NUM_MAX)
-            VNET_QUEUE.QueueNum = value;
-        else
-            virtio_net_set_fail(vnet);
-        return true;
-    case _(QueueReady):
-        VNET_QUEUE.ready = value & 1;
-        if (value & 1)
-            VNET_QUEUE.last_avail =
-                ram_load_high16_acquire(&vnet->ram[VNET_QUEUE.QueueAvail]);
-        if (vnet->QueueSel == VNET_QUEUE_RX)
-            ram_fetch_or_w(&vnet->ram[VNET_QUEUE.QueueAvail],
-                           1); /* set VIRTQ_AVAIL_F_NO_INTERRUPT */
-        return true;
-    case _(QueueDescLow):
-        VNET_QUEUE.QueueDesc = vnet_preprocess(vnet, value);
-        return true;
-    case _(QueueDescHigh):
-        if (value)
-            virtio_net_set_fail(vnet);
-        return true;
-    case _(QueueDriverLow):
-        VNET_QUEUE.QueueAvail = vnet_preprocess(vnet, value);
-        return true;
-    case _(QueueDriverHigh):
-        if (value)
-            virtio_net_set_fail(vnet);
-        return true;
-    case _(QueueDeviceLow):
-        VNET_QUEUE.QueueUsed = vnet_preprocess(vnet, value);
-        return true;
-    case _(QueueDeviceHigh):
-        if (value)
-            virtio_net_set_fail(vnet);
-        return true;
+    *used_len = 0;
+    if (chain->readable_count != 0 || chain->writable_count == 0)
+        return -EINVAL;
+    if (header_len > sizeof(header))
+        return -EINVAL;
+    if (!virtio_net_iovs_have_bytes(chain->writable, chain->writable_count,
+                                    header_len))
+        return -EINVAL;
 
-    case _(QueueNotify):
-        if (value < ARRAY_SIZE(vnet->queues)) {
-            switch (value) {
-            case VNET_QUEUE_RX:
-                virtio_net_try_rx(vnet);
-                break;
-            case VNET_QUEUE_TX:
-                virtio_net_try_tx(vnet);
-                break;
-            }
-        } else {
+    ret = virtio_net_host_read(vnet, packet, sizeof(packet), &packet_len);
+    if (ret < 0)
+        return ret;
+    if (packet_len == 0)
+        return -EAGAIN;
+    if (!virtio_net_iovs_have_bytes(
+            chain->writable, chain->writable_count,
+            (guest_size_t) header_len + (guest_size_t) packet_len))
+        return -ENOSPC;
+
+    if (!virtio_net_write_iovs(vnet, chain->writable, chain->writable_count, 0,
+                               header, header_len) ||
+        !virtio_net_write_iovs(vnet, chain->writable, chain->writable_count,
+                               header_len, packet, (guest_size_t) packet_len))
+        return -EFAULT;
+
+    *used_len = (uint32_t) ((size_t) header_len + (size_t) packet_len);
+    return 0;
+}
+
+static int virtio_net_process_tx_chain(virtio_net_state_t *vnet,
+                                       const struct virtq_chain *chain,
+                                       uint32_t *used_len)
+{
+    struct iovec host_iovs[VNET_QUEUE_NUM_MAX];
+    size_t host_iov_count = ARRAY_SIZE(host_iovs);
+    uint8_t header[VNET_V1_HEADER_LEN];
+    unsigned header_len = virtio_net_header_len(vnet);
+    ssize_t written = 0;
+    int ret;
+
+    *used_len = 0;
+    if (chain->writable_count != 0 || chain->readable_count == 0)
+        return -EINVAL;
+    if (header_len > sizeof(header))
+        return -EINVAL;
+    if (!virtio_net_read_iovs(vnet, chain->readable, chain->readable_count, 0,
+                              header, header_len))
+        return -EFAULT;
+
+    ret = virtio_net_tx_build_iovs(vnet, chain, host_iovs, &host_iov_count);
+    if (ret < 0)
+        return ret;
+
+    ret = virtio_net_host_write(vnet, host_iovs, host_iov_count, &written);
+    if (ret < 0)
+        return ret;
+
+    return 0;
+}
+
+static int virtio_net_actor_drain_queue(void *opaque,
+                                        struct virtio_actor *actor,
+                                        uint16_t queue_index,
+                                        uint64_t generation)
+{
+    virtio_net_state_t *vnet = opaque;
+    struct virtq *queue;
+    struct virtq_iov readable[VNET_QUEUE_NUM_MAX];
+    struct virtq_iov writable[VNET_QUEUE_NUM_MAX];
+    bool consumed = false;
+    uint64_t common_generation = 0;
+
+    if (!vnet || queue_index >= VNET_QUEUE_COUNT) {
+        if (vnet)
             virtio_net_set_fail(vnet);
+        return 0;
+    }
+
+    queue = &vnet->common.queues[queue_index];
+
+    if (!virtio_net_actor_generation_current(vnet, actor, generation))
+        return 0;
+    if (!virtio_net_queue_ready_for_actor(vnet, queue, queue_index))
+        return 0;
+    if (!virtio_net_capture_common_generation(vnet, &common_generation))
+        return 0;
+
+    for (;;) {
+        struct virtq_chain chain = {
+            .readable = readable,
+            .readable_capacity = ARRAY_SIZE(readable),
+            .writable = writable,
+            .writable_capacity = ARRAY_SIZE(writable),
+        };
+        uint16_t available = 0;
+        uint32_t used_len = 0;
+        int ret;
+
+        if (!virtio_net_actor_generation_current(vnet, actor, generation))
+            return 0;
+        if (!virtio_net_common_generation_current(vnet, common_generation))
+            return 0;
+        if (!virtio_net_queue_fd_ready(vnet, queue_index))
+            return 0;
+
+        ret = virtio_net_queue_available(vnet, queue, &available);
+        if (ret < 0) {
+            virtio_net_set_fail_for_actor(vnet, generation, common_generation);
+            return 0;
         }
-        return true;
-    case _(InterruptACK):
-        vnet->InterruptStatus &= ~value;
-        return true;
-    case _(Status):
-        virtio_net_update_status(vnet, value);
-        return true;
+        if (available == 0)
+            break;
 
-    /* TODO: May want to check the occasion that the Linux kernel
-     * touches the MAC address of the virtio-net under 8-bit accesses
-     */
-    default:
-        /* Invalid address which exceeded the range */
-        if (!RANGE_CHECK(addr, _(Config), sizeof(struct virtio_net_config)))
-            return false;
+        ret = virtq_pop(vnet->common.dma, queue, &chain);
+        if (!virtio_net_actor_generation_current(vnet, actor, generation))
+            return 0;
+        if (!virtio_net_common_generation_current(vnet, common_generation))
+            return 0;
+        if (ret < 0) {
+            virtio_net_set_fail_for_actor(vnet, generation, common_generation);
+            return 0;
+        }
+        if (ret == 0)
+            break;
 
-        /* Write configuration to the corresponding register */
-        ((uint32_t *) PRIV(vnet))[addr - _(Config)] = value;
+        if (queue_index == VNET_QUEUE_RX)
+            ret = virtio_net_process_rx_chain(vnet, &chain, &used_len);
+        else
+            ret = virtio_net_process_tx_chain(vnet, &chain, &used_len);
 
-        return true;
+        if (!virtio_net_actor_generation_current(vnet, actor, generation))
+            return 0;
+        if (!virtio_net_common_generation_current(vnet, common_generation))
+            return 0;
+        if (ret == -EAGAIN) {
+            queue->last_avail--;
+            return 0;
+        }
+        if (ret < 0) {
+            virtio_net_set_fail_for_actor(vnet, generation, common_generation);
+            return 0;
+        }
+
+        if (!virtio_net_begin_actor_completion(vnet, generation,
+                                               common_generation))
+            return 0;
+        ret = virtq_add_used(vnet->common.dma, queue, chain.head, used_len);
+        if (ret < 0) {
+            virtio_net_set_fail(vnet);
+            virtio_net_end_actor_completion(vnet);
+            return 0;
+        }
+        virtio_net_end_actor_completion(vnet);
+        consumed = true;
     }
-#undef _
+
+    if (consumed && virtio_net_begin_actor_completion(vnet, generation,
+                                                      common_generation)) {
+        if (!virtq_interrupt_suppressed(vnet->common.dma, queue))
+            virtio_irq_trigger(&vnet->common.irq, VIRTIO_INT__USED_RING);
+        virtio_net_end_actor_completion(vnet);
+    }
+    return 0;
+}
+
+static bool virtio_net_actor_queue_has_work(void *opaque,
+                                            struct virtio_actor *actor,
+                                            uint16_t queue_index,
+                                            uint64_t generation)
+{
+    virtio_net_state_t *vnet = opaque;
+    uint16_t available = 0;
+    uint64_t common_generation = 0;
+    int ret;
+
+    if (!vnet || queue_index >= VNET_QUEUE_COUNT)
+        return false;
+    if (!virtio_net_actor_generation_current(vnet, actor, generation))
+        return false;
+    if (!virtio_net_queue_ready_for_actor(
+            vnet, &vnet->common.queues[queue_index], queue_index))
+        return false;
+    if (!virtio_net_capture_common_generation(vnet, &common_generation))
+        return false;
+
+    ret = virtio_net_queue_available(vnet, &vnet->common.queues[queue_index],
+                                     &available);
+    if (ret < 0) {
+        virtio_net_set_fail_for_actor(vnet, generation, common_generation);
+        return false;
+    }
+    return available != 0;
+}
+
+static void virtio_net_actor_failed(void *opaque,
+                                    struct virtio_actor *actor UNUSED)
+{
+    virtio_net_state_t *vnet = opaque;
+
+    if (vnet)
+        virtio_net_set_fail(vnet);
+}
+
+static const struct virtio_actor_ops virtio_net_actor_ops = {
+    .drain_queue = virtio_net_actor_drain_queue,
+    .queue_has_work = virtio_net_actor_queue_has_work,
+    .on_failed = virtio_net_actor_failed,
+};
+
+static int virtio_net_activate(void *opaque,
+                               const struct virtio_activation_context *ctx)
+{
+    virtio_net_state_t *vnet = opaque;
+    int ret;
+
+    if (!vnet || !vnet->actor_initialized)
+        return -EINVAL;
+
+    if (vnet->priv && ctx && ctx->common)
+        atomic_store_explicit(
+            &VNET_PRIV(vnet)->header_len,
+            virtio_net_features_header_len(ctx->common->driver_features),
+            memory_order_release);
+
+    ret = virtio_actor_start(&vnet->actor);
+    if (ret < 0 && ret != -EALREADY)
+        return ret;
+
+    ret = virtio_actor_enter_configuring(&vnet->actor);
+    if (ret < 0)
+        return ret;
+    return virtio_actor_activate(&vnet->actor);
+}
+
+static int virtio_net_prepare_reset(void *opaque,
+                                    uint64_t old_generation,
+                                    uint64_t new_generation)
+{
+    virtio_net_state_t *vnet = opaque;
+
+    (void) old_generation;
+    (void) new_generation;
+
+    if (!vnet || !vnet->actor_initialized)
+        return 0;
+    return virtio_actor_reset(&vnet->actor);
+}
+
+static int virtio_net_reset(void *opaque,
+                            uint64_t old_generation,
+                            uint64_t new_generation)
+{
+    virtio_net_state_t *vnet = opaque;
+
+    (void) old_generation;
+    (void) new_generation;
+
+    if (!vnet)
+        return 0;
+
+    virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_RX, false);
+    virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_TX, false);
+    if (vnet->priv)
+        atomic_store_explicit(&VNET_PRIV(vnet)->header_len,
+                              VNET_LEGACY_HEADER_LEN, memory_order_release);
+    return 0;
+}
+
+static int virtio_net_notify_queue(void *opaque,
+                                   uint16_t queue_index,
+                                   uint64_t generation)
+{
+    virtio_net_state_t *vnet = opaque;
+    int ret;
+
+    (void) generation;
+
+    if (!vnet || queue_index >= VNET_QUEUE_COUNT) {
+        if (vnet)
+            virtio_net_set_fail(vnet);
+        return -EINVAL;
+    }
+
+    ret = virtio_actor_notify_queue(&vnet->actor, queue_index);
+    if (ret == 0 || ret == -EAGAIN)
+        return 0;
+
+    virtio_net_set_fail(vnet);
+    return ret;
+}
+
+static const struct virtio_device_ops virtio_net_ops = {
+    .activate = virtio_net_activate,
+    .prepare_reset = virtio_net_prepare_reset,
+    .reset = virtio_net_reset,
+    .notify_queue = virtio_net_notify_queue,
+    .read_config = virtio_net_read_config,
+    .write_config = virtio_net_write_config,
+};
+
+static bool virtio_net_load_width_bytes(uint8_t width, size_t *access_size)
+{
+    switch (width) {
+    case RV_MEM_LW:
+        *access_size = 4;
+        return true;
+    case RV_MEM_LBU:
+    case RV_MEM_LB:
+        *access_size = 1;
+        return true;
+    case RV_MEM_LHU:
+    case RV_MEM_LH:
+        *access_size = 2;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool virtio_net_store_width_bytes(uint8_t width, size_t *access_size)
+{
+    switch (width) {
+    case RV_MEM_SW:
+        *access_size = 4;
+        return true;
+    case RV_MEM_SB:
+        *access_size = 1;
+        return true;
+    case RV_MEM_SH:
+        *access_size = 2;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool virtio_net_is_config_access(uint32_t addr, size_t access_size)
+{
+    const uint32_t base = VIRTIO_Config << 2;
+    const uint32_t end = base + (uint32_t) sizeof(struct virtio_net_config);
+
+    if (access_size == 0 || addr < base || addr >= end)
+        return false;
+    return access_size <= end - addr;
 }
 
 void virtio_net_read(hart_t *vm,
@@ -584,21 +886,34 @@ void virtio_net_read(hart_t *vm,
                      uint8_t width,
                      uint32_t *value)
 {
-    switch (width) {
-    case RV_MEM_LW:
-        if (!virtio_net_reg_read(vnet, addr >> 2, value))
-            vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
-        break;
-    case RV_MEM_LBU:
-    case RV_MEM_LB:
-    case RV_MEM_LHU:
-    case RV_MEM_LH:
-        vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
-        return;
-    default:
+    size_t access_size = 0;
+    bool is_cfg;
+    int ret;
+
+    if (!virtio_net_load_width_bytes(width, &access_size)) {
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
         return;
     }
+
+    is_cfg = virtio_net_is_config_access(addr, access_size);
+    if (addr >= (VIRTIO_Config << 2) && !is_cfg) {
+        vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
+        return;
+    }
+
+    if (!is_cfg) {
+        if (access_size != 4 || (addr & 0x3)) {
+            vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
+            return;
+        }
+    } else if (addr & (access_size - 1)) {
+        vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
+        return;
+    }
+
+    ret = virtio_mmio_read(&vnet->common, addr, (uint8_t) access_size, value);
+    if (ret < 0)
+        vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
 }
 
 void virtio_net_write(hart_t *vm,
@@ -607,41 +922,272 @@ void virtio_net_write(hart_t *vm,
                       uint8_t width,
                       uint32_t value)
 {
-    switch (width) {
-    case RV_MEM_SW:
-        if (!virtio_net_reg_write(vnet, addr >> 2, value))
-            vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
-        break;
-    case RV_MEM_SB:
-    case RV_MEM_SH:
-        vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
-        return;
-    default:
+    size_t access_size = 0;
+    bool is_cfg;
+    int ret;
+
+    if (!virtio_net_store_width_bytes(width, &access_size)) {
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
         return;
     }
-}
 
-bool virtio_net_init(virtio_net_state_t *vnet, const char *name)
-{
-    if (vnet_dev_cnt >= VNET_DEV_CNT_MAX) {
-        fprintf(stderr,
-                "Excedded the number of virtio-net device can be allocated.\n");
-        exit(2);
+    is_cfg = virtio_net_is_config_access(addr, access_size);
+    if (addr >= (VIRTIO_Config << 2) && !is_cfg) {
+        vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
+        return;
     }
 
-    /* Allocate memory for the private member */
-    vnet->priv = &vnet_configs[vnet_dev_cnt++];
+    if (!is_cfg) {
+        if (access_size != 4 || (addr & 0x3)) {
+            vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
+            return;
+        }
+    } else if (addr & (access_size - 1)) {
+        vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
+        return;
+    }
 
-    if (!netdev_init(&vnet->peer, name)) {
-        fprintf(stderr, "Fail to init net device %s\n", name);
+    ret = virtio_mmio_write(&vnet->common, addr, (uint8_t) access_size, value);
+    if (ret < 0)
+        vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
+}
+
+bool virtio_net_irq_pending(virtio_net_state_t *vnet)
+{
+    return vnet && virtio_irq_read_status(&vnet->common.irq) != 0;
+}
+
+static void virtio_net_notify_if_active(virtio_net_state_t *vnet,
+                                        uint16_t queue_index)
+{
+    int ret;
+
+    if (!vnet || !vnet->actor_initialized)
+        return;
+
+    ret = virtio_actor_notify_queue(&vnet->actor, queue_index);
+    if (ret < 0 && ret != -EAGAIN)
+        virtio_net_set_fail(vnet);
+}
+
+static void virtio_net_poll_internal_rx(virtio_net_state_t *vnet,
+                                        net_user_options_t *usr)
+{
+    struct pollfd rx = {usr->guest_to_host_channel[SLIRP_READ_SIDE], POLLIN, 0};
+
+    if (poll(&rx, 1, 0) > 0 && (rx.revents & POLLIN)) {
+        virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_RX, true);
+        virtio_net_notify_if_active(vnet, VNET_QUEUE_RX);
+    }
+}
+
+static void virtio_net_poll_internal_tx_ready(virtio_net_state_t *vnet,
+                                              net_user_options_t *usr)
+{
+    struct pollfd tx = {usr->host_to_guest_channel[SLIRP_WRITE_SIDE], POLLOUT,
+                        0};
+
+    if (poll(&tx, 1, 0) > 0 && (tx.revents & POLLOUT)) {
+        virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_TX, true);
+        virtio_net_notify_if_active(vnet, VNET_QUEUE_TX);
+    }
+}
+
+static void virtio_net_pump_user_slirp(virtio_net_state_t *vnet,
+                                       net_user_options_t *usr)
+{
+    uint32_t timeout = 0;
+    int pollout;
+
+    if (!vnet || !usr || !usr->slirp || !usr->pfd || usr->pfd_size < 2)
+        return;
+
+    usr->pfd_len = 2;
+    slirp_pollfds_fill_socket(usr->slirp, &timeout, semu_slirp_add_poll_socket,
+                              usr);
+    pollout = poll(usr->pfd, usr->pfd_len, 0);
+
+    if (usr->pfd_len > 1 && (usr->pfd[1].revents & POLLIN))
+        (void) net_slirp_read(usr);
+
+    slirp_pollfds_poll(usr->slirp, pollout <= 0, semu_slirp_get_revents, usr);
+
+    virtio_net_poll_internal_rx(vnet, usr);
+    virtio_net_poll_internal_tx_ready(vnet, usr);
+}
+
+void virtio_net_recv_from_peer(void *peer)
+{
+    virtio_net_state_t *vnet = (virtio_net_state_t *) peer;
+
+    if (!vnet)
+        return;
+
+    virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_RX, true);
+    virtio_net_notify_if_active(vnet, VNET_QUEUE_RX);
+}
+
+void virtio_net_refresh_queue(virtio_net_state_t *vnet)
+{
+    unsigned status;
+
+    if (!vnet)
+        return;
+
+    status = virtio_net_status_load(vnet);
+    if (!(status & VIRTIO_STATUS__DRIVER_OK) ||
+        (status & VIRTIO_STATUS__DEVICE_NEEDS_RESET))
+        return;
+    if (!vnet->peer.op)
+        return;
+
+    switch (vnet->peer.type) {
+#if defined(__APPLE__)
+    case NETDEV_IMPL_vmnet: {
+        net_vmnet_state_t *vmnet = (net_vmnet_state_t *) vnet->peer.op;
+        struct pollfd pfd = {net_vmnet_get_fd(vmnet), POLLIN, 0};
+
+        (void) poll(&pfd, 1, 0);
+        if (pfd.revents & POLLIN) {
+            virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_RX, true);
+            virtio_net_notify_if_active(vnet, VNET_QUEUE_RX);
+        }
+        virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_TX, true);
+        virtio_net_notify_if_active(vnet, VNET_QUEUE_TX);
+        break;
+    }
+#else
+    case NETDEV_IMPL_tap: {
+        net_tap_options_t *tap = (net_tap_options_t *) vnet->peer.op;
+        struct pollfd pfd = {tap->tap_fd, POLLIN | POLLOUT, 0};
+
+        (void) poll(&pfd, 1, 0);
+        if (pfd.revents & POLLIN) {
+            virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_RX, true);
+            virtio_net_notify_if_active(vnet, VNET_QUEUE_RX);
+        }
+        if (pfd.revents & POLLOUT) {
+            virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_TX, true);
+            virtio_net_notify_if_active(vnet, VNET_QUEUE_TX);
+        }
+        break;
+    }
+#endif
+    case NETDEV_IMPL_user: {
+        net_user_options_t *usr = (net_user_options_t *) vnet->peer.op;
+
+        virtio_net_pump_user_slirp(vnet, usr);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+bool virtio_net_init(virtio_net_state_t *vnet,
+                     emu_state_t *emu,
+                     const char *name)
+{
+    static const uint16_t queue_max_sizes[] = {
+        [VNET_QUEUE_RX] = VNET_QUEUE_NUM_MAX,
+        [VNET_QUEUE_TX] = VNET_QUEUE_NUM_MAX,
+    };
+    struct virtio_device_common_config common_config;
+    struct virtio_net_priv *priv;
+
+    if (!vnet || !emu) {
+        fprintf(stderr, "Failed to initialize virtio-net common device.\n");
         return false;
     }
 
+    memset(vnet, 0, sizeof(*vnet));
+    vnet->ram = emu->ram;
+
+    priv = calloc(1, sizeof(*priv));
+    if (!priv) {
+        fprintf(stderr, "Failed to allocate virtio-net config.\n");
+        return false;
+    }
+    priv->config.status = 1;
+    priv->config.max_virtqueue_pairs = 1;
+    priv->config.mtu = 1500;
+    atomic_init(&priv->header_len, VNET_LEGACY_HEADER_LEN);
+    vnet->priv = priv;
+
+    common_config = (struct virtio_device_common_config) {
+        .emu = emu,
+        .dma = &emu->ram_dma,
+        .irq_source = SEMU_IRQ_SOURCE_VNET,
+        .device_id = 1,
+        .vendor_id = VIRTIO_VENDOR_ID,
+        .device_features = VIRTIO_NET_F_VERSION_1,
+        .required_features = VIRTIO_NET_F_VERSION_1,
+        .queue_max_sizes = queue_max_sizes,
+        .num_queues = ARRAY_SIZE(queue_max_sizes),
+        .ops = &virtio_net_ops,
+        .opaque = vnet,
+    };
+
+    if (virtio_device_common_init(&vnet->common, &common_config) < 0) {
+        free(priv);
+        vnet->priv = NULL;
+        fprintf(stderr, "Failed to initialize virtio-net common device.\n");
+        return false;
+    }
+
+    if (virtio_actor_init(&vnet->actor, &virtio_net_actor_ops, vnet,
+                          ARRAY_SIZE(queue_max_sizes)) < 0) {
+        virtio_device_common_destroy(&vnet->common);
+        free(priv);
+        vnet->priv = NULL;
+        fprintf(stderr, "Failed to initialize virtio-net actor.\n");
+        return false;
+    }
+    vnet->actor_initialized = true;
+
+    if (name) {
+        if (!netdev_init(&vnet->peer, name)) {
+            virtio_net_destroy(vnet);
+            fprintf(stderr, "Fail to init net device %s\n", name);
+            return false;
+        }
+        VNET_PRIV(vnet)->peer_owned = true;
+    }
+
 #if defined(__APPLE__)
-    if (vnet->peer.type == NETDEV_IMPL_vmnet)
-        vnet->queues[VNET_QUEUE_TX].fd_ready = true;
+    if (vnet->peer.op && vnet->peer.type == NETDEV_IMPL_vmnet)
+        virtio_net_set_queue_fd_ready(vnet, VNET_QUEUE_TX, true);
 #endif
 
     return true;
+}
+
+void virtio_net_destroy(virtio_net_state_t *vnet)
+{
+    struct virtio_net_priv *priv;
+
+    if (!vnet)
+        return;
+
+    priv = VNET_PRIV(vnet);
+
+    if (vnet->actor_initialized) {
+        virtio_actor_stop(&vnet->actor);
+        virtio_actor_destroy(&vnet->actor);
+        vnet->actor_initialized = false;
+    }
+
+    virtio_device_common_destroy(&vnet->common);
+
+    if (priv && priv->peer_owned && vnet->peer.op) {
+#if defined(__APPLE__)
+        if (vnet->peer.type == NETDEV_IMPL_vmnet)
+            net_vmnet_cleanup((net_vmnet_state_t *) vnet->peer.op);
+#endif
+        free(vnet->peer.op);
+        vnet->peer.op = NULL;
+    }
+
+    free(priv);
+    vnet->priv = NULL;
 }
