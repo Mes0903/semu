@@ -1,6 +1,7 @@
 #include "virtio-gpu-virgl.h"
 
 #include "platform.h"
+#include "riscv_private.h"
 #include "vgpu-display.h"
 
 #include <limits.h>
@@ -217,9 +218,57 @@ static bool vgpu_virgl_remove_renderer_resource(uint32_t resource_id)
     return false;
 }
 
-static bool vgpu_virgl_hostmem_width_ok(uint8_t width)
+static bool vgpu_virgl_hostmem_load_access(uint8_t width,
+                                           uint8_t *bytes,
+                                           bool *sign_extend)
 {
-    return width == 1 || width == 2 || width == 4;
+    if (!bytes || !sign_extend)
+        return false;
+
+    switch (width) {
+    case RV_MEM_LW:
+        *bytes = 4;
+        *sign_extend = false;
+        return true;
+    case RV_MEM_LHU:
+        *bytes = 2;
+        *sign_extend = false;
+        return true;
+    case RV_MEM_LH:
+        *bytes = 2;
+        *sign_extend = true;
+        return true;
+    case RV_MEM_LBU:
+        *bytes = 1;
+        *sign_extend = false;
+        return true;
+    case RV_MEM_LB:
+        *bytes = 1;
+        *sign_extend = true;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool vgpu_virgl_hostmem_store_access(uint8_t width, uint8_t *bytes)
+{
+    if (!bytes)
+        return false;
+
+    switch (width) {
+    case RV_MEM_SW:
+        *bytes = 4;
+        return true;
+    case RV_MEM_SH:
+        *bytes = 2;
+        return true;
+    case RV_MEM_SB:
+        *bytes = 1;
+        return true;
+    default:
+        return false;
+    }
 }
 
 static bool vgpu_virgl_hostmem_range_valid(uint64_t offset, uint64_t size)
@@ -232,16 +281,16 @@ static bool vgpu_virgl_hostmem_range_valid(uint64_t offset, uint64_t size)
 }
 
 static bool vgpu_virgl_find_hostmem_mapping_locked(uint64_t off,
-                                                   uint8_t width,
+                                                   uint8_t bytes,
                                                    uint8_t **ptr)
 {
     uint64_t end;
 
-    if (!ptr || !vgpu_virgl_hostmem_width_ok(width))
+    if (!ptr || (bytes != 1 && bytes != 2 && bytes != 4))
         return false;
-    if (off > UINT64_MAX - width)
+    if (off > UINT64_MAX - bytes)
         return false;
-    end = off + width;
+    end = off + bytes;
 
     for (struct vgpu_virgl_renderer_resource *res =
              vgpu_virgl_renderer_resources;
@@ -269,19 +318,26 @@ bool vgpu_virgl_hostmem_read(uint64_t off, uint8_t width, uint32_t *value)
 {
     uint8_t *ptr = NULL;
     uint32_t result = 0;
+    uint8_t bytes = 0;
+    bool sign_extend = false;
 
-    if (!value)
+    if (!value || !vgpu_virgl_hostmem_load_access(width, &bytes, &sign_extend))
         return false;
 
     pthread_mutex_lock(&vgpu_virgl_resource_lock);
-    if (!vgpu_virgl_find_hostmem_mapping_locked(off, width, &ptr)) {
+    if (!vgpu_virgl_find_hostmem_mapping_locked(off, bytes, &ptr)) {
         pthread_mutex_unlock(&vgpu_virgl_resource_lock);
         return false;
     }
 
-    for (uint8_t i = 0; i < width; i++)
+    for (uint8_t i = 0; i < bytes; i++)
         result |= (uint32_t) ptr[i] << (i * 8);
     pthread_mutex_unlock(&vgpu_virgl_resource_lock);
+
+    if (sign_extend && bytes == 1)
+        result = (uint32_t) (int32_t) (int8_t) result;
+    else if (sign_extend && bytes == 2)
+        result = (uint32_t) (int32_t) (int16_t) result;
 
     *value = result;
     return true;
@@ -290,14 +346,17 @@ bool vgpu_virgl_hostmem_read(uint64_t off, uint8_t width, uint32_t *value)
 bool vgpu_virgl_hostmem_write(uint64_t off, uint8_t width, uint32_t value)
 {
     uint8_t *ptr = NULL;
+    uint8_t bytes = 0;
 
+    if (!vgpu_virgl_hostmem_store_access(width, &bytes))
+        return false;
     pthread_mutex_lock(&vgpu_virgl_resource_lock);
-    if (!vgpu_virgl_find_hostmem_mapping_locked(off, width, &ptr)) {
+    if (!vgpu_virgl_find_hostmem_mapping_locked(off, bytes, &ptr)) {
         pthread_mutex_unlock(&vgpu_virgl_resource_lock);
         return false;
     }
 
-    for (uint8_t i = 0; i < width; i++)
+    for (uint8_t i = 0; i < bytes; i++)
         ptr[i] = (uint8_t) (value >> (i * 8));
     pthread_mutex_unlock(&vgpu_virgl_resource_lock);
     return true;
