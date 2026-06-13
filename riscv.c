@@ -1065,28 +1065,54 @@ static bool mmu_store(hart_t *vm,
     }
 
 do_store:
-    lr_reservation_lock(vm->vm);
-
-    if (unlikely(cond) && !lr_reservation_matches_locked(vm, phys_addr)) {
-        lr_reservation_clear_locked(vm);
-        lr_reservation_unlock(vm->vm);
-        return false;
-    }
-
     if (likely(host_addr)) {
+        lr_reservation_lock(vm->vm);
+
+        if (unlikely(cond) && !lr_reservation_matches_locked(vm, phys_addr)) {
+            lr_reservation_clear_locked(vm);
+            lr_reservation_unlock(vm->vm);
+            return false;
+        }
+
         ram_write_host_fast(vm, host_addr, width, value);
-    } else {
-        uint32_t *page_ptr = ram_cache_lookup(vm, phys_addr, true);
-        if (likely(page_ptr != NULL))
-            ram_write_fast(vm, page_ptr, phys_addr, width, value);
-        else
-            vm->mem_store(vm, phys_addr, width, value);
+
+        if (!vm->error)
+            lr_reservation_invalidate_locked(vm->vm, phys_addr);
+
+        lr_reservation_unlock(vm->vm);
+        return !vm->error;
     }
 
-    if (!vm->error)
-        lr_reservation_invalidate_locked(vm->vm, phys_addr);
+    uint32_t *page_ptr = ram_cache_lookup(vm, phys_addr, true);
+    if (likely(page_ptr != NULL)) {
+        lr_reservation_lock(vm->vm);
 
-    lr_reservation_unlock(vm->vm);
+        if (unlikely(cond) && !lr_reservation_matches_locked(vm, phys_addr)) {
+            lr_reservation_clear_locked(vm);
+            lr_reservation_unlock(vm->vm);
+            return false;
+        }
+
+        ram_write_fast(vm, page_ptr, phys_addr, width, value);
+
+        if (!vm->error)
+            lr_reservation_invalidate_locked(vm->vm, phys_addr);
+
+        lr_reservation_unlock(vm->vm);
+        return !vm->error;
+    }
+
+    if (unlikely(cond)) {
+        lr_reservation_lock(vm->vm);
+        if (!lr_reservation_matches_locked(vm, phys_addr)) {
+            lr_reservation_clear_locked(vm);
+            lr_reservation_unlock(vm->vm);
+            return false;
+        }
+        lr_reservation_unlock(vm->vm);
+    }
+
+    vm->mem_store(vm, phys_addr, width, value);
     return !vm->error;
 }
 

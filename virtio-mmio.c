@@ -677,8 +677,17 @@ int virtio_mmio_read(struct virtio_device_common *common,
         result = common->config_generation;
         break;
     case VIRTIO_MMIO_REG(SHMSel):
+        result = 0;
+        break;
     case VIRTIO_MMIO_REG(SHMLenLow):
     case VIRTIO_MMIO_REG(SHMLenHigh):
+        /* VirtIO MMIO reports a missing shared-memory region by returning
+         * UINT64_MAX from the length registers. Returning zero describes a
+         * real zero-length region to Linux, which can make drivers fail probe
+         * while reserving host-visible memory.
+         */
+        result = UINT32_MAX;
+        break;
     case VIRTIO_MMIO_REG(SHMBaseLow):
     case VIRTIO_MMIO_REG(SHMBaseHigh):
     case VIRTIO_MMIO_REG(QueueReset):
