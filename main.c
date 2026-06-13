@@ -66,7 +66,11 @@ static void semu_ram_dma_write_invalidate(void *opaque,
                                           guest_size_t len);
 static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps);
 static int semu_service_hart_step(emu_state_t *emu, hart_t *hart);
-static int semu_run_chunk(emu_state_t *emu, int steps);
+static bool semu_single_thread_pick_next_started_hart(emu_state_t *emu,
+                                                      uint32_t *next_hart,
+                                                      hart_t **hart_out);
+static void semu_single_thread_refresh_harts(emu_state_t *emu);
+static int semu_run_chunk(emu_state_t *emu, int steps, uint32_t *next_hart);
 
 enum {
     SEMU_SMP_SLICE_STEPS = 8,
@@ -1629,6 +1633,13 @@ static sbi_ret_t semu_rfence_request(hart_t *hart,
                                      uint32_t size,
                                      uint32_t asid)
 {
+    emu_state_t *emu = PRIV(hart);
+    if (!semu_should_use_threaded_runtime(emu)) {
+        (void) asid;
+        return semu_rfence_direct(hart, type, hart_mask, hart_mask_base,
+                                  start_addr, size);
+    }
+
     return semu_rfence_threaded(hart, type, hart_mask, hart_mask_base,
                                 start_addr, size, asid);
 }
@@ -2583,23 +2594,91 @@ static int semu_step(emu_state_t *emu)
     return 0;
 }
 
-static int semu_service_hart_step(emu_state_t *emu, hart_t *hart)
+static bool semu_single_thread_pick_next_started_hart(emu_state_t *emu,
+                                                      uint32_t *next_hart,
+                                                      hart_t **hart_out)
 {
-    semu_process_pending_rfence(hart);
-    emu_tick_peripherals(emu);
-    emu_update_timer_interrupt(hart);
-    emu_update_swi_interrupt(hart);
-    return semu_step_chunk(emu, hart, 1);
+    vm_t *vm = &emu->vm;
+    if (!vm->n_hart || !next_hart || !hart_out)
+        return false;
+
+    uint32_t start = *next_hart % vm->n_hart;
+    for (uint32_t scanned = 0; scanned < vm->n_hart; scanned++) {
+        uint32_t index = (start + scanned) % vm->n_hart;
+        hart_t *hart = vm->hart[index];
+        if (hart && hart_hsm_status_load(hart) == SBI_HSM_STATE_STARTED) {
+            *hart_out = hart;
+            *next_hart = (index + 1) % vm->n_hart;
+            return true;
+        }
+    }
+
+    *hart_out = NULL;
+    *next_hart = start;
+    return false;
 }
 
-static int semu_run_chunk(emu_state_t *emu, int steps)
+static int semu_service_hart_steps(emu_state_t *emu, hart_t *hart, int steps)
 {
-    hart_t *hart = emu->vm.hart[0];
+    semu_process_pending_rfence(hart);
+    if (hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED)
+        return 0;
+
+    semu_process_hsm_resume_if_started(hart);
+    if (semu_hart_pause_safe_point(hart) < 0)
+        return 0;
 
     emu_tick_peripherals(emu);
     emu_update_timer_interrupt(hart);
     emu_update_swi_interrupt(hart);
+    semu_wake_hart_if_interrupt_pending(emu, hart->mhartid);
+
+    if (hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED)
+        return 0;
     return semu_step_chunk(emu, hart, steps);
+}
+
+static int semu_service_hart_step(emu_state_t *emu, hart_t *hart)
+{
+    return semu_service_hart_steps(emu, hart, 1);
+}
+
+static void semu_single_thread_refresh_harts(emu_state_t *emu)
+{
+    for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
+        emu_update_timer_interrupt(emu->vm.hart[i]);
+        emu_update_swi_interrupt(emu->vm.hart[i]);
+        semu_wake_hart_if_interrupt_pending(emu, i);
+    }
+}
+
+static void semu_single_thread_idle_tick(emu_state_t *emu)
+{
+    emu_tick_peripherals(emu);
+    semu_single_thread_refresh_harts(emu);
+    poll(NULL, 0, 1);
+}
+
+static int semu_run_chunk(emu_state_t *emu, int steps, uint32_t *next_hart)
+{
+    while (steps > 0 && !emu_stopped_load(emu)) {
+        emu_tick_peripherals(emu);
+        semu_single_thread_refresh_harts(emu);
+
+        hart_t *hart;
+        if (!semu_single_thread_pick_next_started_hart(emu, next_hart, &hart)) {
+            semu_single_thread_idle_tick(emu);
+            return 0;
+        }
+
+        int slice = MIN(SEMU_SMP_SLICE_STEPS, steps);
+        int ret = semu_service_hart_steps(emu, hart, slice);
+        if (ret)
+            return ret;
+        steps -= slice;
+    }
+
+    return 0;
 }
 
 static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps)
@@ -2816,8 +2895,10 @@ static void semu_run(emu_state_t *emu)
     }
 
     int ret;
+    uint32_t next_hart = 0;
 
-    /* Single-hart mode: use inline scheduling. */
+    /* Single-thread mode: one inline CPU executor schedules all active harts.
+     */
     while (!emu_stopped_load(emu)) {
         /* Break out on SIGINT/SIGTERM so atexit hooks fire on graceful exit. */
         if (signal_received)
@@ -2847,7 +2928,7 @@ static void semu_run(emu_state_t *emu)
                 int steps =
                     MIN(SEMU_SLIRP_SLICE_STEPS, SLIRP_POLL_INTERVAL - i);
 
-                ret = semu_run_chunk(emu, steps);
+                ret = semu_run_chunk(emu, steps, &next_hart);
                 if (ret) {
                     emu->exit_code = ret;
                     return;
@@ -2856,7 +2937,7 @@ static void semu_run(emu_state_t *emu)
         } else
 #endif
         {
-            ret = semu_run_chunk(emu, SEMU_SINGLE_SLICE_STEPS);
+            ret = semu_run_chunk(emu, SEMU_SINGLE_SLICE_STEPS, &next_hart);
             if (ret) {
                 emu->exit_code = ret;
                 return;
