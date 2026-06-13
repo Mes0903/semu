@@ -81,7 +81,7 @@ static bool aclint_mtimer_reg_write(mtimer_state_t *mtimer,
 
     /* mtime (0x4307FF8 ~ 0x4308000) */
     if (addr < 0x8000) {
-        uint64_t mtime_val = mtimer->mtime.begin;
+        uint64_t mtime_val = semu_timer_get(&mtimer->mtime);
         if (addr & 0x4)
             mtime_val = (mtime_val & 0xFFFFFFFF) | ((uint64_t) value << 32);
         else

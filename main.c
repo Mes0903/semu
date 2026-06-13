@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef MMU_CACHE_STATS
 #include <sys/time.h>
@@ -40,9 +41,17 @@
 
 #define PRIV(x) ((emu_state_t *) x->priv)
 
-/* Forward declarations for coroutine support */
+/* Forward declarations for runtime support */
+#if !SEMU_HAS(THREADED)
 static void wfi_handler(hart_t *hart);
 static void hart_exec_loop(void *arg);
+#endif
+#if SEMU_HAS(THREADED)
+static void wfi_handler_threaded(hart_t *hart);
+static void *hart_thread_func(void *arg);
+static void *io_thread_func(void *arg);
+#endif
+static volatile sig_atomic_t signal_received = 0;
 static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps);
 static int semu_service_hart_step(emu_state_t *emu, hart_t *hart);
 static int semu_run_chunk(emu_state_t *emu, int steps);
@@ -64,9 +73,74 @@ static inline void emu_stopped_store(emu_state_t *emu, bool value)
     __atomic_store_n(&emu->stopped, value, __ATOMIC_RELAXED);
 }
 
-static inline void emu_device_lock(pthread_mutex_t *lock UNUSED) {}
+static inline bool emu_threaded_fatal_load(const emu_state_t *emu)
+{
+    return __atomic_load_n(&emu->threaded_fatal, __ATOMIC_RELAXED);
+}
 
-static inline void emu_device_unlock(pthread_mutex_t *lock UNUSED) {}
+static inline void emu_threaded_fatal_store(emu_state_t *emu, bool value)
+{
+    __atomic_store_n(&emu->threaded_fatal, value, __ATOMIC_RELAXED);
+}
+
+static inline uint32_t emu_peripheral_update_ctr_load(emu_state_t *emu)
+{
+    return __atomic_load_n(&emu->peripheral_update_ctr, __ATOMIC_RELAXED);
+}
+
+static inline void emu_peripheral_update_ctr_store(emu_state_t *emu,
+                                                   uint32_t value)
+{
+    __atomic_store_n(&emu->peripheral_update_ctr, value, __ATOMIC_RELAXED);
+}
+
+static inline bool emu_peripheral_tick_due(emu_state_t *emu)
+{
+#if SEMU_HAS(THREADED)
+    for (;;) {
+        uint32_t counter =
+            __atomic_load_n(&emu->peripheral_update_ctr, __ATOMIC_RELAXED);
+        if (counter == 0) {
+            uint32_t expected = 0;
+            if (__atomic_compare_exchange_n(&emu->peripheral_update_ctr,
+                                            &expected, 64, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                return true;
+            continue;
+        }
+
+        uint32_t next = counter - 1;
+        if (__atomic_compare_exchange_n(&emu->peripheral_update_ctr, &counter,
+                                        next, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_RELAXED))
+            return false;
+    }
+#else
+    if (emu->peripheral_update_ctr-- == 0) {
+        emu->peripheral_update_ctr = 64;
+        return true;
+    }
+    return false;
+#endif
+}
+
+static inline void emu_device_lock(pthread_mutex_t *lock)
+{
+#if SEMU_HAS(THREADED)
+    pthread_mutex_lock(lock);
+#else
+    (void) lock;
+#endif
+}
+
+static inline void emu_device_unlock(pthread_mutex_t *lock)
+{
+#if SEMU_HAS(THREADED)
+    pthread_mutex_unlock(lock);
+#else
+    (void) lock;
+#endif
+}
 
 #define EMU_DEVICE_CALL(lock, ...)  \
     do {                            \
@@ -81,6 +155,92 @@ static int emu_mutex_init(pthread_mutex_t *lock)
     if (rc)
         errno = rc;
     return rc;
+}
+
+static void semu_signal_hart(emu_state_t *emu, uint32_t hartid)
+{
+#if SEMU_HAS(THREADED)
+    if (!emu->hart_wait || hartid >= emu->vm.n_hart)
+        return;
+
+    pthread_mutex_lock(&emu->hart_wait[hartid].mutex);
+    pthread_cond_signal(&emu->hart_wait[hartid].cond);
+    pthread_mutex_unlock(&emu->hart_wait[hartid].mutex);
+#else
+    (void) emu;
+    (void) hartid;
+#endif
+}
+
+static bool UNUSED semu_hart_has_enabled_interrupt(hart_t *hart)
+{
+    return (hart_sip_load(hart) & hart_sie_load(hart)) != 0;
+}
+
+static void UNUSED semu_resume_hart(emu_state_t *emu, uint32_t hartid)
+{
+#if SEMU_HAS(THREADED)
+    if (hartid >= emu->vm.n_hart)
+        return;
+
+    hart_t *hart = emu->vm.hart[hartid];
+    int32_t expected = SBI_HSM_STATE_SUSPENDED;
+    hart_hsm_status_compare_exchange(hart, &expected, SBI_HSM_STATE_STARTED);
+    semu_signal_hart(emu, hartid);
+#else
+    (void) emu;
+    (void) hartid;
+#endif
+}
+
+static void semu_signal_all_harts(emu_state_t *emu)
+{
+#if SEMU_HAS(THREADED)
+    for (uint32_t i = 0; i < emu->vm.n_hart; i++)
+        semu_signal_hart(emu, i);
+#else
+    (void) emu;
+#endif
+}
+
+static void semu_wake_hart_if_interrupt_pending(emu_state_t *emu,
+                                                uint32_t hartid)
+{
+#if SEMU_HAS(THREADED)
+    if (hartid >= emu->vm.n_hart)
+        return;
+
+    if (semu_hart_has_enabled_interrupt(emu->vm.hart[hartid]))
+        semu_resume_hart(emu, hartid);
+#else
+    (void) emu;
+    (void) hartid;
+#endif
+}
+
+static void semu_wake_interruptible_harts(emu_state_t *emu)
+{
+#if SEMU_HAS(THREADED)
+    for (uint32_t i = 0; i < emu->vm.n_hart; i++)
+        semu_wake_hart_if_interrupt_pending(emu, i);
+#else
+    (void) emu;
+#endif
+}
+
+static void semu_set_stopped(emu_state_t *emu, bool value)
+{
+    emu_stopped_store(emu, value);
+    if (value)
+        semu_signal_all_harts(emu);
+}
+
+static void emu_update_plic_irq(emu_state_t *emu, uint32_t irq_bit, bool active)
+{
+    EMU_DEVICE_CALL(emu->plic_lock, if (active) emu->plic.active |= irq_bit;
+                    else emu->plic.active &= ~irq_bit;
+                    plic_update_interrupts(&emu->vm, &emu->plic));
+    semu_wake_interruptible_harts(emu);
 }
 
 /* Define fetch separately since it is simpler (fixed width, already checked
@@ -106,84 +266,79 @@ static uint32_t *mem_page_table(const hart_t *hart, uint32_t ppn)
     return NULL;
 }
 
-static void emu_update_uart_interrupts(vm_t *vm)
+static void UNUSED emu_update_uart_interrupts(vm_t *vm)
 {
     emu_state_t *data = PRIV(vm->hart[0]);
-    u8250_update_interrupts(&data->uart);
-    if (data->uart.pending_ints)
-        data->plic.active |= IRQ_UART_BIT;
-    else
-        data->plic.active &= ~IRQ_UART_BIT;
-    plic_update_interrupts(vm, &data->plic);
+    bool pending;
+
+    EMU_DEVICE_CALL(data->uart_lock, u8250_update_interrupts(&data->uart);
+                    pending = data->uart.pending_ints != 0);
+    emu_update_plic_irq(data, IRQ_UART_BIT, pending);
 }
 
 #if SEMU_HAS(VIRTIONET)
-static void emu_update_vnet_interrupts(vm_t *vm)
+static void UNUSED emu_update_vnet_interrupts(vm_t *vm)
 {
     emu_state_t *data = PRIV(vm->hart[0]);
-    if (data->vnet.InterruptStatus)
-        data->plic.active |= IRQ_VNET_BIT;
-    else
-        data->plic.active &= ~IRQ_VNET_BIT;
-    plic_update_interrupts(vm, &data->plic);
+    bool pending;
+
+    EMU_DEVICE_CALL(data->vnet_lock, pending = data->vnet.InterruptStatus != 0);
+    emu_update_plic_irq(data, IRQ_VNET_BIT, pending);
 }
 #endif
 
 #if SEMU_HAS(VIRTIOBLK)
-static void emu_update_vblk_interrupts(vm_t *vm)
+static void UNUSED emu_update_vblk_interrupts(vm_t *vm)
 {
     emu_state_t *data = PRIV(vm->hart[0]);
-    if (data->vblk.InterruptStatus)
-        data->plic.active |= IRQ_VBLK_BIT;
-    else
-        data->plic.active &= ~IRQ_VBLK_BIT;
-    plic_update_interrupts(vm, &data->plic);
+    bool pending;
+
+    EMU_DEVICE_CALL(data->vblk_lock, pending = data->vblk.InterruptStatus != 0);
+    emu_update_plic_irq(data, IRQ_VBLK_BIT, pending);
 }
 #endif
 
 #if SEMU_HAS(VIRTIORNG)
-static void emu_update_vrng_interrupts(vm_t *vm)
+static void UNUSED emu_update_vrng_interrupts(vm_t *vm)
 {
     emu_state_t *data = PRIV(vm->hart[0]);
-    if (data->vrng.InterruptStatus)
-        data->plic.active |= IRQ_VRNG_BIT;
-    else
-        data->plic.active &= ~IRQ_VRNG_BIT;
-    plic_update_interrupts(vm, &data->plic);
+    bool pending;
+
+    EMU_DEVICE_CALL(data->vrng_lock, pending = data->vrng.InterruptStatus != 0);
+    emu_update_plic_irq(data, IRQ_VRNG_BIT, pending);
 }
 #endif
 
 #if SEMU_HAS(VIRTIOINPUT)
-static void emu_update_vinput_keyboard_interrupts(vm_t *vm)
+static void UNUSED emu_update_vinput_keyboard_interrupts(vm_t *vm)
 {
     emu_state_t *data = PRIV(vm->hart[0]);
-    if (virtio_input_irq_pending(&data->vkeyboard))
-        data->plic.active |= IRQ_VINPUT_KEYBOARD_BIT;
-    else
-        data->plic.active &= ~IRQ_VINPUT_KEYBOARD_BIT;
-    plic_update_interrupts(vm, &data->plic);
+    bool pending;
+
+    EMU_DEVICE_CALL(data->vkeyboard_lock,
+                    pending = virtio_input_irq_pending(&data->vkeyboard));
+    emu_update_plic_irq(data, IRQ_VINPUT_KEYBOARD_BIT, pending);
 }
 
-static void emu_update_vinput_mouse_interrupts(vm_t *vm)
+static void UNUSED emu_update_vinput_mouse_interrupts(vm_t *vm)
 {
     emu_state_t *data = PRIV(vm->hart[0]);
-    if (virtio_input_irq_pending(&data->vmouse))
-        data->plic.active |= IRQ_VINPUT_MOUSE_BIT;
-    else
-        data->plic.active &= ~IRQ_VINPUT_MOUSE_BIT;
-    plic_update_interrupts(vm, &data->plic);
+    bool pending;
+
+    EMU_DEVICE_CALL(data->vmouse_lock,
+                    pending = virtio_input_irq_pending(&data->vmouse));
+    emu_update_plic_irq(data, IRQ_VINPUT_MOUSE_BIT, pending);
 }
 #endif
 
 #if SEMU_HAS(VIRTIOGPU)
-static void emu_update_vgpu_interrupts(vm_t *vm)
+static void UNUSED emu_update_vgpu_interrupts(vm_t *vm)
 {
     emu_state_t *data = PRIV(vm->hart[0]);
-    if (data->vgpu.InterruptStatus)
-        data->plic.active |= IRQ_VGPU_BIT;
-    else
-        data->plic.active &= ~IRQ_VGPU_BIT;
-    plic_update_interrupts(vm, &data->plic);
+    bool pending;
+
+    EMU_DEVICE_CALL(data->vgpu_lock, pending = data->vgpu.InterruptStatus != 0);
+    emu_update_plic_irq(data, IRQ_VGPU_BIT, pending);
 }
 #endif
 
@@ -191,8 +346,6 @@ static void emu_update_timer_interrupt(hart_t *hart)
 {
     emu_state_t *data = PRIV(hart);
 
-    /* Sync global timer with local timer */
-    hart->time = data->mtimer.mtime;
     aclint_mtimer_update_interrupts(hart, &data->mtimer);
 }
 
@@ -203,26 +356,26 @@ static void emu_update_swi_interrupt(hart_t *hart)
 }
 
 #if SEMU_HAS(VIRTIOSND)
-static void emu_update_vsnd_interrupts(vm_t *vm)
+static void UNUSED emu_update_vsnd_interrupts(vm_t *vm)
 {
     emu_state_t *data = PRIV(vm->hart[0]);
-    if (__atomic_load_n(&data->vsnd.InterruptStatus, __ATOMIC_ACQUIRE))
-        data->plic.active |= IRQ_VSND_BIT;
-    else
-        data->plic.active &= ~IRQ_VSND_BIT;
-    plic_update_interrupts(vm, &data->plic);
+    bool pending;
+
+    EMU_DEVICE_CALL(data->vsnd_lock,
+                    pending = __atomic_load_n(&data->vsnd.InterruptStatus,
+                                              __ATOMIC_ACQUIRE) != 0);
+    emu_update_plic_irq(data, IRQ_VSND_BIT, pending);
 }
 #endif
 
 #if SEMU_HAS(VIRTIOFS)
-static void emu_update_vfs_interrupts(vm_t *vm)
+static void UNUSED emu_update_vfs_interrupts(vm_t *vm)
 {
     emu_state_t *data = PRIV(vm->hart[0]);
-    if (data->vfs.InterruptStatus)
-        data->plic.active |= IRQ_VFS_BIT;
-    else
-        data->plic.active &= ~IRQ_VFS_BIT;
-    plic_update_interrupts(vm, &data->plic);
+    bool pending;
+
+    EMU_DEVICE_CALL(data->vfs_lock, pending = data->vfs.InterruptStatus != 0);
+    emu_update_plic_irq(data, IRQ_VFS_BIT, pending);
 }
 #endif
 
@@ -247,65 +400,73 @@ static void emu_update_vfs_interrupts(vm_t *vm)
  */
 static void io_poll_peripherals(emu_state_t *emu)
 {
-    vm_t *vm = &emu->vm;
+    bool pending;
 
-    u8250_check_ready(&emu->uart);
-    u8250_flush_out(&emu->uart);
-    if (emu->uart.in_ready)
-        emu_update_uart_interrupts(vm);
+    EMU_DEVICE_CALL(emu->uart_lock, u8250_check_ready(&emu->uart);
+                    u8250_flush_out(&emu->uart);
+                    u8250_update_interrupts(&emu->uart);
+                    pending = emu->uart.pending_ints != 0);
+    emu_update_plic_irq(emu, IRQ_UART_BIT, pending);
 
 #if SEMU_HAS(VIRTIONET)
-    virtio_net_refresh_queue(&emu->vnet);
-    if (emu->vnet.InterruptStatus)
-        emu_update_vnet_interrupts(vm);
+    EMU_DEVICE_CALL(emu->vnet_lock, virtio_net_refresh_queue(&emu->vnet);
+                    pending = emu->vnet.InterruptStatus != 0);
+    emu_update_plic_irq(emu, IRQ_VNET_BIT, pending);
 #endif
 
 #if SEMU_HAS(VIRTIOBLK)
-    if (emu->vblk.InterruptStatus)
-        emu_update_vblk_interrupts(vm);
+    EMU_DEVICE_CALL(emu->vblk_lock, pending = emu->vblk.InterruptStatus != 0);
+    emu_update_plic_irq(emu, IRQ_VBLK_BIT, pending);
 #endif
 
 #if SEMU_HAS(VIRTIORNG)
-    if (emu->vrng.InterruptStatus)
-        emu_update_vrng_interrupts(vm);
+    EMU_DEVICE_CALL(emu->vrng_lock, pending = emu->vrng.InterruptStatus != 0);
+    emu_update_plic_irq(emu, IRQ_VRNG_BIT, pending);
 #endif
 
 #if SEMU_HAS(VIRTIOSND)
-    if (__atomic_load_n(&emu->vsnd.InterruptStatus, __ATOMIC_ACQUIRE))
-        emu_update_vsnd_interrupts(vm);
+    EMU_DEVICE_CALL(emu->vsnd_lock,
+                    pending = __atomic_load_n(&emu->vsnd.InterruptStatus,
+                                              __ATOMIC_ACQUIRE) != 0);
+    emu_update_plic_irq(emu, IRQ_VSND_BIT, pending);
 #endif
 
 #if SEMU_HAS(VIRTIOFS)
-    if (emu->vfs.InterruptStatus)
-        emu_update_vfs_interrupts(vm);
+    EMU_DEVICE_CALL(emu->vfs_lock, pending = emu->vfs.InterruptStatus != 0);
+    emu_update_plic_irq(emu, IRQ_VFS_BIT, pending);
 #endif
 #if SEMU_HAS(VIRTIOINPUT)
     /* The empty path is common during CI and boot workloads, so only
      * drain the host-side queue after the window thread has published
      * pending work for the emulator thread.
      */
-    if (vinput_may_have_pending_cmds())
+    if (vinput_may_have_pending_cmds()) {
+        emu_device_lock(&emu->vkeyboard_lock);
+        emu_device_lock(&emu->vmouse_lock);
         virtio_input_drain_host_events();
+        emu_device_unlock(&emu->vmouse_lock);
+        emu_device_unlock(&emu->vkeyboard_lock);
+    }
 
-    if (virtio_input_irq_pending(&emu->vkeyboard))
-        emu_update_vinput_keyboard_interrupts(vm);
+    EMU_DEVICE_CALL(emu->vkeyboard_lock,
+                    pending = virtio_input_irq_pending(&emu->vkeyboard));
+    emu_update_plic_irq(emu, IRQ_VINPUT_KEYBOARD_BIT, pending);
 
-    if (virtio_input_irq_pending(&emu->vmouse))
-        emu_update_vinput_mouse_interrupts(vm);
+    EMU_DEVICE_CALL(emu->vmouse_lock,
+                    pending = virtio_input_irq_pending(&emu->vmouse));
+    emu_update_plic_irq(emu, IRQ_VINPUT_MOUSE_BIT, pending);
 #endif
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
     /* A closed window is treated like a frontend shutdown request. */
     if (g_window.window_is_closed())
-        emu_stopped_store(emu, true);
+        semu_set_stopped(emu, true);
 #endif
 }
 
 static inline void emu_tick_peripherals(emu_state_t *emu)
 {
-    if (emu->peripheral_update_ctr-- == 0) {
-        emu->peripheral_update_ctr = 64;
+    if (emu_peripheral_tick_due(emu))
         io_poll_peripherals(emu);
-    }
 }
 
 static void mem_load(hart_t *hart,
@@ -327,14 +488,20 @@ static void mem_load(hart_t *hart,
         case 0x2: /* PLIC (0 - 0x3F) */
             EMU_DEVICE_CALL(
                 data->plic_lock,
-                plic_read(hart, &data->plic, addr & 0x3FFFFFF, width, value));
+                plic_read(hart, &data->plic, addr & 0x3FFFFFF, width, value);
+                plic_update_interrupts(hart->vm, &data->plic));
+            semu_wake_interruptible_harts(data);
             return;
-        case 0x40: /* UART */
+        case 0x40: { /* UART */
+            bool pending;
             EMU_DEVICE_CALL(
                 data->uart_lock,
-                u8250_read(hart, &data->uart, addr & 0xFFFFF, width, value));
-            emu_update_uart_interrupts(hart->vm);
+                u8250_read(hart, &data->uart, addr & 0xFFFFF, width, value);
+                u8250_update_interrupts(&data->uart);
+                pending = data->uart.pending_ints != 0);
+            emu_update_plic_irq(data, IRQ_UART_BIT, pending);
             return;
+        }
 #if SEMU_HAS(VIRTIONET)
         case 0x41: /* virtio-net */
             EMU_DEVICE_CALL(data->vnet_lock,
@@ -432,42 +599,74 @@ static void mem_store(hart_t *hart,
                 data->plic_lock,
                 plic_write(hart, &data->plic, addr & 0x3FFFFFF, width, value);
                 plic_update_interrupts(hart->vm, &data->plic));
+            semu_wake_interruptible_harts(data);
             return;
-        case 0x40: /* UART */
+        case 0x40: { /* UART */
+            bool pending;
             EMU_DEVICE_CALL(
                 data->uart_lock,
-                u8250_write(hart, &data->uart, addr & 0xFFFFF, width, value));
-            emu_update_uart_interrupts(hart->vm);
+                u8250_write(hart, &data->uart, addr & 0xFFFFF, width, value);
+                u8250_update_interrupts(&data->uart);
+                pending = data->uart.pending_ints != 0);
+            emu_update_plic_irq(data, IRQ_UART_BIT, pending);
             return;
+        }
 #if SEMU_HAS(VIRTIONET)
-        case 0x41: /* virtio-net */
+        case 0x41: { /* virtio-net */
+            bool pending;
             EMU_DEVICE_CALL(data->vnet_lock,
                             virtio_net_write(hart, &data->vnet, addr & 0xFFFFF,
-                                             width, value));
-            emu_update_vnet_interrupts(hart->vm);
+                                             width, value);
+                            pending = data->vnet.InterruptStatus != 0);
+            emu_update_plic_irq(data, IRQ_VNET_BIT, pending);
             return;
+        }
 #endif
 #if SEMU_HAS(VIRTIOBLK)
-        case 0x42: /* virtio-blk */
+        case 0x42: { /* virtio-blk */
+            bool pending;
             EMU_DEVICE_CALL(data->vblk_lock,
                             virtio_blk_write(hart, &data->vblk, addr & 0xFFFFF,
-                                             width, value));
-            emu_update_vblk_interrupts(hart->vm);
+                                             width, value);
+                            pending = data->vblk.InterruptStatus != 0);
+            emu_update_plic_irq(data, IRQ_VBLK_BIT, pending);
             return;
+        }
 #endif
-        case 0x43: /* mtimer */
-            EMU_DEVICE_CALL(
-                data->mtimer_lock,
-                aclint_mtimer_write(hart, &data->mtimer, addr & 0xFFFFF, width,
-                                    value);
-                aclint_mtimer_update_interrupts(hart, &data->mtimer));
+        case 0x43: { /* mtimer */
+            uint32_t mtimer_addr = addr & 0xFFFFF;
+            uint32_t target_hartid = mtimer_addr >> 3;
+            bool update_all_timers =
+                mtimer_addr >= 0x7FF8 && mtimer_addr < 0x8000;
+            EMU_DEVICE_CALL(data->mtimer_lock,
+                            aclint_mtimer_write(hart, &data->mtimer,
+                                                mtimer_addr, width, value));
+            if (hart->error)
+                return;
+
+            if (update_all_timers) {
+                for (uint32_t i = 0; i < hart->vm->n_hart; i++) {
+                    emu_update_timer_interrupt(hart->vm->hart[i]);
+                    semu_wake_hart_if_interrupt_pending(data, i);
+                }
+            } else if (target_hartid < hart->vm->n_hart) {
+                emu_update_timer_interrupt(hart->vm->hart[target_hartid]);
+                semu_wake_hart_if_interrupt_pending(data, target_hartid);
+            }
             return;
+        }
         case 0x44: /* mswi */
             EMU_DEVICE_CALL(
                 data->mswi_lock,
                 aclint_mswi_write(hart, &data->mswi, addr & 0xFFFFF, width,
                                   value);
                 aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi));
+            {
+                uint32_t target_hartid = (addr & 0xFFFFF) >> 2;
+                if (target_hartid < hart->vm->n_hart)
+                    emu_update_swi_interrupt(hart->vm->hart[target_hartid]);
+                semu_wake_hart_if_interrupt_pending(data, target_hartid);
+            }
             return;
         case 0x45: /* sswi */
             EMU_DEVICE_CALL(
@@ -475,55 +674,81 @@ static void mem_store(hart_t *hart,
                 aclint_sswi_write(hart, &data->sswi, addr & 0xFFFFF, width,
                                   value);
                 aclint_swi_update_interrupts(hart, &data->mswi, &data->sswi));
+            {
+                uint32_t target_hartid = (addr & 0xFFFFF) >> 2;
+                if (target_hartid < hart->vm->n_hart)
+                    emu_update_swi_interrupt(hart->vm->hart[target_hartid]);
+                semu_wake_hart_if_interrupt_pending(data, target_hartid);
+            }
             return;
 
 #if SEMU_HAS(VIRTIORNG)
-        case 0x46: /* virtio-rng */
+        case 0x46: { /* virtio-rng */
+            bool pending;
             EMU_DEVICE_CALL(data->vrng_lock,
                             virtio_rng_write(hart, &data->vrng, addr & 0xFFFFF,
-                                             width, value));
-            emu_update_vrng_interrupts(hart->vm);
+                                             width, value);
+                            pending = data->vrng.InterruptStatus != 0);
+            emu_update_plic_irq(data, IRQ_VRNG_BIT, pending);
             return;
+        }
 #endif
 
 #if SEMU_HAS(VIRTIOSND)
-        case 0x47: /* virtio-snd */
-            EMU_DEVICE_CALL(data->vsnd_lock,
-                            virtio_snd_write(hart, &data->vsnd, addr & 0xFFFFF,
-                                             width, value));
-            emu_update_vsnd_interrupts(hart->vm);
+        case 0x47: { /* virtio-snd */
+            bool pending;
+            EMU_DEVICE_CALL(
+                data->vsnd_lock, virtio_snd_write(hart, &data->vsnd,
+                                                  addr & 0xFFFFF, width, value);
+                pending = __atomic_load_n(&data->vsnd.InterruptStatus,
+                                          __ATOMIC_ACQUIRE) != 0);
+            emu_update_plic_irq(data, IRQ_VSND_BIT, pending);
             return;
+        }
 #endif
 
 #if SEMU_HAS(VIRTIOFS)
-        case 0x48: /* virtio-fs */
-            EMU_DEVICE_CALL(data->vfs_lock,
-                            virtio_fs_write(hart, &data->vfs, addr & 0xFFFFF,
-                                            width, value));
-            emu_update_vfs_interrupts(hart->vm);
+        case 0x48: { /* virtio-fs */
+            bool pending;
+            EMU_DEVICE_CALL(
+                data->vfs_lock,
+                virtio_fs_write(hart, &data->vfs, addr & 0xFFFFF, width, value);
+                pending = data->vfs.InterruptStatus != 0);
+            emu_update_plic_irq(data, IRQ_VFS_BIT, pending);
             return;
+        }
 #endif
 #if SEMU_HAS(VIRTIOINPUT)
-        case 0x49: /* virtio-input keyboard */
-            EMU_DEVICE_CALL(data->vkeyboard_lock,
-                            virtio_input_write(hart, &data->vkeyboard,
-                                               addr & 0xFFFFF, width, value));
-            emu_update_vinput_keyboard_interrupts(hart->vm);
+        case 0x49: { /* virtio-input keyboard */
+            bool pending;
+            EMU_DEVICE_CALL(
+                data->vkeyboard_lock,
+                virtio_input_write(hart, &data->vkeyboard, addr & 0xFFFFF,
+                                   width, value);
+                pending = virtio_input_irq_pending(&data->vkeyboard));
+            emu_update_plic_irq(data, IRQ_VINPUT_KEYBOARD_BIT, pending);
             return;
-        case 0x4A: /* virtio-input mouse */
+        }
+        case 0x4A: { /* virtio-input mouse */
+            bool pending;
             EMU_DEVICE_CALL(data->vmouse_lock,
                             virtio_input_write(hart, &data->vmouse,
-                                               addr & 0xFFFFF, width, value));
-            emu_update_vinput_mouse_interrupts(hart->vm);
+                                               addr & 0xFFFFF, width, value);
+                            pending = virtio_input_irq_pending(&data->vmouse));
+            emu_update_plic_irq(data, IRQ_VINPUT_MOUSE_BIT, pending);
             return;
+        }
 #endif
 #if SEMU_HAS(VIRTIOGPU)
-        case 0x4B: /* virtio-gpu */
+        case 0x4B: { /* virtio-gpu */
+            bool pending;
             EMU_DEVICE_CALL(data->vgpu_lock,
                             virtio_gpu_write(hart, &data->vgpu, addr & 0xFFFFF,
-                                             width, value));
-            emu_update_vgpu_interrupts(hart->vm);
+                                             width, value);
+                            pending = data->vgpu.InterruptStatus != 0);
+            emu_update_plic_irq(data, IRQ_VGPU_BIT, pending);
             return;
+        }
 #endif
         }
     }
@@ -549,6 +774,8 @@ static inline sbi_ret_t handle_sbi_ecall_TIMER(hart_t *hart, int32_t fid)
                              (uint64_t) (hart->x_regs[RV_R_A0]),
                          __ATOMIC_RELAXED);
         hart_sip_clear_bits(hart, RV_INT_STI_BIT);
+        emu_update_timer_interrupt(hart);
+        semu_wake_hart_if_interrupt_pending(data, hart->mhartid);
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     default:
         return (sbi_ret_t) {SBI_ERR_NOT_SUPPORTED, 0};
@@ -562,7 +789,7 @@ static inline sbi_ret_t handle_sbi_ecall_RST(hart_t *hart, int32_t fid)
     case SBI_RST__SYSTEM_RESET:
         fprintf(stderr, "system reset: type=%u, reason=%u\n",
                 hart->x_regs[RV_R_A0], hart->x_regs[RV_R_A1]);
-        emu_stopped_store(data, true);
+        semu_set_stopped(data, true);
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     default:
         return (sbi_ret_t) {SBI_ERR_NOT_SUPPORTED, 0};
@@ -572,24 +799,36 @@ static inline sbi_ret_t handle_sbi_ecall_RST(hart_t *hart, int32_t fid)
 static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
 {
     uint32_t hartid, start_addr, opaque, suspend_type, resume_addr;
+    emu_state_t *emu = PRIV(hart);
     vm_t *vm = hart->vm;
     switch (fid) {
-    case SBI_HSM__HART_START:
+    case SBI_HSM__HART_START: {
         hartid = hart->x_regs[RV_R_A0];
         if (hartid >= vm->n_hart)
             return (sbi_ret_t) {SBI_ERR_INVALID_PARAM, 0};
+
+        hart_t *target = vm->hart[hartid];
+        int32_t expected = SBI_HSM_STATE_STOPPED;
+        if (!hart_hsm_status_compare_exchange(target, &expected,
+                                              SBI_HSM_STATE_START_PENDING))
+            return (sbi_ret_t) {SBI_ERR_ALREADY_AVAILABLE, 0};
+
         start_addr = hart->x_regs[RV_R_A1];
         opaque = hart->x_regs[RV_R_A2];
-        vm->hart[hartid]->satp = 0;
-        vm->hart[hartid]->sstatus_sie = 0;
-        vm->hart[hartid]->x_regs[RV_R_A0] = hartid;
-        vm->hart[hartid]->x_regs[RV_R_A1] = opaque;
-        vm->hart[hartid]->pc = start_addr;
-        vm->hart[hartid]->s_mode = true;
-        hart_hsm_status_store(vm->hart[hartid], SBI_HSM_STATE_STARTED);
+        target->satp = 0;
+        target->sstatus_sie = false;
+        target->x_regs[RV_R_A0] = hartid;
+        target->x_regs[RV_R_A1] = opaque;
+        target->pc = start_addr;
+        target->s_mode = true;
+        mmu_invalidate(target);
+        hart_hsm_status_store(target, SBI_HSM_STATE_STARTED);
+        semu_signal_hart(emu, hartid);
         return (sbi_ret_t) {SBI_SUCCESS, 0};
+    }
     case SBI_HSM__HART_STOP:
         hart_hsm_status_store(hart, SBI_HSM_STATE_STOPPED);
+        hart->error = ERR_USER;
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     case SBI_HSM__HART_GET_STATUS:
         hartid = hart->x_regs[RV_R_A0];
@@ -601,7 +840,6 @@ static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
         suspend_type = hart->x_regs[RV_R_A0];
         resume_addr = hart->x_regs[RV_R_A1];
         opaque = hart->x_regs[RV_R_A2];
-        hart_hsm_status_store(hart, SBI_HSM_STATE_SUSPENDED);
         if (suspend_type == 0x00000000) {
             hart->hsm_resume_is_ret = true;
             hart->hsm_resume_pc = hart->pc;
@@ -609,7 +847,11 @@ static inline sbi_ret_t handle_sbi_ecall_HSM(hart_t *hart, int32_t fid)
             hart->hsm_resume_is_ret = false;
             hart->hsm_resume_pc = resume_addr;
             hart->hsm_resume_opaque = opaque;
+        } else {
+            return (sbi_ret_t) {SBI_ERR_INVALID_PARAM, 0};
         }
+        hart_hsm_status_store(hart, SBI_HSM_STATE_SUSPENDED);
+        hart->error = ERR_USER;
         return (sbi_ret_t) {SBI_SUCCESS, 0};
     default:
         return (sbi_ret_t) {SBI_ERR_NOT_SUPPORTED, 0};
@@ -626,13 +868,19 @@ static inline sbi_ret_t handle_sbi_ecall_IPI(hart_t *hart, int32_t fid)
         hart_mask = hart->x_regs[RV_R_A0];
         hart_mask_base = hart->x_regs[RV_R_A1];
         if (hart_mask_base == UINT32_MAX) {
-            for (uint32_t i = 0; i < hart->vm->n_hart; i++)
+            for (uint32_t i = 0; i < hart->vm->n_hart; i++) {
                 __atomic_store_n(&data->sswi.ssip[i], 1, __ATOMIC_RELAXED);
+                emu_update_swi_interrupt(data->vm.hart[i]);
+                semu_wake_hart_if_interrupt_pending(data, i);
+            }
         } else {
             for (uint32_t i = hart_mask_base; hart_mask && i < hart->vm->n_hart;
                  hart_mask >>= 1, i++) {
-                if (hart_mask & 1)
+                if (hart_mask & 1) {
                     __atomic_store_n(&data->sswi.ssip[i], 1, __ATOMIC_RELAXED);
+                    emu_update_swi_interrupt(data->vm.hart[i]);
+                    semu_wake_hart_if_interrupt_pending(data, i);
+                }
             }
         }
 
@@ -755,6 +1003,9 @@ static void handle_sbi_ecall(hart_t *hart)
     }
     hart->x_regs[RV_R_A0] = (uint32_t) ret.error;
     hart->x_regs[RV_R_A1] = (uint32_t) ret.value;
+
+    if (hart->error == ERR_USER)
+        return;
 
     /* Clear error to allow execution to continue */
     hart->error = ERR_NONE;
@@ -997,7 +1248,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     int hart_count = 1;
     bool debug = false;
     bool headless = false;
-#if SEMU_HAS(VIRTIONET)
+#if SEMU_HAS(VIRTIONET) && !SEMU_HAS(THREADED)
     bool netdev_ready = false;
 #endif
     vm_t *vm = &emu->vm;
@@ -1114,6 +1365,21 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
                 vm->n_hart);
         return 1;
     }
+#if SEMU_HAS(THREADED)
+    emu->hart_wait = calloc(vm->n_hart, sizeof(*emu->hart_wait));
+    emu->hart_threads = calloc(vm->n_hart, sizeof(*emu->hart_threads));
+    if (!emu->hart_wait || !emu->hart_threads) {
+        fprintf(stderr, "Failed to allocate threaded hart state.\n");
+        return 1;
+    }
+    for (uint32_t i = 0; i < vm->n_hart; i++) {
+        if (emu_mutex_init(&emu->hart_wait[i].mutex) ||
+            pthread_cond_init(&emu->hart_wait[i].cond, NULL)) {
+            perror("threaded hart wait init");
+            return 1;
+        }
+    }
+#endif
     for (uint32_t i = 0; i < vm->n_hart; i++) {
         hart_t *newhart = calloc(1, sizeof(hart_t));
         if (!newhart) {
@@ -1131,7 +1397,11 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
         }
 
         newhart->vm = vm;
+#if SEMU_HAS(THREADED)
+        newhart->wfi = wfi_handler_threaded;
+#else
         newhart->wfi = wfi_handler; /* Set WFI callback for coroutine support */
+#endif
         vm->hart[i] = newhart;
     }
 
@@ -1150,7 +1420,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             fprintf(stderr, "Failed to initialize virtio-net device.\n");
             return 1;
         }
+#if !SEMU_HAS(THREADED)
         netdev_ready = true;
+#endif
     }
 #endif
 #if SEMU_HAS(VIRTIOBLK)
@@ -1226,9 +1498,10 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     }
 #endif
 
-    emu->peripheral_update_ctr = 0;
+    emu_peripheral_update_ctr_store(emu, 0);
     emu->debug = debug;
 
+#if !SEMU_HAS(THREADED)
     /* Initialize coroutine system for multi-hart mode (SMP > 1) */
     if (vm->n_hart > 1) {
         uint32_t total_slots = vm->n_hart;
@@ -1267,10 +1540,12 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             }
         }
     }
+#endif
 
     return 0;
 }
 
+#if !SEMU_HAS(THREADED)
 /* WFI callback for coroutine-based scheduling in SMP mode
  *
  * This handler implements the RISC-V WFI (Wait For Interrupt) instruction
@@ -1292,7 +1567,7 @@ static void wfi_handler(hart_t *hart)
     /* Per RISC-V spec: WFI returns immediately if interrupt is pending.
      * We check if any interrupt is actually pending (sip & sie != 0).
      */
-    bool interrupt_pending = (hart_sip_load(hart) & hart->sie) != 0;
+    bool interrupt_pending = (hart_sip_load(hart) & hart_sie_load(hart)) != 0;
 
     if (!interrupt_pending) {
         emu_state_t *emu = PRIV(hart);
@@ -1314,7 +1589,152 @@ static void wfi_handler(hart_t *hart)
         hart_in_wfi_store(hart, false); /* Clear if interrupt already pending */
     }
 }
+#endif
 
+#if SEMU_HAS(THREADED)
+static void wfi_handler_threaded(hart_t *hart)
+{
+    emu_state_t *emu = PRIV(hart);
+    uint32_t id = hart->mhartid;
+
+    emu_update_timer_interrupt(hart);
+    emu_update_swi_interrupt(hart);
+    if (hart_sip_load(hart) & hart_sie_load(hart))
+        return;
+
+    pthread_mutex_lock(&emu->hart_wait[id].mutex);
+    hart_in_wfi_store(hart, true);
+    while (!emu_stopped_load(emu) &&
+           hart_hsm_status_load(hart) == SBI_HSM_STATE_STARTED) {
+        emu_update_timer_interrupt(hart);
+        emu_update_swi_interrupt(hart);
+        if (hart_sip_load(hart) & hart_sie_load(hart))
+            break;
+
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 1000000;
+        if (deadline.tv_nsec >= 1000000000) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000;
+        }
+        pthread_cond_timedwait(&emu->hart_wait[id].cond,
+                               &emu->hart_wait[id].mutex, &deadline);
+    }
+    hart_in_wfi_store(hart, false);
+    pthread_mutex_unlock(&emu->hart_wait[id].mutex);
+}
+
+static void handle_hsm_resume(hart_t *hart)
+{
+    if (hart->hsm_resume_is_ret)
+        return;
+
+    hart->satp = 0;
+    hart->sstatus_sie = false;
+    hart->s_mode = true;
+    hart->x_regs[RV_R_A0] = hart->mhartid;
+    hart->x_regs[RV_R_A1] = hart->hsm_resume_opaque;
+    hart->pc = hart->hsm_resume_pc;
+    mmu_invalidate(hart);
+}
+
+static void wait_for_hart_start(emu_state_t *emu,
+                                hart_t *hart,
+                                int32_t initial_state)
+{
+#if SEMU_HAS(THREADED)
+    uint32_t id = hart->mhartid;
+    bool was_suspended = initial_state == SBI_HSM_STATE_SUSPENDED;
+
+    pthread_mutex_lock(&emu->hart_wait[id].mutex);
+    while (!emu_stopped_load(emu) &&
+           hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED) {
+        int32_t state = hart_hsm_status_load(hart);
+        was_suspended |= state == SBI_HSM_STATE_SUSPENDED;
+        pthread_cond_wait(&emu->hart_wait[id].cond, &emu->hart_wait[id].mutex);
+    }
+    pthread_mutex_unlock(&emu->hart_wait[id].mutex);
+
+    if (!emu_stopped_load(emu) && was_suspended)
+        handle_hsm_resume(hart);
+#else
+    (void) emu;
+    (void) hart;
+#endif
+}
+
+static void *hart_thread_func(void *arg)
+{
+    hart_t *hart = (hart_t *) arg;
+    emu_state_t *emu = PRIV(hart);
+
+    while (!emu_stopped_load(emu)) {
+        if (signal_received) {
+            semu_set_stopped(emu, true);
+            break;
+        }
+
+        int32_t state = hart_hsm_status_load(hart);
+        if (state != SBI_HSM_STATE_STARTED) {
+            wait_for_hart_start(emu, hart, state);
+            continue;
+        }
+
+        for (int i = 0; i < SEMU_SMP_BATCH_STEPS && !emu_stopped_load(emu);
+             i += SEMU_SMP_SLICE_STEPS) {
+            if (hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED)
+                break;
+
+            emu_tick_peripherals(emu);
+            emu_update_timer_interrupt(hart);
+            emu_update_swi_interrupt(hart);
+            if (unlikely(semu_step_chunk(emu, hart, SEMU_SMP_SLICE_STEPS))) {
+                emu_threaded_fatal_store(emu, true);
+                semu_set_stopped(emu, true);
+                break;
+            }
+            if (hart->error == ERR_USER) {
+                hart->error = ERR_NONE;
+                break;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static void io_poll_peripherals_threaded(emu_state_t *emu)
+{
+    io_poll_peripherals(emu);
+    semu_wake_interruptible_harts(emu);
+}
+
+static void *io_thread_func(void *arg)
+{
+    emu_state_t *emu = (emu_state_t *) arg;
+
+    while (!emu_stopped_load(emu)) {
+        if (signal_received) {
+            semu_set_stopped(emu, true);
+            break;
+        }
+
+        io_poll_peripherals_threaded(emu);
+        for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
+            emu_update_timer_interrupt(emu->vm.hart[i]);
+            emu_update_swi_interrupt(emu->vm.hart[i]);
+            semu_wake_hart_if_interrupt_pending(emu, i);
+        }
+        poll(NULL, 0, 1);
+    }
+
+    semu_signal_all_harts(emu);
+    return NULL;
+}
+#endif
+
+#if !SEMU_HAS(THREADED)
 /* Hart execution loop - each hart runs in its own coroutine
  *
  * This is the main entry point for each RISC-V hart when running in SMP mode.
@@ -1360,7 +1780,7 @@ static void hart_exec_loop(void *arg)
             emu_update_timer_interrupt(hart);
             emu_update_swi_interrupt(hart);
             if (unlikely(semu_step_chunk(emu, hart, SEMU_SMP_SLICE_STEPS))) {
-                emu_stopped_store(emu, true);
+                semu_set_stopped(emu, true);
                 goto cleanup;
             }
         }
@@ -1371,6 +1791,7 @@ static void hart_exec_loop(void *arg)
 cleanup:
     return;
 }
+#endif
 
 static int semu_step(emu_state_t *emu)
 {
@@ -1415,9 +1836,18 @@ static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps)
 
         if (hart->error == ERR_EXCEPTION && hart->exc_cause == RV_EXC_ECALL_S) {
             handle_sbi_ecall(hart);
+            if (hart->error == ERR_USER) {
+                hart->error = ERR_NONE;
+                return 0;
+            }
             if (unlikely(emu_stopped_load(emu)))
                 return 0;
             continue;
+        }
+
+        if (hart->error == ERR_USER) {
+            hart->error = ERR_NONE;
+            return 0;
         }
 
         if (hart->error == ERR_EXCEPTION) {
@@ -1444,7 +1874,6 @@ static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps)
  * guarantees the loop notices `signal_received` and exits, which in
  * turn unblocks the window main loop via window_shutdown().
  */
-static volatile sig_atomic_t signal_received = 0;
 static volatile sig_atomic_t signal_wake_fd = -1;
 static void signal_handler(int sig UNUSED)
 {
@@ -1559,8 +1988,56 @@ static void print_mmu_cache_stats(vm_t *vm)
 }
 #endif
 
+
+#if SEMU_HAS(THREADED)
+static void semu_run_threaded(emu_state_t *emu)
+{
+    vm_t *vm = &emu->vm;
+    uint32_t created_harts = 0;
+
+    if (pthread_create(&emu->io_thread, NULL, io_thread_func, emu) != 0) {
+        fprintf(stderr, "Failed to create I/O thread\n");
+        emu_threaded_fatal_store(emu, true);
+        emu->exit_code = 1;
+        return;
+    }
+    emu->io_thread_created = true;
+
+    for (uint32_t i = 0; i < vm->n_hart; i++) {
+        if (pthread_create(&emu->hart_threads[i], NULL, hart_thread_func,
+                           vm->hart[i]) != 0) {
+            fprintf(stderr, "Failed to create hart thread %u\n", i);
+            emu_threaded_fatal_store(emu, true);
+            semu_set_stopped(emu, true);
+            break;
+        }
+        created_harts++;
+    }
+
+    while (!emu_stopped_load(emu)) {
+        if (signal_received) {
+            semu_set_stopped(emu, true);
+            break;
+        }
+        poll(NULL, 0, 10);
+    }
+
+    semu_set_stopped(emu, true);
+    for (uint32_t i = 0; i < created_harts; i++)
+        pthread_join(emu->hart_threads[i], NULL);
+    if (emu->io_thread_created)
+        pthread_join(emu->io_thread, NULL);
+
+    emu->exit_code = emu_threaded_fatal_load(emu) ? 1 : 0;
+}
+#endif
+
 static void semu_run(emu_state_t *emu)
 {
+#if SEMU_HAS(THREADED)
+    semu_run_threaded(emu);
+    return;
+#endif
     int ret;
     vm_t *vm = &emu->vm;
 
@@ -1713,7 +2190,7 @@ static void semu_run(emu_state_t *emu)
             const uint64_t BOOT_SETTLE_ITERATIONS = 5000;
             bool boot_complete =
                 all_harts_started &&
-                (emu->peripheral_update_ctr > BOOT_SETTLE_ITERATIONS);
+                (emu_peripheral_update_ctr_load(emu) > BOOT_SETTLE_ITERATIONS);
             bool harts_active =
                 (vm->n_hart == 1) || !boot_complete || (idle_harts == 0);
 #ifdef __APPLE__

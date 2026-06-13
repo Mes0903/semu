@@ -1133,12 +1133,16 @@ static inline void set_dest_idx(hart_t *vm, uint8_t rd, uint32_t x)
 static void csr_read(hart_t *vm, uint16_t addr, uint32_t *value)
 {
     switch (addr) {
-    case RV_CSR_TIME:
-        *value = semu_timer_get(&vm->time);
+    case RV_CSR_TIME: {
+        emu_state_t *data = (emu_state_t *) vm->priv;
+        *value = semu_timer_get(&data->mtimer.mtime);
         return;
-    case RV_CSR_TIMEH:
-        *value = semu_timer_get(&vm->time) >> 32;
+    }
+    case RV_CSR_TIMEH: {
+        emu_state_t *data = (emu_state_t *) vm->priv;
+        *value = semu_timer_get(&data->mtimer.mtime) >> 32;
         return;
+    }
     case RV_CSR_INSTRET:
         *value = vm->instret;
         return;
@@ -1164,7 +1168,7 @@ static void csr_read(hart_t *vm, uint16_t addr, uint32_t *value)
         vm->sstatus_mxr && (*value |= 1 << (19));
         break;
     case RV_CSR_SIE:
-        *value = vm->sie;
+        *value = hart_sie_load(vm);
         break;
     case RV_CSR_SIP:
         *value = hart_sip_load(vm);
@@ -1220,7 +1224,7 @@ static void csr_write(hart_t *vm, uint16_t addr, uint32_t value)
     }
     case RV_CSR_SIE:
         value &= SIE_MASK;
-        vm->sie = value;
+        hart_sie_store(vm, value);
         break;
     case RV_CSR_SIP:
         hart_sip_replace_bits(vm, SIP_MASK, value);
@@ -1517,8 +1521,9 @@ static inline void vm_handle_pending_interrupt(hart_t *vm)
 {
     uint32_t sip = hart_sip_load(vm);
 
-    if ((vm->sstatus_sie || !vm->s_mode) && (sip & vm->sie)) {
-        uint32_t applicable = sip & vm->sie;
+    uint32_t sie = hart_sie_load(vm);
+    if ((vm->sstatus_sie || !vm->s_mode) && (sip & sie)) {
+        uint32_t applicable = sip & sie;
         uint8_t idx = ilog2(applicable);
         if (idx == 1) {
             emu_state_t *data = PRIV(vm);

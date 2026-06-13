@@ -144,7 +144,7 @@ struct __hart_internal {
     /* Warm path: interrupt check fields */
     bool sstatus_sie;
     bool s_mode;
-    uint32_t sie;
+    _Atomic uint32_t sie;
     _Atomic uint32_t sip;
 
     semu_timer_t time;
@@ -207,6 +207,16 @@ static inline uint32_t hart_sip_load(const hart_t *hart)
     return __atomic_load_n(&hart->sip, __ATOMIC_RELAXED);
 }
 
+static inline uint32_t hart_sie_load(const hart_t *hart)
+{
+    return __atomic_load_n(&hart->sie, __ATOMIC_RELAXED);
+}
+
+static inline void hart_sie_store(hart_t *hart, uint32_t value)
+{
+    __atomic_store_n(&hart->sie, value, __ATOMIC_RELAXED);
+}
+
 static inline void hart_sip_set_bits(hart_t *hart, uint32_t bits)
 {
     __atomic_fetch_or(&hart->sip, bits, __ATOMIC_RELAXED);
@@ -242,12 +252,21 @@ static inline void hart_in_wfi_store(hart_t *hart, bool value)
 
 static inline int32_t hart_hsm_status_load(const hart_t *hart)
 {
-    return __atomic_load_n(&hart->hsm_status, __ATOMIC_RELAXED);
+    return __atomic_load_n(&hart->hsm_status, __ATOMIC_ACQUIRE);
 }
 
 static inline void hart_hsm_status_store(hart_t *hart, int32_t value)
 {
-    __atomic_store_n(&hart->hsm_status, value, __ATOMIC_RELAXED);
+    __atomic_store_n(&hart->hsm_status, value, __ATOMIC_RELEASE);
+}
+
+static inline bool hart_hsm_status_compare_exchange(hart_t *hart,
+                                                    int32_t *expected,
+                                                    int32_t desired)
+{
+    return __atomic_compare_exchange_n(&hart->hsm_status, expected, desired,
+                                       false, __ATOMIC_ACQ_REL,
+                                       __ATOMIC_ACQUIRE);
 }
 
 

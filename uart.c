@@ -123,6 +123,10 @@ static void u8250_handle_out(u8250_state_t *uart, uint8_t value)
  */
 static void u8250_wait_for_input(u8250_state_t *uart)
 {
+#if SEMU_HAS(THREADED)
+    (void) uart;
+    return;
+#else
     /* Only yield in SMP mode - single-core mode doesn't use coroutines */
     uint32_t hart_id = coro_current_hart_id();
     if (hart_id == UINT32_MAX)
@@ -140,6 +144,7 @@ static void u8250_wait_for_input(u8250_state_t *uart)
     /* Resumed - clear waiting state */
     uart->has_waiting_hart = false;
     uart->waiting_hart_id = UINT32_MAX;
+#endif
 }
 
 static uint8_t u8250_handle_in(u8250_state_t *uart)

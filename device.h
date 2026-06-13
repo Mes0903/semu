@@ -556,6 +556,11 @@ bool virtio_fs_init(virtio_fs_state_t *vfs, char *mtag, char *dir);
 
 /* memory mapping */
 typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+} hart_wait_t;
+
+typedef struct {
     int exit_code;
     bool debug;
     _Atomic bool stopped;
@@ -619,7 +624,13 @@ typedef struct {
     sswi_state_t sswi;
     pthread_mutex_t sswi_lock;
 
-    uint32_t peripheral_update_ctr;
+    pthread_t *hart_threads;
+    pthread_t io_thread;
+    bool io_thread_created;
+    _Atomic bool threaded_fatal;
+    hart_wait_t *hart_wait;
+
+    _Atomic uint32_t peripheral_update_ctr;
 
     /* The fields used for debug mode */
     bool is_interrupted;

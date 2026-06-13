@@ -125,8 +125,9 @@ static uint64_t semu_timer_clocksource(semu_timer_t *timer)
                                      ? call_driven_ticks
                                      : real_elapsed_ticks;
 
-        return timer->begin +
-               atomic_fetch_max_u64(&boot_elapsed_ticks, elapsed_ticks);
+        uint64_t begin =
+            atomic_load_explicit(&timer->begin, memory_order_acquire);
+        return begin + atomic_fetch_max_u64(&boot_elapsed_ticks, elapsed_ticks);
     }
 
     uint64_t real_ticks = mult_frac(now_ns, timer->freq, 1e9);
@@ -135,8 +136,10 @@ static uint64_t semu_timer_clocksource(semu_timer_t *timer)
         pthread_mutex_lock(&timer_state_lock);
         if (!atomic_load_explicit(&timer_switched_to_real_time,
                                   memory_order_relaxed)) {
+            uint64_t begin =
+                atomic_load_explicit(&timer->begin, memory_order_acquire);
             uint64_t boot_ticks =
-                timer->begin +
+                begin +
                 atomic_load_explicit(&boot_elapsed_ticks, memory_order_relaxed);
             int64_t offset = (int64_t) (real_ticks - boot_ticks);
             atomic_store_explicit(&timer_offset, offset, memory_order_release);
@@ -195,7 +198,9 @@ void semu_timer_init(semu_timer_t *timer, uint64_t freq, int n_harts)
 
     timer->freq = freq;
     boot_real_start_ns = host_time_ns();
-    timer->begin = mult_frac(boot_real_start_ns, timer->freq, 1e9);
+    atomic_store_explicit(&timer->begin,
+                          mult_frac(boot_real_start_ns, timer->freq, 1e9),
+                          memory_order_release);
     atomic_store_explicit(&boot_elapsed_fp, 0, memory_order_release);
     atomic_store_explicit(&boot_elapsed_ticks, 0, memory_order_release);
     atomic_store_explicit(&timer_call_count, 0, memory_order_release);
@@ -230,10 +235,12 @@ void semu_timer_init(semu_timer_t *timer, uint64_t freq, int n_harts)
 
 uint64_t semu_timer_get(semu_timer_t *timer)
 {
-    return semu_timer_clocksource(timer) - timer->begin;
+    uint64_t begin = atomic_load_explicit(&timer->begin, memory_order_acquire);
+    return semu_timer_clocksource(timer) - begin;
 }
 
 void semu_timer_rebase(semu_timer_t *timer, uint64_t time)
 {
-    timer->begin = semu_timer_clocksource(timer) - time;
+    atomic_store_explicit(&timer->begin, semu_timer_clocksource(timer) - time,
+                          memory_order_release);
 }

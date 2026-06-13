@@ -32,6 +32,11 @@
 #define SEMU_FEATURE_EXTERNAL_ROOT 0
 #endif
 
+/* true per-hart pthread runtime. Default off; coroutine path is reference. */
+#ifndef SEMU_FEATURE_THREADED
+#define SEMU_FEATURE_THREADED 0
+#endif
+
 /* virtio-gpu */
 #ifndef SEMU_FEATURE_VIRTIOGPU
 #define SEMU_FEATURE_VIRTIOGPU 1

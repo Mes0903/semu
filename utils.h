@@ -27,7 +27,7 @@ static inline void semu_boot_complete_store(bool value)
 
 /* TIMER */
 typedef struct {
-    uint64_t begin;
+    _Atomic uint64_t begin;
     uint64_t freq;
 } semu_timer_t;
 
