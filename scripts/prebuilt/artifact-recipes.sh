@@ -410,6 +410,11 @@ do_directfb() {
 
 # Build optional runtime payloads and collect them under extra_packages/. That
 # directory is later overlaid into test-tools.img, not the default rootfs.
+stage_test_tools_local_env() {
+    ASSERT mkdir -p extra_packages/root
+    ASSERT cp target/local-env.sh extra_packages/root/
+}
+
 do_extra_packages() {
     local buildroot_output=$1
 
@@ -428,7 +433,7 @@ do_extra_packages() {
     fi
 
     ASSERT cp -r directfb/. extra_packages/
-    ASSERT cp target/local-env.sh extra_packages/root/
+    stage_test_tools_local_env
 }
 
 # The x11 test-tools variant needs libstdc++ at runtime, but the default
@@ -451,6 +456,13 @@ stage_cxx_runtime() {
     ASSERT mkdir -p extra_packages/lib
     ASSERT cp -a "$toolchain_lib/libstdc++.so" "$libstdcpp" \
         "$libstdcpp_real" extra_packages/lib/
+}
+
+stage_x11_test_tools_overlay() {
+    stage_cxx_runtime "$1"
+    stage_test_tools_local_env
+    ASSERT mkdir -p extra_packages/etc
+    ASSERT touch extra_packages/etc/semu-test-tools-virgl
 }
 
 # Translate the normalized test-tools recipe into build decisions. x11 selects
@@ -487,13 +499,13 @@ do_test_tools_unlocked() {
     if [[ $BUILD_DIRECTFB_TEST -eq 1 ]]; then
         do_extra_packages "$buildroot_output"
         if [[ $BUILD_X11 -eq 1 ]]; then
-            stage_cxx_runtime "$buildroot_output"
+            stage_x11_test_tools_overlay "$buildroot_output"
         fi
         ASSERT ./scripts/rootfs_ext4.sh "$test_tools_rootfs" ./test-tools.img \
             "$TEST_TOOLS_SIZE_MB" ./extra_packages
     elif [[ $BUILD_X11 -eq 1 ]]; then
         ASSERT rm -rf extra_packages
-        stage_cxx_runtime "$buildroot_output"
+        stage_x11_test_tools_overlay "$buildroot_output"
         ASSERT ./scripts/rootfs_ext4.sh "$test_tools_rootfs" ./test-tools.img \
             "$TEST_TOOLS_SIZE_MB" ./extra_packages
     else
