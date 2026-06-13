@@ -19,6 +19,63 @@ static const struct executor_mode_entry executor_modes[] = {
      SEMU_EXECUTOR_THREADED_CPU_WITH_DEVICE_ACTORS},
 };
 
+static const struct semu_executor_virtio_host_io_policy
+    virtio_host_io_policies[] = {
+        {
+            .device_name = "virtio-gpu",
+            .build_enabled = SEMU_HAS(VIRTIOGPU),
+            .actor_mode_allowed = true,
+            .actor_mode_policy = "first actor client; QueueNotify must wake "
+                                 "actor, not parse on vCPU",
+        },
+        {
+            .device_name = "virtio-input",
+            .build_enabled = SEMU_HAS(VIRTIOINPUT),
+            .actor_mode_allowed = false,
+            .actor_mode_policy =
+                "keep SDL producer/SPSC queue; move guest virtqueues to common "
+                "transport before actor support",
+        },
+        {
+            .device_name = "virtio-rng",
+            .build_enabled = SEMU_HAS(VIRTIORNG),
+            .actor_mode_allowed = false,
+            .actor_mode_policy = "actor required before target threaded mode; "
+                                 "do not block vCPU on /dev/random",
+        },
+        {
+            .device_name = "virtio-blk",
+            .build_enabled = SEMU_HAS(VIRTIOBLK),
+            .actor_mode_allowed = false,
+            .actor_mode_policy =
+                "actor or actor+worker pool required; flush/drain runs outside "
+                "lifecycle/transport locks",
+        },
+        {
+            .device_name = "virtio-fs",
+            .build_enabled = SEMU_HAS(VIRTIOFS),
+            .actor_mode_allowed = false,
+            .actor_mode_policy =
+                "actor or actor+worker pool required; host filesystem calls "
+                "need cancellation or generation bounds",
+        },
+        {
+            .device_name = "virtio-net",
+            .build_enabled = SEMU_HAS(VIRTIONET),
+            .actor_mode_allowed = false,
+            .actor_mode_policy = "host fd/slirp/vmnet events need device event "
+                                 "loop or actor wake path; no tick polling",
+        },
+        {
+            .device_name = "virtio-snd",
+            .build_enabled = SEMU_HAS(VIRTIOSND),
+            .actor_mode_allowed = false,
+            .actor_mode_policy =
+                "actor owns virtqueues; callback owns timing; reset releases, "
+                "broadcasts, closes, then frees buffers",
+        },
+};
+
 int semu_executor_mode_parse(const char *name, enum semu_executor_mode *mode)
 {
     if (!name || !mode)
@@ -63,68 +120,76 @@ enum hart_executor_backend semu_executor_backend_for_mode(
     }
 }
 
+size_t semu_executor_virtio_host_io_policy_count(void)
+{
+    return ARRAY_SIZE(virtio_host_io_policies);
+}
+
+const struct semu_executor_virtio_host_io_policy *
+semu_executor_virtio_host_io_policy_at(size_t index)
+{
+    if (index >= ARRAY_SIZE(virtio_host_io_policies))
+        return NULL;
+    return &virtio_host_io_policies[index];
+}
+
+static void append_unsupported_device(char *buffer,
+                                      size_t buffer_size,
+                                      const char *device_name)
+{
+    size_t len;
+
+    if (buffer_size == 0)
+        return;
+
+    len = strlen(buffer);
+    if (len >= buffer_size - 1)
+        return;
+
+    if (len > 0) {
+        strncat(buffer, ", ", buffer_size - len - 1);
+        len = strlen(buffer);
+        if (len >= buffer_size - 1)
+            return;
+    }
+
+    strncat(buffer, device_name, buffer_size - len - 1);
+}
+
+static bool build_actor_unsupported_devices(char *buffer, size_t buffer_size)
+{
+    bool has_unsupported = false;
+
+    if (buffer_size > 0)
+        buffer[0] = '\0';
+
+    for (size_t i = 0; i < ARRAY_SIZE(virtio_host_io_policies); i++) {
+        const struct semu_executor_virtio_host_io_policy *policy =
+            &virtio_host_io_policies[i];
+
+        if (!policy->build_enabled || policy->actor_mode_allowed)
+            continue;
+
+        append_unsupported_device(buffer, buffer_size, policy->device_name);
+        has_unsupported = true;
+    }
+
+    return has_unsupported;
+}
+
 struct semu_executor_device_gate semu_executor_check_actor_device_gate(
     enum semu_executor_mode mode)
 {
-    if (mode != SEMU_EXECUTOR_THREADED_CPU_WITH_DEVICE_ACTORS) {
-        return (struct semu_executor_device_gate) {
-            .allowed = true,
-            .unsupported_devices = "",
-            .fallback_command = SEMU_EXECUTOR_FALLBACK,
-        };
-    }
-
-#if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIONET) || SEMU_HAS(VIRTIOBLK) || \
-    SEMU_HAS(VIRTIORNG) || SEMU_HAS(VIRTIOSND) || SEMU_HAS(VIRTIOFS)
-    static const char unsupported_devices[] =
-#if SEMU_HAS(VIRTIOINPUT)
-        "virtio-input"
-#endif
-#if SEMU_HAS(VIRTIOINPUT) &&                                              \
-    (SEMU_HAS(VIRTIONET) || SEMU_HAS(VIRTIOBLK) || SEMU_HAS(VIRTIORNG) || \
-     SEMU_HAS(VIRTIOSND) || SEMU_HAS(VIRTIOFS))
-        ", "
-#endif
-#if SEMU_HAS(VIRTIONET)
-        "virtio-net"
-#endif
-#if SEMU_HAS(VIRTIONET) && (SEMU_HAS(VIRTIOBLK) || SEMU_HAS(VIRTIORNG) || \
-                            SEMU_HAS(VIRTIOSND) || SEMU_HAS(VIRTIOFS))
-        ", "
-#endif
-#if SEMU_HAS(VIRTIOBLK)
-        "virtio-blk"
-#endif
-#if SEMU_HAS(VIRTIOBLK) && \
-    (SEMU_HAS(VIRTIORNG) || SEMU_HAS(VIRTIOSND) || SEMU_HAS(VIRTIOFS))
-        ", "
-#endif
-#if SEMU_HAS(VIRTIORNG)
-        "virtio-rng"
-#endif
-#if SEMU_HAS(VIRTIORNG) && (SEMU_HAS(VIRTIOSND) || SEMU_HAS(VIRTIOFS))
-        ", "
-#endif
-#if SEMU_HAS(VIRTIOSND)
-        "virtio-snd"
-#endif
-#if SEMU_HAS(VIRTIOSND) && SEMU_HAS(VIRTIOFS)
-        ", "
-#endif
-#if SEMU_HAS(VIRTIOFS)
-        "virtio-fs"
-#endif
-        ;
-    return (struct semu_executor_device_gate) {
-        .allowed = false,
-        .unsupported_devices = unsupported_devices,
-        .fallback_command = SEMU_EXECUTOR_FALLBACK,
-    };
-#else
-    return (struct semu_executor_device_gate) {
+    struct semu_executor_device_gate gate = {
         .allowed = true,
         .unsupported_devices = "",
         .fallback_command = SEMU_EXECUTOR_FALLBACK,
     };
-#endif
+
+    if (mode != SEMU_EXECUTOR_THREADED_CPU_WITH_DEVICE_ACTORS)
+        return gate;
+
+    gate.allowed = !build_actor_unsupported_devices(
+        gate.unsupported_devices, sizeof(gate.unsupported_devices));
+    return gate;
 }

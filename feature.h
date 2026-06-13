@@ -17,6 +17,11 @@
 #define SEMU_FEATURE_VIRTIOSND 1
 #endif
 
+/* virtio-rng */
+#ifndef SEMU_FEATURE_VIRTIORNG
+#define SEMU_FEATURE_VIRTIORNG 1
+#endif
+
 /* virtio-fs */
 #ifndef SEMU_FEATURE_VIRTIOFS
 #define SEMU_FEATURE_VIRTIOFS 1
