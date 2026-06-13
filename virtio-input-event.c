@@ -33,10 +33,12 @@ struct vinput_cmd_queue {
 
 static struct vinput_cmd_queue vinput_cmd_queues[VINPUT_DEV_CNT];
 
-/* Single wake gate across all device queues. The emulator drains every queue
- * after one pipe wake-up, so coalescing through a single gate is enough.
+/* Per-device wake gates. SDL/main produces into per-device queues, the I/O
+ * thread observes these gates and notifies the matching actor, and each actor
+ * rearms only its own gate after draining. This prevents one device reset or
+ * actor drain from clearing another device's pending wake.
  */
-static bool vinput_cmd_wake_pending;
+static bool vinput_cmd_wake_pending[VINPUT_DEV_CNT];
 
 static struct vinput_key_map_entry vinput_key_map[] = {
     /* Keyboard */
@@ -159,32 +161,31 @@ static bool vinput_push_cmd(int dev_id, const struct vinput_cmd *event)
     queue->entries[head] = *event;
     __atomic_store_n(&queue->head, next, __ATOMIC_RELEASE);
 
-    /* Coalesce wakeups across a whole drain batch. The producer only writes to
-     * the wake pipe when transitioning wake_pending false -> true and the
-     * consumer clears it after draining queued events and rechecks for races.
+    /* Coalesce wakeups across a whole per-device drain batch. The producer
+     * only writes to the wake pipe when transitioning wake_pending false ->
+     * true and the consumer clears it after draining queued events and
+     * rechecks for races.
      *
      * SEQ_CST on this exchange pairs with the SEQ_CST store in
      * vinput_rearm_cmd_wake(). The total order guarantees that if this
-     * exchange reads the stale "true", the consumer's later reads of the
+     * exchange reads the stale "true", the actor's later reads of the
      * queue head/tail will observe the store above. Without it, weakly-
      * ordered architectures can lose a wake-up.
      */
-    if (!__atomic_exchange_n(&vinput_cmd_wake_pending, true, __ATOMIC_SEQ_CST))
+    if (!__atomic_exchange_n(&vinput_cmd_wake_pending[dev_id], true,
+                             __ATOMIC_SEQ_CST))
         g_window.window_wake_backend();
 
     return true;
 }
 
-static bool vinput_all_queues_empty(void)
+static bool vinput_queue_empty(int dev_id)
 {
-    for (int i = 0; i < VINPUT_DEV_CNT; i++) {
-        struct vinput_cmd_queue *queue = &vinput_cmd_queues[i];
-        uint32_t tail = __atomic_load_n(&queue->tail, __ATOMIC_RELAXED);
-        uint32_t head = __atomic_load_n(&queue->head, __ATOMIC_ACQUIRE);
-        if (tail != head)
-            return false;
-    }
-    return true;
+    struct vinput_cmd_queue *queue = &vinput_cmd_queues[dev_id];
+    uint32_t tail = __atomic_load_n(&queue->tail, __ATOMIC_RELAXED);
+    uint32_t head = __atomic_load_n(&queue->head, __ATOMIC_ACQUIRE);
+
+    return tail == head;
 }
 
 /* Mouse button mapping uses SDL button IDs, not scancodes */
@@ -218,8 +219,8 @@ static int vinput_sdl_scancode_to_linux_key(int sdl_scancode)
 
 bool vinput_pop_cmd(int dev_id, struct vinput_cmd *event)
 {
-    /* Consumer-side dequeue. Called from the emulator thread after poll()
-     * wakes, and also from the periodic peripheral tick while work remains.
+    /* Consumer-side dequeue. Called by the selected device's actor after the
+     * I/O thread observes the per-device wake gate and notifies that actor.
      */
     struct vinput_cmd_queue *queue = &vinput_cmd_queues[dev_id];
     uint32_t tail = __atomic_load_n(&queue->tail, __ATOMIC_RELAXED);
@@ -235,24 +236,34 @@ bool vinput_pop_cmd(int dev_id, struct vinput_cmd *event)
     return true;
 }
 
-bool vinput_rearm_cmd_wake(void)
+bool vinput_rearm_cmd_wake(int dev_id)
 {
-    /* Clear wake_pending only after the current batch has been drained. If the
-     * producer published while wake_pending was still true, one of the queues
-     * will be non-empty here and the consumer must keep draining instead of
-     * returning to poll().
+    /* Clear wake_pending only after the current per-device batch has been
+     * drained. If the producer published while wake_pending was still true,
+     * this device's queue will be non-empty here and the actor must keep
+     * draining instead of sleeping.
      *
      * SEQ_CST pairs with the SEQ_CST exchange in vinput_push_cmd(). See the
      * note there: without a total order, the producer can read a stale "true"
-     * while this thread reads stale empty queues, losing the wake-up.
+     * while the actor reads a stale empty queue, losing the wake-up.
      */
-    __atomic_store_n(&vinput_cmd_wake_pending, false, __ATOMIC_SEQ_CST);
-    return vinput_all_queues_empty();
+    __atomic_store_n(&vinput_cmd_wake_pending[dev_id], false, __ATOMIC_SEQ_CST);
+    return vinput_queue_empty(dev_id);
 }
 
 bool vinput_may_have_pending_cmds(void)
 {
-    return __atomic_load_n(&vinput_cmd_wake_pending, __ATOMIC_RELAXED);
+    for (int i = 0; i < VINPUT_DEV_CNT; i++)
+        if (vinput_may_have_pending_cmds_for_dev(i))
+            return true;
+    return false;
+}
+
+bool vinput_may_have_pending_cmds_for_dev(int dev_id)
+{
+    if (dev_id < 0 || dev_id >= VINPUT_DEV_CNT)
+        return false;
+    return __atomic_load_n(&vinput_cmd_wake_pending[dev_id], __ATOMIC_RELAXED);
 }
 
 void vinput_reset_host_events(int dev_id)
@@ -264,25 +275,23 @@ void vinput_reset_host_events(int dev_id)
     while (vinput_pop_cmd(dev_id, &event))
         ;
 
-    /* Restore the wake-gate invariant: wake_pending true means a pipe byte is
-     * in flight, or the consumer has not rearmed yet.
+    /* Restore this device's wake-gate invariant: wake_pending true means a
+     * pipe byte is in flight, or the actor has not rearmed yet.
      *
-     * Reset can run on the emulator thread between main.c consuming the pipe
-     * byte and the next emu_tick_peripherals() drain. If we left
+     * Reset can run after the I/O thread consumes the pipe byte and before the
+     * next emu_tick_peripherals() actor notification. If we left this device's
      * wake_pending=true with no backing pipe byte and no events for this
      * device to process, a later producer push would see wake_pending=true and
      * skip its pipe write, and the emulator could block in poll(-1)
      * indefinitely.
-     *
-     * Mirror the producer's rearm idiom: clear the gate, then if the other
-     * device still has work, re-arm the gate with a fresh pipe byte so the
-     * consumer is guaranteed to be woken and drain it next tick.
      */
-    __atomic_store_n(&vinput_cmd_wake_pending, false, __ATOMIC_SEQ_CST);
-    if (!vinput_all_queues_empty() &&
-        !__atomic_exchange_n(&vinput_cmd_wake_pending, true,
-                             __ATOMIC_SEQ_CST)) {
-        g_window.window_wake_backend();
+    __atomic_store_n(&vinput_cmd_wake_pending[dev_id], false, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < VINPUT_DEV_CNT; i++) {
+        if (i == dev_id || vinput_queue_empty(i))
+            continue;
+        if (!__atomic_exchange_n(&vinput_cmd_wake_pending[i], true,
+                                 __ATOMIC_SEQ_CST))
+            g_window.window_wake_backend();
     }
 }
 

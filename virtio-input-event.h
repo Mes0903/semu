@@ -20,8 +20,8 @@ enum {
 };
 
 /* Host-side input commands produced by the window backend. The SDL/main
- * thread translates platform input into this neutral form. The emulator
- * thread consumes it and updates the virtio-input device state.
+ * thread translates platform input into this neutral form. Per-device
+ * virtio-input actors consume it and update guest-visible virtqueues.
  */
 enum vinput_cmd_type {
     VINPUT_CMD_KEYBOARD_KEY = 0,
@@ -62,23 +62,28 @@ struct vinput_cmd {
 bool vinput_handle_events(void);
 
 /* Pop one translated backend input event from the per-device queue. Called by
- * the emulator thread while draining work that arrived from the SDL/main
- * thread. dev_id selects which device's queue to read.
+ * the matching virtio-input actor while draining work that arrived from the
+ * SDL/main thread. dev_id selects which device's queue to read.
  */
 bool vinput_pop_cmd(int dev_id, struct vinput_cmd *cmd);
 
-/* Reopen the producer wake gate after the emulator thread drains the current
- * batch of queued input events across all device queues. Returns true if every
- * queue is empty across the rearm, or false if the producer raced and more
- * events are already pending.
+/* Reopen one device's producer wake gate after its actor drains the current
+ * batch of queued input events. Returns true if the selected queue is empty
+ * across the rearm, or false if the producer raced and more events are already
+ * pending for that same device.
  */
-bool vinput_rearm_cmd_wake(void);
+bool vinput_rearm_cmd_wake(int dev_id);
 
-/* Returns true once the backend has published input work for the emulator
- * thread. This is a cheap fast-path check used to skip queue-drain bookkeeping
- * when no translated input events are pending.
+/* Returns true once the backend has published any input work for input actors.
+ * This is a cheap fast-path check used by the I/O thread before notifying
+ * actors.
  */
 bool vinput_may_have_pending_cmds(void);
+
+/* Returns true once the backend has published input work for one device's
+ * actor.
+ */
+bool vinput_may_have_pending_cmds_for_dev(int dev_id);
 
 /* Drop all pending events for one virtio-input device. Called when the guest
  * resets that device; the other device's queue is left untouched.

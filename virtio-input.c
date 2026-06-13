@@ -16,23 +16,22 @@
 #include "virtio-mmio.h"
 #include "virtio.h"
 
-/* Threading invariant: every function in this file that reads or writes
- * guest-visible virtio-input backend state (host event queues and the
- * per-device config union) runs exclusively on the emulator thread. Common
- * VirtIO transport, virtqueue, and IRQ state are owned by virtio-mmio/virtq.
+/* Threading invariant: guest-facing virtqueue draining is owned by the
+ * per-device virtio-input actor. Common VirtIO transport, virtqueue, and IRQ
+ * state are owned by virtio-mmio/virtq; actor generation and common generation
+ * guards suppress stale reset/stop completions.
  *
  * The SDL/main thread produces host input through the SPSC queue in
- * virtio-input-event.c; the emulator thread consumes that queue in
- * virtio_input_drain_host_events() and then calls into this file. Guest MMIO
- * accesses arrive via virtio_input_read()/virtio_input_write() from
- * mem_load()/mem_store(), which is also the emulator thread.
+ * virtio-input-event.c. The I/O/peripheral polling path only observes the
+ * per-device wake gates and notifies input actors; it does not write guest
+ * RAM, used rings, or IRQ state for input events. Guest MMIO accesses arrive
+ * via virtio_input_read()/virtio_input_write() from mem_load()/mem_store().
  *
  * The only cross-thread touch point is virtio_input_irq_pending(), which reads
  * the common VirtIO ISR bits from the PLIC polling path.
  *
- * No vinput-internal mutex is required as long as this invariant holds. If a
- * future change reintroduces SDL-thread writes into virtio-input device state,
- * add a lock back at the same time.
+ * No vinput-internal mutex is required as long as SDL writes only host SPSC
+ * queues and guest-facing state remains actor/common-owned.
  */
 
 #define BUS_VIRTUAL 0x06
@@ -112,6 +111,7 @@ struct vinput_data {
 };
 
 static struct vinput_data vinput_dev[VINPUT_DEV_CNT];
+static int vinput_dev_cnt;
 static const char *vinput_dev_name[VINPUT_DEV_CNT] = {
     VINPUT_KEYBOARD_NAME,
     VINPUT_MOUSE_NAME,
@@ -147,6 +147,106 @@ static inline void virtio_input_set_fail(virtio_input_state_t *vinput)
         virtio_irq_trigger(&vinput->common.irq, VIRTIO_INT__CONF_CHANGE);
 }
 
+static bool virtio_input_actor_generation_current(virtio_input_state_t *vinput,
+                                                  struct virtio_actor *actor,
+                                                  uint64_t generation)
+{
+    return vinput && actor == &vinput->actor &&
+           virtio_actor_generation(actor) == generation;
+}
+
+static bool virtio_input_queue_ready_for_actor(virtio_input_state_t *vinput,
+                                               const struct virtq *queue)
+{
+    unsigned status;
+
+    if (!vinput || !queue || !queue->ready)
+        return false;
+
+    status = virtio_input_status_load(vinput);
+    return !(status & VIRTIO_STATUS__DEVICE_NEEDS_RESET) &&
+           (status & VIRTIO_STATUS__DRIVER_OK);
+}
+
+static bool virtio_input_common_generation_current(virtio_input_state_t *vinput,
+                                                   uint64_t generation)
+{
+    bool current;
+
+    if (!vinput || !vinput->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vinput->common.transport_lock);
+    current = vinput->common.generation == generation &&
+              !vinput->common.reset_in_progress;
+    pthread_mutex_unlock(&vinput->common.transport_lock);
+    return current;
+}
+
+static bool virtio_input_capture_common_generation(virtio_input_state_t *vinput,
+                                                   uint64_t *generation)
+{
+    unsigned status;
+    bool current;
+
+    if (!vinput || !vinput->common.initialized || !generation)
+        return false;
+
+    pthread_mutex_lock(&vinput->common.transport_lock);
+    status = virtio_input_status_load(vinput);
+    current = !vinput->common.reset_in_progress &&
+              (status & VIRTIO_STATUS__DRIVER_OK) &&
+              !(status & VIRTIO_STATUS__DEVICE_NEEDS_RESET);
+    if (current)
+        *generation = vinput->common.generation;
+    pthread_mutex_unlock(&vinput->common.transport_lock);
+    return current;
+}
+
+static bool virtio_input_begin_actor_completion(virtio_input_state_t *vinput,
+                                                uint64_t actor_generation,
+                                                uint64_t common_generation)
+{
+    bool common_current;
+
+    if (!vinput || !vinput->actor_initialized || !vinput->common.initialized)
+        return false;
+
+    pthread_mutex_lock(&vinput->common.transport_lock);
+    common_current = vinput->common.generation == common_generation &&
+                     !vinput->common.reset_in_progress;
+    if (!common_current) {
+        pthread_mutex_unlock(&vinput->common.transport_lock);
+        return false;
+    }
+
+    if (!virtio_actor_begin_completion(&vinput->actor, actor_generation)) {
+        pthread_mutex_unlock(&vinput->common.transport_lock);
+        return false;
+    }
+    return true;
+}
+
+static void virtio_input_end_actor_completion(virtio_input_state_t *vinput)
+{
+    if (!vinput || !vinput->actor_initialized)
+        return;
+
+    virtio_actor_end_completion(&vinput->actor);
+    pthread_mutex_unlock(&vinput->common.transport_lock);
+}
+
+static void virtio_input_set_fail_for_actor(virtio_input_state_t *vinput,
+                                            uint64_t actor_generation,
+                                            uint64_t common_generation)
+{
+    if (!virtio_input_begin_actor_completion(vinput, actor_generation,
+                                             common_generation))
+        return;
+    virtio_input_set_fail(vinput);
+    virtio_input_end_actor_completion(vinput);
+}
+
 static inline bool virtio_input_is_config_access(uint32_t addr,
                                                  size_t access_size)
 {
@@ -159,30 +259,26 @@ static inline bool virtio_input_is_config_access(uint32_t addr,
     return access_size <= end - addr;
 }
 
-static bool virtio_input_queue_available(virtio_input_state_t *vinput,
-                                         const struct virtq *queue,
-                                         uint16_t *available)
+static int virtio_input_queue_available(virtio_input_state_t *vinput,
+                                        const struct virtq *queue,
+                                        uint16_t *available)
 {
     uint16_t avail_idx;
     uint16_t delta;
 
     if (!queue || !queue->ready || !available)
-        return false;
+        return -EINVAL;
 
     if (!ram_dma_read(vinput->common.dma, queue->driver_addr + 2, &avail_idx,
-                      sizeof(avail_idx))) {
-        virtio_input_set_fail(vinput);
-        return false;
-    }
+                      sizeof(avail_idx)))
+        return -EFAULT;
 
     delta = (uint16_t) (avail_idx - queue->last_avail);
-    if (delta > queue->queue_size) {
-        virtio_input_set_fail(vinput);
-        return false;
-    }
+    if (delta > queue->queue_size)
+        return -EINVAL;
 
     *available = delta;
-    return true;
+    return 0;
 }
 
 static guest_size_t virtio_input_iov_bytes(const struct virtq_iov *iov,
@@ -228,16 +324,20 @@ static bool virtio_input_write_event_to_chain(
  * SDL has no portable LED-control API, so LED state is not applied to the host
  * keyboard here.
  */
-static void virtio_input_drain_statusq(virtio_input_state_t *vinput)
+static int virtio_input_drain_statusq(virtio_input_state_t *vinput,
+                                      struct virtio_actor *actor,
+                                      uint64_t actor_generation,
+                                      uint64_t common_generation)
 {
     struct virtq *queue = &vinput->common.queues[VIRTIO_INPUT_STATUSQ];
     struct virtq_iov readable[VIRTIO_INPUT_QUEUE_NUM_MAX];
     struct virtq_iov writable[VIRTIO_INPUT_QUEUE_NUM_MAX];
     bool consumed = false;
 
-    if (!(virtio_input_status_load(vinput) & VIRTIO_STATUS__DRIVER_OK) ||
-        !queue->ready)
-        return;
+    if (!virtio_input_actor_generation_current(vinput, actor, actor_generation))
+        return 0;
+    if (!virtio_input_queue_ready_for_actor(vinput, queue))
+        return 0;
 
     for (;;) {
         struct virtq_chain chain = {
@@ -249,15 +349,30 @@ static void virtio_input_drain_statusq(virtio_input_state_t *vinput)
         uint16_t available;
         int ret;
 
-        if (!virtio_input_queue_available(vinput, queue, &available))
-            return;
+        if (!virtio_input_actor_generation_current(vinput, actor,
+                                                   actor_generation))
+            return 0;
+        if (!virtio_input_common_generation_current(vinput, common_generation))
+            return 0;
+        ret = virtio_input_queue_available(vinput, queue, &available);
+        if (ret < 0) {
+            virtio_input_set_fail_for_actor(vinput, actor_generation,
+                                            common_generation);
+            return 0;
+        }
         if (available == 0)
             break;
 
         ret = virtq_pop(vinput->common.dma, queue, &chain);
+        if (!virtio_input_actor_generation_current(vinput, actor,
+                                                   actor_generation))
+            return 0;
+        if (!virtio_input_common_generation_current(vinput, common_generation))
+            return 0;
         if (ret < 0) {
-            virtio_input_set_fail(vinput);
-            return;
+            virtio_input_set_fail_for_actor(vinput, actor_generation,
+                                            common_generation);
+            return 0;
         }
         if (ret == 0)
             break;
@@ -265,38 +380,61 @@ static void virtio_input_drain_statusq(virtio_input_state_t *vinput)
         if (chain.writable_count != 0 || chain.readable_count == 0 ||
             virtio_input_iov_bytes(chain.readable, chain.readable_count) <
                 sizeof(struct virtio_input_event)) {
-            virtio_input_set_fail(vinput);
-            return;
+            virtio_input_set_fail_for_actor(vinput, actor_generation,
+                                            common_generation);
+            return 0;
         }
 
+        if (!virtio_input_begin_actor_completion(vinput, actor_generation,
+                                                 common_generation))
+            return 0;
         if (virtq_add_used(vinput->common.dma, queue, chain.head, 0) < 0) {
             virtio_input_set_fail(vinput);
-            return;
+            virtio_input_end_actor_completion(vinput);
+            return 0;
         }
+        virtio_input_end_actor_completion(vinput);
         consumed = true;
     }
 
-    if (consumed && !virtq_interrupt_suppressed(vinput->common.dma, queue))
-        virtio_irq_trigger(&vinput->common.irq, VIRTIO_INT__USED_RING);
+    if (consumed && virtio_input_begin_actor_completion(
+                        vinput, actor_generation, common_generation)) {
+        if (!virtq_interrupt_suppressed(vinput->common.dma, queue))
+            virtio_irq_trigger(&vinput->common.irq, VIRTIO_INT__USED_RING);
+        virtio_input_end_actor_completion(vinput);
+    }
+    return 0;
 }
 
-/* Returns true if any events were written to used ring, false otherwise */
-static bool virtio_input_desc_handler(virtio_input_state_t *vinput,
-                                      struct virtio_input_event *input_ev,
-                                      uint32_t ev_cnt,
-                                      struct virtq *queue)
+static int virtio_input_desc_handler(virtio_input_state_t *vinput,
+                                     struct virtio_actor *actor,
+                                     uint64_t actor_generation,
+                                     uint64_t common_generation,
+                                     struct virtio_input_event *input_ev,
+                                     uint32_t ev_cnt,
+                                     struct virtq *queue,
+                                     bool *wrote_events)
 {
     struct virtq_iov readable[VIRTIO_INPUT_QUEUE_NUM_MAX];
     struct virtq_iov writable[VIRTIO_INPUT_QUEUE_NUM_MAX];
     uint16_t available;
-    bool wrote_events = false;
+    int ret;
 
-    if (!virtio_input_queue_available(vinput, queue, &available))
-        return false;
+    *wrote_events = false;
+    if (!virtio_input_actor_generation_current(vinput, actor, actor_generation))
+        return 0;
+    if (!virtio_input_common_generation_current(vinput, common_generation))
+        return 0;
+    ret = virtio_input_queue_available(vinput, queue, &available);
+    if (ret < 0) {
+        virtio_input_set_fail_for_actor(vinput, actor_generation,
+                                        common_generation);
+        return 0;
+    }
 
     /* Preserve the old all-or-drop behavior for grouped input events. */
     if (available < ev_cnt)
-        return false;
+        return 0;
 
     for (uint32_t i = 0; i < ev_cnt; i++) {
         struct virtq_chain chain = {
@@ -305,33 +443,58 @@ static bool virtio_input_desc_handler(virtio_input_state_t *vinput,
             .writable = writable,
             .writable_capacity = ARRAY_SIZE(writable),
         };
-        int ret = virtq_pop(vinput->common.dma, queue, &chain);
+        ret = virtq_pop(vinput->common.dma, queue, &chain);
 
+        if (!virtio_input_actor_generation_current(vinput, actor,
+                                                   actor_generation))
+            return 0;
+        if (!virtio_input_common_generation_current(vinput, common_generation))
+            return 0;
         if (ret < 0) {
-            virtio_input_set_fail(vinput);
-            return false;
+            virtio_input_set_fail_for_actor(vinput, actor_generation,
+                                            common_generation);
+            return 0;
         }
         if (ret == 0)
-            return wrote_events;
+            return 0;
 
         if (chain.readable_count != 0 || chain.writable_count == 0 ||
             !virtio_input_write_event_to_chain(vinput, &chain, &input_ev[i])) {
-            virtio_input_set_fail(vinput);
-            return false;
+            if (!virtio_input_actor_generation_current(vinput, actor,
+                                                       actor_generation) ||
+                !virtio_input_common_generation_current(vinput,
+                                                        common_generation))
+                return 0;
+            virtio_input_set_fail_for_actor(vinput, actor_generation,
+                                            common_generation);
+            return 0;
         }
 
+        if (!virtio_input_actor_generation_current(vinput, actor,
+                                                   actor_generation))
+            return 0;
+        if (!virtio_input_common_generation_current(vinput, common_generation))
+            return 0;
+        if (!virtio_input_begin_actor_completion(vinput, actor_generation,
+                                                 common_generation))
+            return 0;
         if (virtq_add_used(vinput->common.dma, queue, chain.head,
                            sizeof(struct virtio_input_event)) < 0) {
             virtio_input_set_fail(vinput);
-            return false;
+            virtio_input_end_actor_completion(vinput);
+            return 0;
         }
-        wrote_events = true;
+        virtio_input_end_actor_completion(vinput);
+        *wrote_events = true;
     }
 
-    return wrote_events;
+    return 0;
 }
 
 static void virtio_input_update_eventq(int dev_id,
+                                       struct virtio_actor *actor,
+                                       uint64_t actor_generation,
+                                       uint64_t common_generation,
                                        struct virtio_input_event *input_ev,
                                        uint32_t ev_cnt)
 {
@@ -352,7 +515,10 @@ static void virtio_input_update_eventq(int dev_id,
     if (!(status & VIRTIO_STATUS__DRIVER_OK) || !queue->ready)
         return;
 
-    wrote_events = virtio_input_desc_handler(vinput, input_ev, ev_cnt, queue);
+    if (virtio_input_desc_handler(vinput, actor, actor_generation,
+                                  common_generation, input_ev, ev_cnt, queue,
+                                  &wrote_events) < 0)
+        return;
 
 #if SEMU_INPUT_DEBUG
     if (!wrote_events)
@@ -360,11 +526,19 @@ static void virtio_input_update_eventq(int dev_id,
                 dev_id);
 #endif
 
-    if (wrote_events && !virtq_interrupt_suppressed(vinput->common.dma, queue))
-        virtio_irq_trigger(&vinput->common.irq, VIRTIO_INT__USED_RING);
+    if (wrote_events && virtio_input_begin_actor_completion(
+                            vinput, actor_generation, common_generation)) {
+        if (!virtq_interrupt_suppressed(vinput->common.dma, queue))
+            virtio_irq_trigger(&vinput->common.irq, VIRTIO_INT__USED_RING);
+        virtio_input_end_actor_completion(vinput);
+    }
 }
 
-static void virtio_input_update_key(uint32_t key, uint32_t ev_value)
+static void virtio_input_update_key(struct virtio_actor *actor,
+                                    uint64_t actor_generation,
+                                    uint64_t common_generation,
+                                    uint32_t key,
+                                    uint32_t ev_value)
 {
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "key code=%u value=%u\n", key,
@@ -377,10 +551,14 @@ static void virtio_input_update_key(uint32_t key, uint32_t ev_value)
     };
 
     size_t ev_cnt = ARRAY_SIZE(input_ev);
-    virtio_input_update_eventq(VINPUT_KEYBOARD_ID, input_ev, ev_cnt);
+    virtio_input_update_eventq(VINPUT_KEYBOARD_ID, actor, actor_generation,
+                               common_generation, input_ev, ev_cnt);
 }
 
-static void virtio_input_update_mouse_button_state(uint32_t button,
+static void virtio_input_update_mouse_button_state(struct virtio_actor *actor,
+                                                   uint64_t actor_generation,
+                                                   uint64_t common_generation,
+                                                   uint32_t button,
                                                    bool pressed)
 {
 #if SEMU_INPUT_DEBUG
@@ -393,10 +571,15 @@ static void virtio_input_update_mouse_button_state(uint32_t button,
     };
 
     size_t ev_cnt = ARRAY_SIZE(input_ev);
-    virtio_input_update_eventq(VINPUT_MOUSE_ID, input_ev, ev_cnt);
+    virtio_input_update_eventq(VINPUT_MOUSE_ID, actor, actor_generation,
+                               common_generation, input_ev, ev_cnt);
 }
 
-static void virtio_input_update_mouse_motion(int32_t dx, int32_t dy)
+static void virtio_input_update_mouse_motion(struct virtio_actor *actor,
+                                             uint64_t actor_generation,
+                                             uint64_t common_generation,
+                                             int32_t dx,
+                                             int32_t dy)
 {
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "motion dx=%d dy=%d\n", dx, dy);
@@ -416,10 +599,15 @@ static void virtio_input_update_mouse_motion(int32_t dx, int32_t dy)
     input_ev[ev_cnt++] = (struct virtio_input_event) {
         .type = SEMU_EV_SYN, .code = SEMU_SYN_REPORT, .value = 0};
 
-    virtio_input_update_eventq(VINPUT_MOUSE_ID, input_ev, ev_cnt);
+    virtio_input_update_eventq(VINPUT_MOUSE_ID, actor, actor_generation,
+                               common_generation, input_ev, ev_cnt);
 }
 
-static void virtio_input_update_scroll(int32_t dx, int32_t dy)
+static void virtio_input_update_scroll(struct virtio_actor *actor,
+                                       uint64_t actor_generation,
+                                       uint64_t common_generation,
+                                       int32_t dx,
+                                       int32_t dy)
 {
 #if SEMU_INPUT_DEBUG
     fprintf(stderr, VINPUT_DEBUG_PREFIX "scroll dx=%d dy=%d\n", dx, dy);
@@ -446,54 +634,86 @@ static void virtio_input_update_scroll(int32_t dx, int32_t dy)
     input_ev[ev_cnt++] = (struct virtio_input_event) {
         .type = SEMU_EV_SYN, .code = SEMU_SYN_REPORT, .value = 0};
 
-    virtio_input_update_eventq(VINPUT_MOUSE_ID, input_ev, ev_cnt);
+    virtio_input_update_eventq(VINPUT_MOUSE_ID, actor, actor_generation,
+                               common_generation, input_ev, ev_cnt);
 }
 
-void virtio_input_drain_host_events(void)
+static void virtio_input_drain_host_events_for_actor(
+    virtio_input_state_t *vinput,
+    struct virtio_actor *actor,
+    uint64_t actor_generation,
+    uint64_t common_generation)
 {
+    int dev_id = PRIV(vinput)->type;
+    struct virtq *queue = &vinput->common.queues[VIRTIO_INPUT_EVENTQ];
+
     for (;;) {
         struct vinput_cmd event;
 
-        /* Drain per-device queues on the emulator thread so SDL never touches
-         * guest-visible virtio-input state directly.
+        /* Drain one per-device host queue on its actor so SDL and the I/O
+         * polling path never touch guest-visible virtio-input state directly.
          *
-         * We intentionally drain the whole keyboard queue before touching the
-         * mouse queue, rather than round-robining between them. The guest-
-         * visible cross-device order is decided by PLIC arbitration when it
-         * picks between the pending IRQs, not by the order we drain the queues
-         * here. Round-robining between queues would not change it.
+         * Cross-device ordering is decided by independent actor scheduling and
+         * PLIC arbitration between pending IRQs. The old single-thread path
+         * already offered no guest-visible cross-device ordering guarantee
+         * beyond interrupt arbitration.
          *
          * If a future change raises interrupts mid-drain, adds host-side
          * timestamps to virtio_input_event, or otherwise starts to rely on
-         * sub-tick cross-device ordering, revisit this loop.
+         * sub-tick cross-device ordering, introduce an explicit sequencer.
          */
-        while (vinput_pop_cmd(VINPUT_KEYBOARD_ID, &event)) {
-            if (event.type == VINPUT_CMD_KEYBOARD_KEY)
-                virtio_input_update_key(event.u.keyboard_key.key,
-                                        event.u.keyboard_key.value);
-        }
-
-        while (vinput_pop_cmd(VINPUT_MOUSE_ID, &event)) {
+        if (!virtio_input_queue_ready_for_actor(vinput, queue))
+            return;
+        while (vinput_pop_cmd(dev_id, &event)) {
             switch (event.type) {
+            case VINPUT_CMD_KEYBOARD_KEY:
+                if (dev_id == VINPUT_KEYBOARD_ID)
+                    virtio_input_update_key(
+                        actor, actor_generation, common_generation,
+                        event.u.keyboard_key.key, event.u.keyboard_key.value);
+                break;
             case VINPUT_CMD_MOUSE_BUTTON:
-                virtio_input_update_mouse_button_state(
-                    event.u.mouse_button.button, event.u.mouse_button.pressed);
+                if (dev_id == VINPUT_MOUSE_ID)
+                    virtio_input_update_mouse_button_state(
+                        actor, actor_generation, common_generation,
+                        event.u.mouse_button.button,
+                        event.u.mouse_button.pressed);
                 break;
             case VINPUT_CMD_MOUSE_MOTION:
-                virtio_input_update_mouse_motion(event.u.mouse_motion.dx,
-                                                 event.u.mouse_motion.dy);
+                if (dev_id == VINPUT_MOUSE_ID)
+                    virtio_input_update_mouse_motion(
+                        actor, actor_generation, common_generation,
+                        event.u.mouse_motion.dx, event.u.mouse_motion.dy);
                 break;
             case VINPUT_CMD_MOUSE_WHEEL:
-                virtio_input_update_scroll(event.u.mouse_wheel.dx,
-                                           event.u.mouse_wheel.dy);
+                if (dev_id == VINPUT_MOUSE_ID)
+                    virtio_input_update_scroll(
+                        actor, actor_generation, common_generation,
+                        event.u.mouse_wheel.dx, event.u.mouse_wheel.dy);
                 break;
             default:
                 break;
             }
         }
 
-        if (vinput_rearm_cmd_wake())
+        if (vinput_rearm_cmd_wake(dev_id))
             break;
+    }
+}
+
+void virtio_input_drain_host_events(void)
+{
+    for (int dev_id = 0; dev_id < VINPUT_DEV_CNT; dev_id++) {
+        virtio_input_state_t *vinput = vinput_dev[dev_id].vinput;
+        int ret;
+
+        if (!vinput || !vinput_may_have_pending_cmds_for_dev(dev_id))
+            continue;
+
+        ret = virtio_actor_notify_queue(&vinput->actor, VIRTIO_INPUT_EVENTQ);
+        if (ret == 0 || ret == -EAGAIN)
+            continue;
+        virtio_input_set_fail(vinput);
     }
 }
 
@@ -810,12 +1030,115 @@ bool virtio_input_irq_pending(virtio_input_state_t *vinput)
     return virtio_irq_read_status(&vinput->common.irq) != 0;
 }
 
+static int virtio_input_actor_drain_queue(void *opaque,
+                                          struct virtio_actor *actor,
+                                          uint16_t queue_index,
+                                          uint64_t generation)
+{
+    virtio_input_state_t *vinput = opaque;
+    uint64_t common_generation = 0;
+
+    if (!vinput || (queue_index != VIRTIO_INPUT_EVENTQ &&
+                    queue_index != VIRTIO_INPUT_STATUSQ)) {
+        if (vinput)
+            virtio_input_set_fail(vinput);
+        return 0;
+    }
+
+    if (!virtio_input_actor_generation_current(vinput, actor, generation))
+        return 0;
+    if (!virtio_input_capture_common_generation(vinput, &common_generation))
+        return 0;
+
+    if (queue_index == VIRTIO_INPUT_EVENTQ) {
+        virtio_input_drain_host_events_for_actor(vinput, actor, generation,
+                                                 common_generation);
+        return 0;
+    }
+
+    return virtio_input_drain_statusq(vinput, actor, generation,
+                                      common_generation);
+}
+
+static bool virtio_input_actor_queue_has_work(void *opaque,
+                                              struct virtio_actor *actor,
+                                              uint16_t queue_index,
+                                              uint64_t generation)
+{
+    virtio_input_state_t *vinput = opaque;
+    uint16_t available = 0;
+
+    if (!vinput || (queue_index != VIRTIO_INPUT_EVENTQ &&
+                    queue_index != VIRTIO_INPUT_STATUSQ))
+        return false;
+    if (!virtio_input_actor_generation_current(vinput, actor, generation))
+        return false;
+
+    if (queue_index == VIRTIO_INPUT_EVENTQ) {
+        if (!virtio_input_queue_ready_for_actor(
+                vinput, &vinput->common.queues[VIRTIO_INPUT_EVENTQ]))
+            return false;
+        return vinput_may_have_pending_cmds_for_dev(PRIV(vinput)->type);
+    }
+
+    if (!virtio_input_queue_ready_for_actor(
+            vinput, &vinput->common.queues[VIRTIO_INPUT_STATUSQ]))
+        return false;
+    if (virtio_input_queue_available(
+            vinput, &vinput->common.queues[VIRTIO_INPUT_STATUSQ], &available) <
+        0)
+        return false;
+    return available != 0;
+}
+
+static void virtio_input_actor_failed(void *opaque,
+                                      struct virtio_actor *actor UNUSED)
+{
+    virtio_input_state_t *vinput = opaque;
+
+    if (vinput)
+        virtio_input_set_fail(vinput);
+}
+
+static const struct virtio_actor_ops virtio_input_actor_ops = {
+    .drain_queue = virtio_input_actor_drain_queue,
+    .queue_has_work = virtio_input_actor_queue_has_work,
+    .on_failed = virtio_input_actor_failed,
+};
+
 static int virtio_input_activate(void *opaque,
                                  const struct virtio_activation_context *ctx)
 {
-    (void) opaque;
+    virtio_input_state_t *vinput = opaque;
+    int ret;
+
     (void) ctx;
-    return 0;
+
+    if (!vinput || !vinput->actor_initialized)
+        return -EINVAL;
+
+    ret = virtio_actor_start(&vinput->actor);
+    if (ret < 0 && ret != -EALREADY)
+        return ret;
+
+    ret = virtio_actor_enter_configuring(&vinput->actor);
+    if (ret < 0)
+        return ret;
+    return virtio_actor_activate(&vinput->actor);
+}
+
+static int virtio_input_prepare_reset(void *opaque,
+                                      uint64_t old_generation,
+                                      uint64_t new_generation)
+{
+    virtio_input_state_t *vinput = opaque;
+
+    (void) old_generation;
+    (void) new_generation;
+
+    if (!vinput || !vinput->actor_initialized)
+        return 0;
+    return virtio_actor_reset(&vinput->actor);
 }
 
 static int virtio_input_reset(void *opaque,
@@ -835,15 +1158,27 @@ static int virtio_input_notify_queue(void *opaque,
                                      uint64_t generation)
 {
     virtio_input_state_t *vinput = opaque;
+    int ret;
     (void) generation;
 
-    if (queue_index == VIRTIO_INPUT_STATUSQ)
-        virtio_input_drain_statusq(vinput);
-    return 0;
+    if (!vinput || (queue_index != VIRTIO_INPUT_EVENTQ &&
+                    queue_index != VIRTIO_INPUT_STATUSQ)) {
+        if (vinput)
+            virtio_input_set_fail(vinput);
+        return -EINVAL;
+    }
+
+    ret = virtio_actor_notify_queue(&vinput->actor, queue_index);
+    if (ret == 0 || ret == -EAGAIN)
+        return 0;
+
+    virtio_input_set_fail(vinput);
+    return ret;
 }
 
 static const struct virtio_device_ops virtio_input_ops = {
     .activate = virtio_input_activate,
+    .prepare_reset = virtio_input_prepare_reset,
     .reset = virtio_input_reset,
     .notify_queue = virtio_input_notify_queue,
     .read_config = virtio_input_read_config,
@@ -858,7 +1193,6 @@ void virtio_input_init(virtio_input_state_t *vinput,
         [VIRTIO_INPUT_EVENTQ] = VIRTIO_INPUT_QUEUE_NUM_MAX,
         [VIRTIO_INPUT_STATUSQ] = VIRTIO_INPUT_QUEUE_NUM_MAX,
     };
-    static int vinput_dev_cnt = 0;
     int dev_id;
     struct virtio_device_common_config config;
 
@@ -895,5 +1229,38 @@ void virtio_input_init(virtio_input_state_t *vinput,
         exit(2);
     }
 
+    if (virtio_actor_init(&vinput->actor, &virtio_input_actor_ops, vinput,
+                          ARRAY_SIZE(queue_max_sizes)) < 0) {
+        virtio_device_common_destroy(&vinput->common);
+        fprintf(stderr, "Failed to initialize virtio-input actor.\n");
+        exit(2);
+    }
+    vinput->actor_initialized = true;
     vinput_dev_cnt++;
+}
+
+void virtio_input_destroy(virtio_input_state_t *vinput)
+{
+    if (!vinput)
+        return;
+
+    if (vinput->actor_initialized) {
+        virtio_actor_stop(&vinput->actor);
+        virtio_actor_destroy(&vinput->actor);
+        vinput->actor_initialized = false;
+    }
+
+    if (vinput->priv) {
+        struct vinput_data *data = PRIV(vinput);
+
+        if (data->vinput == vinput)
+            data->vinput = NULL;
+        data->cfg = (struct virtio_input_config) {0};
+    }
+
+    virtio_device_common_destroy(&vinput->common);
+
+    if (vinput_dev[VINPUT_KEYBOARD_ID].vinput == NULL &&
+        vinput_dev[VINPUT_MOUSE_ID].vinput == NULL)
+        vinput_dev_cnt = 0;
 }

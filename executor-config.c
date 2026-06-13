@@ -31,10 +31,11 @@ static const struct semu_executor_virtio_host_io_policy
         {
             .device_name = "virtio-input",
             .build_enabled = SEMU_HAS(VIRTIOINPUT),
-            .actor_mode_allowed = false,
+            .actor_mode_allowed = true,
             .actor_mode_policy =
-                "keep SDL producer/SPSC queue; move guest virtqueues to common "
-                "transport before actor support",
+                "actor-backed; SDL/main produces SPSC host events, I/O thread "
+                "notifies actors, guest EVENTQ/STATUSQ completions run outside "
+                "vCPU",
         },
         {
             .device_name = "virtio-rng",

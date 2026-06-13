@@ -234,6 +234,8 @@ void virtio_rng_destroy(virtio_rng_state_t *vrng);
 
 typedef struct {
     struct virtio_device_common common;
+    struct virtio_actor actor;
+    bool actor_initialized;
     /* supplied by environment */
     uint32_t *ram;
     /* implementation-specific */
@@ -255,9 +257,11 @@ void virtio_input_write(hart_t *vm,
 void virtio_input_init(virtio_input_state_t *vinput,
                        emu_state_t *emu,
                        enum semu_irq_source irq_source);
+void virtio_input_destroy(virtio_input_state_t *vinput);
 
-/* Drain translated host window events and update guest-visible virtio-input
- * device state. Must be called from the emulator thread.
+/* Notify virtio-input actors about translated host window events. The SDL/main
+ * thread produces into per-device host queues; input actors consume those
+ * queues and publish guest-visible EVENTQ completions.
  */
 void virtio_input_drain_host_events(void);
 
