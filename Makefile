@@ -231,6 +231,7 @@ OBJS := \
 	ram_access.o \
 	utils.o \
 	mmio-bus.o \
+	platform.o \
 	plic.o \
 	uart.o \
 	main.o \
