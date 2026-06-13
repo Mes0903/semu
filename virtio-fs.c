@@ -17,6 +17,10 @@
 #include "virtio-mmio.h"
 #include "virtq.h"
 
+#ifndef VIRTIO_FS_PREAD
+#define VIRTIO_FS_PREAD pread
+#endif
+
 /* SEMU currently only supports a single virtio-fs device. Although virtio-fs
  * allows multiple mount points if supported by the device, we limit to one for
  * simplicity.
@@ -797,7 +801,9 @@ static int virtio_fs_process_read(virtio_fs_state_t *vfs,
                    ? 0
                    : -EFAULT;
 
-    n = pread(handle->fd, buf, read_in.size, read_in.offset);
+    do {
+        n = VIRTIO_FS_PREAD(handle->fd, buf, read_in.size, read_in.offset);
+    } while (n < 0 && errno == EINTR);
     if (n < 0) {
         int err = errno;
         free(buf);
@@ -1728,7 +1734,11 @@ static void virtio_fs_read_handler(virtio_fs_state_t *vfs,
         return;
     }
 
-    ssize_t n = pread(fd, buf, size, offset);
+    ssize_t n;
+
+    do {
+        n = VIRTIO_FS_PREAD(fd, buf, size, offset);
+    } while (n < 0 && errno == EINTR);
     if (n < 0) {
         struct vfs_resp_header *header_resp =
             (struct vfs_resp_header *) ((uintptr_t) vfs->ram + vq_desc[2].addr);
