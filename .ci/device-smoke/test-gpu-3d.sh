@@ -311,7 +311,7 @@ expect {
 }
 
 expect "# " {
-  send "i=0; status=FAIL; while test \u0024i -lt $env(VGPU3D_XORG_RETRIES); do if test -S /tmp/.X11-unix/X0; then status=READY; break; fi; sleep $env(VGPU3D_XORG_SLEEP); i=\u0024((i + 1)); done; printf \"__VIRGL_XORG_%s__\\n\" \"\u0024status\"\r"
+  send "xorg_glx_ready() { test -S /tmp/.X11-unix/X0 || return 1; for log_file in /tmp/xorg.log /var/log/Xorg.0.0.log /var/log/Xorg.0.log; do if test -f \u0024log_file && grep -Eq 'AIGLX: Loaded and initialized|GLX: Initialized .* GL provider' \u0024log_file; then return 0; fi; done; return 1; }; i=0; status=FAIL; while test \u0024i -lt $env(VGPU3D_XORG_RETRIES); do if xorg_glx_ready; then status=READY; break; fi; sleep $env(VGPU3D_XORG_SLEEP); i=\u0024((i + 1)); done; printf \"__VIRGL_XORG_%s__\\n\" \"\u0024status\"\r"
 } timeout { exit 6 }
 expect {
   -exact "__VIRGL_XORG_READY__" {}
@@ -377,11 +377,22 @@ restart_xorg() {
   echo $! >/tmp/xorg.pid
 }
 
+xorg_glx_ready() {
+  test -S /tmp/.X11-unix/X0 || return 1
+  for log_file in /tmp/xorg.log /var/log/Xorg.0.0.log /var/log/Xorg.0.log; do
+    if test -f "$log_file" &&
+       grep -Eq 'AIGLX: Loaded and initialized|GLX: Initialized .* GL provider' "$log_file"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 wait_for_xorg() {
   i=0
   ready=FAIL
   while test "$i" -lt "$xorg_retries"; do
-    if test -S /tmp/.X11-unix/X0; then
+    if xorg_glx_ready; then
       ready=READY
       break
     fi

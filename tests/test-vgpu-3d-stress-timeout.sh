@@ -57,3 +57,8 @@ if ! grep -q 'eof { exit 10 }' <<<"$repeat_expect_block"; then
     printf '%s\n' 'expected repeat sentinel EOF to exit 10'
     exit 1
 fi
+
+if ! grep -q 'xorg_glx_ready' "$REPO_ROOT/.ci/device-smoke/test-gpu-3d.sh"; then
+    printf '%s\n' 'expected vgpu 3D smoke to wait for Xorg GLX readiness'
+    exit 1
+fi
