@@ -5,6 +5,7 @@
 #if SEMU_HAS(VIRTIONET)
 #include "netdev.h"
 #endif
+#include "ram_access.h"
 #include "riscv.h"
 #include "virtio.h"
 
@@ -580,6 +581,7 @@ typedef struct {
     bool debug;
     _Atomic bool stopped;
     uint32_t *ram;
+    ram_dma_t ram_dma;
     uint32_t *disk;
     vm_t vm;
     plic_state_t plic;

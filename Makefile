@@ -228,6 +228,7 @@ all: $(BIN) minimal.dtb
 OBJS := \
 	riscv.o \
 	ram.o \
+	ram_access.o \
 	utils.o \
 	plic.o \
 	uart.o \

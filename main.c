@@ -43,7 +43,11 @@ static void *io_thread_func(void *arg);
 static bool UNUSED semu_should_use_threaded_runtime(const emu_state_t *emu);
 static semu_wfi_handler_t semu_wfi_handler_for_config(const emu_state_t *emu);
 static volatile sig_atomic_t signal_received = 0;
+static void semu_process_pending_dma_invalidation(hart_t *hart);
 static void semu_process_pending_rfence(hart_t *hart);
+static void semu_ram_dma_write_invalidate(void *opaque,
+                                          guest_paddr_t addr,
+                                          guest_size_t len);
 static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps);
 static int semu_service_hart_step(emu_state_t *emu, hart_t *hart);
 static int semu_run_chunk(emu_state_t *emu, int steps);
@@ -328,6 +332,8 @@ static void UNUSED semu_rfence_ack(emu_state_t *emu)
 
 static void semu_process_pending_rfence(hart_t *hart)
 {
+    semu_process_pending_dma_invalidation(hart);
+
     if (!hart_pending_rfence_load(hart))
         return;
 
@@ -1093,6 +1099,38 @@ static sbi_ret_t semu_rfence_request(hart_t *hart,
                                 start_addr, size, asid);
 }
 
+static void semu_process_pending_dma_invalidation(hart_t *hart)
+{
+    if (!hart || !hart->vm)
+        return;
+
+    uint64_t generation = __atomic_load_n(
+        &hart->vm->dma_write_invalidate_generation, __ATOMIC_ACQUIRE);
+    if (hart->dma_write_invalidate_generation_seen == generation)
+        return;
+
+    hart->dma_write_invalidate_generation_seen = generation;
+    semu_apply_rfence(hart, SEMU_RFENCE_I, 0, (uint32_t) -1);
+}
+
+static void semu_ram_dma_write_invalidate(void *opaque,
+                                          guest_paddr_t addr,
+                                          guest_size_t len)
+{
+    emu_state_t *emu = opaque;
+
+    if (!emu || len == 0)
+        return;
+
+    /* DMA reports GPA ranges, while current hart caches are VA keyed. Publish
+     * a VM-wide generation and let harts invalidate locally at safe points.
+     */
+    (void) addr;
+    __atomic_fetch_add(&emu->vm.dma_write_invalidate_generation, 1,
+                       __ATOMIC_RELEASE);
+    semu_signal_all_harts(emu);
+}
+
 static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
 {
     uint32_t hart_mask, hart_mask_base;
@@ -1559,6 +1597,10 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
         perror("reservation lock init");
         return 1;
     }
+
+    ram_dma_init(&emu->ram_dma, emu->ram, RAM_SIZE, vm);
+    ram_dma_set_write_invalidate_callback(&emu->ram_dma,
+                                          semu_ram_dma_write_invalidate, emu);
 
     emu->hart_wait = calloc(vm->n_hart, sizeof(*emu->hart_wait));
     emu->hart_threads = calloc(vm->n_hart, sizeof(*emu->hart_threads));

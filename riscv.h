@@ -191,6 +191,7 @@ struct __hart_internal {
     mmu_cache_set_t cache_load[32];
     mmu_cache_set_t cache_store[32];
     icache_t icache;
+    uint64_t dma_write_invalidate_generation_seen;
 };
 
 typedef struct {
@@ -204,6 +205,7 @@ struct __vm_internel {
     pthread_mutex_t reservation_lock;
     reservation_entry_t *reservations;
     _Atomic bool any_reservation_active;
+    _Atomic uint64_t dma_write_invalidate_generation;
 };
 
 static inline uint32_t hart_sip_load(const hart_t *hart)
