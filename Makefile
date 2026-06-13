@@ -245,6 +245,7 @@ OBJS := \
 	virtio-mmio.o \
 	uart.o \
 	executor-config.o \
+	hart-executor.o \
 	main.o \
 	aclint.o \
 	$(OBJS_EXTRA)

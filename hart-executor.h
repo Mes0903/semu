@@ -57,3 +57,6 @@ int hart_executor_request_rfence(struct emu_state *emu,
 int hart_executor_join(struct emu_state *emu);
 hart_wait_t *hart_executor_wait_for_hart(struct emu_state *emu,
                                          uint32_t hart_id);
+
+void hart_executor_mark_fatal(struct emu_state *emu);
+bool hart_executor_fatal(struct emu_state *emu);

@@ -95,12 +95,13 @@ static inline void emu_stopped_store(emu_state_t *emu, bool value)
 
 static inline bool emu_threaded_fatal_load(const emu_state_t *emu)
 {
-    return __atomic_load_n(&emu->threaded_fatal, __ATOMIC_RELAXED);
+    return hart_executor_fatal((emu_state_t *) emu);
 }
 
 static inline void emu_threaded_fatal_store(emu_state_t *emu, bool value)
 {
-    __atomic_store_n(&emu->threaded_fatal, value, __ATOMIC_RELAXED);
+    if (value)
+        hart_executor_mark_fatal(emu);
 }
 
 static inline uint32_t emu_peripheral_update_ctr_load(emu_state_t *emu)
@@ -176,12 +177,7 @@ static int emu_mutex_init(pthread_mutex_t *lock)
 
 static void semu_signal_hart(emu_state_t *emu, uint32_t hartid)
 {
-    if (!emu->hart_wait || hartid >= emu->vm.n_hart)
-        return;
-
-    pthread_mutex_lock(&emu->hart_wait[hartid].mutex);
-    pthread_cond_signal(&emu->hart_wait[hartid].cond);
-    pthread_mutex_unlock(&emu->hart_wait[hartid].mutex);
+    hart_executor_wake_hart(emu, hartid);
 }
 
 static bool UNUSED semu_hart_has_enabled_interrupt(hart_t *hart)
@@ -259,8 +255,7 @@ static void semu_finish_hsm_park(emu_state_t *emu, hart_t *hart)
 
 static void semu_signal_all_harts(emu_state_t *emu)
 {
-    for (uint32_t i = 0; i < emu->vm.n_hart; i++)
-        semu_signal_hart(emu, i);
+    hart_executor_wake_all(emu);
 }
 
 static bool semu_lifecycle_pause_active(enum semu_vm_lifecycle_state state)
@@ -2205,18 +2200,12 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     ram_dma_set_write_invalidate_callback(&emu->ram_dma,
                                           semu_ram_dma_write_invalidate, emu);
 
-    emu->hart_wait = calloc(vm->n_hart, sizeof(*emu->hart_wait));
-    emu->hart_threads = calloc(vm->n_hart, sizeof(*emu->hart_threads));
-    if (!emu->hart_wait || !emu->hart_threads) {
-        fprintf(stderr, "Failed to allocate threaded hart state.\n");
+    int executor_ret = hart_executor_init(
+        emu, emu->executor_backend, hart_thread_func, io_thread_func, NULL);
+    if (executor_ret < 0) {
+        errno = -executor_ret;
+        perror("hart executor init");
         return 1;
-    }
-    for (uint32_t i = 0; i < vm->n_hart; i++) {
-        if (emu_mutex_init(&emu->hart_wait[i].mutex) ||
-            pthread_cond_init(&emu->hart_wait[i].cond, NULL)) {
-            perror("threaded hart wait init");
-            return 1;
-        }
     }
     for (uint32_t i = 0; i < vm->n_hart; i++) {
         hart_t *newhart = calloc(1, sizeof(hart_t));
@@ -2348,19 +2337,23 @@ static void wfi_handler_threaded(hart_t *hart)
     if (hart_sip_load(hart) & hart_sie_load(hart))
         return;
 
-    pthread_mutex_lock(&emu->hart_wait[id].mutex);
+    hart_wait_t *wait = hart_executor_wait_for_hart(emu, id);
+    if (!wait)
+        return;
+
+    pthread_mutex_lock(&wait->mutex);
     hart_in_wfi_store(hart, true);
     while (!emu_stopped_load(emu) &&
            hart_hsm_status_load(hart) == SBI_HSM_STATE_STARTED) {
-        pthread_mutex_unlock(&emu->hart_wait[id].mutex);
+        pthread_mutex_unlock(&wait->mutex);
         semu_process_pending_rfence(hart);
         if (semu_hart_pause_safe_point(hart) < 0) {
-            pthread_mutex_lock(&emu->hart_wait[id].mutex);
+            pthread_mutex_lock(&wait->mutex);
             break;
         }
         emu_update_timer_interrupt(hart);
         emu_update_swi_interrupt(hart);
-        pthread_mutex_lock(&emu->hart_wait[id].mutex);
+        pthread_mutex_lock(&wait->mutex);
 
         if (hart_pending_rfence_load(hart))
             continue;
@@ -2374,11 +2367,10 @@ static void wfi_handler_threaded(hart_t *hart)
             deadline.tv_sec++;
             deadline.tv_nsec -= 1000000000;
         }
-        pthread_cond_timedwait(&emu->hart_wait[id].cond,
-                               &emu->hart_wait[id].mutex, &deadline);
+        pthread_cond_timedwait(&wait->cond, &wait->mutex, &deadline);
     }
     hart_in_wfi_store(hart, false);
-    pthread_mutex_unlock(&emu->hart_wait[id].mutex);
+    pthread_mutex_unlock(&wait->mutex);
 }
 
 static void handle_hsm_resume(hart_t *hart)
@@ -2487,18 +2479,22 @@ static void wait_for_hart_start(emu_state_t *emu,
     (void) initial_state;
     uint32_t id = hart->mhartid;
 
-    pthread_mutex_lock(&emu->hart_wait[id].mutex);
+    hart_wait_t *wait = hart_executor_wait_for_hart(emu, id);
+    if (!wait)
+        return;
+
+    pthread_mutex_lock(&wait->mutex);
     while (!emu_stopped_load(emu) &&
            hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED) {
         if (hart_pending_rfence_load(hart)) {
-            pthread_mutex_unlock(&emu->hart_wait[id].mutex);
+            pthread_mutex_unlock(&wait->mutex);
             semu_process_pending_rfence(hart);
-            pthread_mutex_lock(&emu->hart_wait[id].mutex);
+            pthread_mutex_lock(&wait->mutex);
             continue;
         }
-        pthread_cond_wait(&emu->hart_wait[id].cond, &emu->hart_wait[id].mutex);
+        pthread_cond_wait(&wait->cond, &wait->mutex);
     }
-    pthread_mutex_unlock(&emu->hart_wait[id].mutex);
+    pthread_mutex_unlock(&wait->mutex);
 
     if (!emu_stopped_load(emu))
         semu_process_hsm_resume_if_started(hart);
@@ -2848,26 +2844,14 @@ static void print_mmu_cache_stats(vm_t *vm)
 
 static void semu_run_threaded(emu_state_t *emu)
 {
-    vm_t *vm = &emu->vm;
-    uint32_t created_harts = 0;
-
-    if (pthread_create(&emu->io_thread, NULL, io_thread_func, emu) != 0) {
-        fprintf(stderr, "Failed to create I/O thread\n");
-        emu_threaded_fatal_store(emu, true);
+    int ret = hart_executor_start(emu);
+    if (ret < 0) {
+        errno = -ret;
+        perror("hart executor start");
+        hart_executor_request_stop(emu);
+        hart_executor_join(emu);
         emu->exit_code = 1;
         return;
-    }
-    emu->io_thread_created = true;
-
-    for (uint32_t i = 0; i < vm->n_hart; i++) {
-        if (pthread_create(&emu->hart_threads[i], NULL, hart_thread_func,
-                           vm->hart[i]) != 0) {
-            fprintf(stderr, "Failed to create hart thread %u\n", i);
-            emu_threaded_fatal_store(emu, true);
-            semu_set_stopped(emu, true);
-            break;
-        }
-        created_harts++;
     }
 
     while (!emu_stopped_load(emu)) {
@@ -2878,11 +2862,8 @@ static void semu_run_threaded(emu_state_t *emu)
         poll(NULL, 0, 10);
     }
 
-    semu_set_stopped(emu, true);
-    for (uint32_t i = 0; i < created_harts; i++)
-        pthread_join(emu->hart_threads[i], NULL);
-    if (emu->io_thread_created)
-        pthread_join(emu->io_thread, NULL);
+    hart_executor_request_stop(emu);
+    hart_executor_join(emu);
 
     emu->exit_code = emu_threaded_fatal_load(emu) ? 1 : 0;
 }

@@ -597,6 +597,7 @@ typedef struct emu_state {
     struct semu_vm_lifecycle lifecycle;
     enum semu_executor_mode executor_mode;
     enum hart_executor_backend executor_backend;
+    struct hart_executor executor;
     uint32_t *ram;
     ram_dma_t ram_dma;
     uint32_t *disk;
@@ -658,12 +659,6 @@ typedef struct emu_state {
     pthread_mutex_t mswi_lock;
     sswi_state_t sswi;
     pthread_mutex_t sswi_lock;
-
-    pthread_t *hart_threads;
-    pthread_t io_thread;
-    bool io_thread_created;
-    _Atomic bool threaded_fatal;
-    hart_wait_t *hart_wait;
 
     _Atomic uint32_t peripheral_update_ctr;
     rfence_request_t rfence;
