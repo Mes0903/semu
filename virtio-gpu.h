@@ -251,6 +251,19 @@ PACKED(struct virtio_gpu_resource_unmap_blob {
     uint32_t padding;
 });
 
+PACKED(struct virtio_gpu_set_scanout_blob {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_rect r;
+    uint32_t scanout_id;
+    uint32_t resource_id;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t padding;
+    uint32_t strides[4];
+    uint32_t offsets[4];
+});
+
 #define VIRTIO_GPU_BLOB_MEM_GUEST 0x0001
 #define VIRTIO_GPU_BLOB_MEM_HOST3D 0x0002
 #define VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST 0x0003
@@ -317,6 +330,7 @@ enum virtio_gpu_ctrl_type {
     VIRTIO_GPU_CMD_GET_EDID,
     VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID,
     VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+    VIRTIO_GPU_CMD_SET_SCANOUT_BLOB,
 
     /* 3D commands */
     VIRTIO_GPU_CMD_CTX_CREATE = 0x0200,
@@ -380,7 +394,7 @@ typedef void (*virtio_gpu_cmd_func)(virtio_gpu_state_t *vgpu,
 typedef void (*virtio_gpu_backend_lifecycle_func)(virtio_gpu_state_t *vgpu);
 typedef void (*virtio_gpu_renderer_side_effect_func)(
     virtio_gpu_state_t *vgpu,
-    const struct vgpu_renderer_completion *completion);
+    struct vgpu_renderer_completion *completion);
 
 struct virtio_gpu_cmd_backend {
     virtio_gpu_backend_lifecycle_func reset;
@@ -399,6 +413,7 @@ struct virtio_gpu_cmd_backend {
     virtio_gpu_cmd_func get_edid;
     virtio_gpu_cmd_func resource_assign_uuid;
     virtio_gpu_cmd_func resource_create_blob;
+    virtio_gpu_cmd_func set_scanout_blob;
     /* 3D commands */
     virtio_gpu_cmd_func ctx_create;
     virtio_gpu_cmd_func ctx_destroy;
@@ -520,6 +535,12 @@ void virtio_gpu_virgl_resource_detach_backing_handler(
     virtio_gpu_state_t *vgpu,
     struct virtq_desc *vq_desc,
     uint32_t *plen);
+void virtio_gpu_virgl_set_scanout_handler(virtio_gpu_state_t *vgpu,
+                                          struct virtq_desc *vq_desc,
+                                          uint32_t *plen);
+void virtio_gpu_virgl_set_scanout_blob_handler(virtio_gpu_state_t *vgpu,
+                                               struct virtq_desc *vq_desc,
+                                               uint32_t *plen);
 void virtio_gpu_virgl_transfer_to_host_3d_handler(virtio_gpu_state_t *vgpu,
                                                   struct virtq_desc *vq_desc,
                                                   uint32_t *plen);
@@ -537,9 +558,10 @@ void virtio_gpu_virgl_resource_unmap_blob_handler(virtio_gpu_state_t *vgpu,
                                                   uint32_t *plen);
 bool virtio_gpu_virgl_resource_id_exists(uint32_t resource_id);
 void virtio_gpu_virgl_discard_resource_unref(uint32_t resource_id);
+void virtio_gpu_virgl_invalidate_scanout(uint32_t scanout_id);
 void virtio_gpu_virgl_apply_renderer_side_effect(
     virtio_gpu_state_t *vgpu,
-    const struct vgpu_renderer_completion *completion);
+    struct vgpu_renderer_completion *completion);
 #endif
 void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
                                       struct virtq_desc *vq_desc,

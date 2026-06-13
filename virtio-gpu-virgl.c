@@ -1,6 +1,7 @@
 #include "virtio-gpu-virgl.h"
 
 #include "platform.h"
+#include "vgpu-display.h"
 
 #include <limits.h>
 #include <pthread.h>
@@ -53,6 +54,13 @@ struct vgpu_virgl_renderer_resource {
     struct vgpu_virgl_renderer_resource *next;
 };
 
+struct vgpu_virgl_renderer_scanout {
+    bool active;
+    uint32_t resource_id;
+    uint64_t scanout_generation;
+    struct virtio_gpu_rect rect;
+};
+
 struct vgpu_virgl_box {
     uint32_t x;
     uint32_t y;
@@ -63,6 +71,8 @@ struct vgpu_virgl_box {
 };
 
 static struct vgpu_virgl_renderer_resource *vgpu_virgl_renderer_resources;
+static struct vgpu_virgl_renderer_scanout
+    vgpu_virgl_renderer_scanouts[VIRTIO_GPU_MAX_SCANOUTS];
 
 static struct vgpu_virgl_box vgpu_virgl_box_from_virtio(
     const struct virtio_gpu_box *box)
@@ -265,6 +275,90 @@ bool vgpu_virgl_hostmem_write(uint64_t off, uint8_t width, uint32_t value)
         ptr[i] = (uint8_t) (value >> (i * 8));
     pthread_mutex_unlock(&vgpu_virgl_resource_lock);
     return true;
+}
+
+static void vgpu_virgl_clear_renderer_resource_scanouts(uint32_t resource_id)
+{
+    for (uint32_t i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
+        if (vgpu_virgl_renderer_scanouts[i].active &&
+            vgpu_virgl_renderer_scanouts[i].resource_id == resource_id)
+            vgpu_virgl_renderer_scanouts[i] =
+                (struct vgpu_virgl_renderer_scanout) {0};
+    }
+}
+
+static bool vgpu_virgl_rect_fits_resource(
+    const struct virtio_gpu_rect *rect,
+    const struct virgl_renderer_resource_info *info)
+{
+    return rect && info && rect->width != 0 && rect->height != 0 &&
+           info->width != 0 && info->height != 0 && rect->x < info->width &&
+           rect->y < info->height && rect->width <= info->width - rect->x &&
+           rect->height <= info->height - rect->y;
+}
+
+static int vgpu_virgl_record_renderer_scanout_view(
+    struct vgpu_renderer_ctrl_payload *payload,
+    uint32_t scanout_id,
+    uint32_t resource_id,
+    const struct virtio_gpu_rect *rect)
+{
+    const struct virtio_gpu_scanout_info *scanout = &payload->scanout;
+    struct virgl_renderer_resource_info info = {0};
+
+    if (scanout_id >= VIRTIO_GPU_MAX_SCANOUTS || !scanout->enabled)
+        return VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
+    if (!vgpu_virgl_find_renderer_resource(resource_id))
+        return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+    if (!rect || rect->width == 0 || rect->height == 0 ||
+        rect->width > scanout->width || rect->height > scanout->height)
+        return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+    if (virgl_renderer_resource_get_info((int) resource_id, &info) != 0 ||
+        info.tex_id == 0)
+        return VIRTIO_GPU_RESP_ERR_UNSPEC;
+    if (!vgpu_virgl_rect_fits_resource(rect, &info))
+        return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+    payload->has_gl_scanout_payload = true;
+    payload->gl_scanout_payload = (struct vgpu_display_gl_payload) {
+        .texture_id = info.tex_id,
+        .width = info.width,
+        .height = info.height,
+        .src_x = rect->x,
+        .src_y = rect->y,
+        .src_width = rect->width,
+        .src_height = rect->height,
+        .y_0_top = false,
+    };
+
+    vgpu_virgl_renderer_scanouts[scanout_id] =
+        (struct vgpu_virgl_renderer_scanout) {
+            .active = true,
+            .resource_id = resource_id,
+            .scanout_generation = payload->scanout_generation,
+            .rect = *rect,
+        };
+    return VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+static int vgpu_virgl_record_renderer_scanout(
+    struct vgpu_renderer_ctrl_payload *payload)
+{
+    const struct virtio_gpu_set_scanout *cmd = &payload->cmd.set_scanout;
+
+    return vgpu_virgl_record_renderer_scanout_view(payload, cmd->scanout_id,
+                                                   cmd->resource_id, &cmd->r);
+}
+
+static int vgpu_virgl_record_renderer_scanout_blob(
+    struct vgpu_renderer_ctrl_payload *payload)
+{
+    const struct virtio_gpu_set_scanout_blob *cmd =
+        &payload->cmd.set_scanout_blob;
+
+    return vgpu_virgl_record_renderer_scanout_view(payload, cmd->scanout_id,
+                                                   cmd->resource_id, &cmd->r);
 }
 
 static bool vgpu_virgl_fence_stream_matches(
@@ -545,6 +639,8 @@ void vgpu_virgl_reset_renderer(void)
     pthread_mutex_unlock(&vgpu_virgl_lock);
 
     vgpu_virgl_clear_renderer_resources();
+    memset(vgpu_virgl_renderer_scanouts, 0,
+           sizeof(vgpu_virgl_renderer_scanouts));
     virgl_renderer_reset();
 }
 
@@ -631,6 +727,42 @@ static void vgpu_virgl_set_ctrl_side_effect(
         completion->virgl_resource.backing_transition_success =
             response_type == VIRTIO_GPU_RESP_OK_NODATA;
         break;
+    case VIRTIO_GPU_CMD_SET_SCANOUT:
+    case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB: {
+        const bool is_blob =
+            payload->hdr.type == VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
+        const uint32_t scanout_id =
+            is_blob ? payload->cmd.set_scanout_blob.scanout_id
+                    : payload->cmd.set_scanout.scanout_id;
+        const uint32_t resource_id =
+            is_blob ? payload->cmd.set_scanout_blob.resource_id
+                    : payload->cmd.set_scanout.resource_id;
+        const struct virtio_gpu_rect *rect =
+            is_blob ? &payload->cmd.set_scanout_blob.r
+                    : &payload->cmd.set_scanout.r;
+
+        completion->virgl_resource.type =
+            response_type == VIRTIO_GPU_RESP_OK_NODATA
+                ? VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT
+                : VGPU_VIRGL_RESOURCE_SIDE_EFFECT_SET_SCANOUT_ROLLBACK;
+        completion->virgl_resource.scanout_count = 1;
+        completion->virgl_resource.scanouts[0] =
+            (struct vgpu_virgl_scanout_side_effect) {
+                .scanout_id = scanout_id,
+                .scanout_generation = payload->scanout_generation,
+                .resource_generation = payload->resource_generation,
+                .has_gl_payload = payload->has_gl_scanout_payload,
+                .gl_payload = payload->gl_scanout_payload,
+                .scanout = payload->scanout,
+            };
+        completion->virgl_resource.scanouts[0].scanout.primary_resource_id =
+            resource_id;
+        completion->virgl_resource.scanouts[0].scanout.src_x = rect->x;
+        completion->virgl_resource.scanouts[0].scanout.src_y = rect->y;
+        completion->virgl_resource.scanouts[0].scanout.src_w = rect->width;
+        completion->virgl_resource.scanouts[0].scanout.src_h = rect->height;
+        break;
+    }
     default:
         break;
     }
@@ -964,6 +1096,12 @@ static void vgpu_virgl_execute_ctrl_request(
         response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
     }
+    case VIRTIO_GPU_CMD_SET_SCANOUT:
+        response_type = vgpu_virgl_record_renderer_scanout(payload);
+        break;
+    case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
+        response_type = vgpu_virgl_record_renderer_scanout_blob(payload);
+        break;
     case VIRTIO_GPU_CMD_RESOURCE_UNREF: {
         const struct virtio_gpu_res_unref *cmd = &payload->cmd.resource_unref;
         struct vgpu_virgl_renderer_resource *res =
@@ -974,6 +1112,7 @@ static void vgpu_virgl_execute_ctrl_request(
             break;
         }
 
+        vgpu_virgl_clear_renderer_resource_scanouts(cmd->resource_id);
         (void) vgpu_virgl_remove_renderer_resource(cmd->resource_id);
         virgl_renderer_resource_unref(cmd->resource_id);
         response_type = VIRTIO_GPU_RESP_OK_NODATA;

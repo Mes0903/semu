@@ -286,6 +286,27 @@ enum vgpu_display_publish_result vgpu_display_publish_primary_set(
     return vgpu_display_push_cmd(&cmd);
 }
 
+enum vgpu_display_publish_result
+vgpu_display_publish_primary_set_next_generation(
+    uint32_t scanout_id,
+    struct vgpu_display_payload *payload)
+{
+    if (__atomic_load_n(&vgpu_display_unavailable, __ATOMIC_ACQUIRE))
+        return VGPU_DISPLAY_PUBLISH_UNAVAILABLE;
+    if (vgpu_display_is_cmd_queue_full())
+        return VGPU_DISPLAY_PUBLISH_QUEUE_FULL;
+
+    uint32_t generation = vgpu_display_advance_plane_generation(
+        &vgpu_display_primary_state[scanout_id]);
+    struct vgpu_display_cmd cmd = {
+        .type = VGPU_DISPLAY_CMD_PRIMARY_SET,
+        .scanout_id = scanout_id,
+        .generation = generation,
+        .u.primary_set = {.payload = payload},
+    };
+    return vgpu_display_push_cmd(&cmd);
+}
+
 enum vgpu_display_publish_result vgpu_display_publish_cursor_set(
     uint32_t scanout_id,
     struct vgpu_display_payload *payload,

@@ -125,6 +125,10 @@ bool vgpu_display_cpu_payload_is_full_texture_update(
 enum vgpu_display_publish_result vgpu_display_publish_primary_set(
     uint32_t scanout_id,
     struct vgpu_display_payload *payload);
+enum vgpu_display_publish_result
+vgpu_display_publish_primary_set_next_generation(
+    uint32_t scanout_id,
+    struct vgpu_display_payload *payload);
 enum vgpu_display_publish_result vgpu_display_publish_cursor_set(
     uint32_t scanout_id,
     struct vgpu_display_payload *payload,

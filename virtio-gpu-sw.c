@@ -961,6 +961,9 @@ static void vgpu_sw_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
             continue;
 
         if (scanout->primary_resource_id == request->resource_id) {
+#if SEMU_HAS(VIRGL)
+            virtio_gpu_virgl_invalidate_scanout(i);
+#endif
             vgpu_scanout_primary_clear_if_published(
                 scanout, clear_result, vgpu_display_primary_generation(i));
         }
@@ -997,6 +1000,14 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
         return;
     }
 
+#if SEMU_HAS(VIRGL)
+    if (request->resource_id != 0 &&
+        virtio_gpu_virgl_resource_id_exists(request->resource_id)) {
+        virtio_gpu_virgl_set_scanout_handler(vgpu, vq_desc, plen);
+        return;
+    }
+#endif
+
     struct virtio_gpu_scanout_info *scanout =
         vgpu_sw_get_scanout(vgpu, request->scanout_id);
     if (!scanout) {
@@ -1021,6 +1032,10 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
         enum vgpu_display_publish_result clear_result =
             vgpu_sw_publish_primary_clear(vgpu, request->scanout_id);
 
+#if SEMU_HAS(VIRGL)
+        if (vgpu_display_lifecycle_publish_succeeded(clear_result))
+            virtio_gpu_virgl_invalidate_scanout(request->scanout_id);
+#endif
         if (!vgpu_scanout_primary_clear_if_published(
                 scanout, clear_result,
                 vgpu_display_primary_generation(request->scanout_id))) {
@@ -1096,6 +1111,14 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
         .height = request->r.height,
     };
 
+#if SEMU_HAS(VIRGL)
+    virtio_gpu_virgl_invalidate_scanout(request->scanout_id);
+#endif
+
+    /* Bind scanout with resource only after the display generation changed, so
+     * older queued frames for the previous binding are stale. SDL keeps any
+     * existing texture until this full resync is successfully published.
+     */
     vgpu_scanout_primary_bind_if_generation_advanced(
         scanout, true, res_2d->resource_id, &src, primary_generation);
     vgpu_sw_mark_primary_full_resync(scanout, primary_generation);
@@ -1808,8 +1831,10 @@ const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
     .resource_assign_uuid = VIRTIO_GPU_CMD_UNDEF,
 #if SEMU_HAS(VIRGL)
     .resource_create_blob = virtio_gpu_virgl_resource_create_blob_handler,
+    .set_scanout_blob = virtio_gpu_virgl_set_scanout_blob_handler,
 #else
     .resource_create_blob = VIRTIO_GPU_CMD_UNDEF,
+    .set_scanout_blob = VIRTIO_GPU_CMD_UNDEF,
 #endif
 #if SEMU_HAS(VIRGL)
     .ctx_create = virtio_gpu_virgl_ctx_create_handler,
