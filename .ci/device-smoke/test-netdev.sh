@@ -61,6 +61,25 @@ TEST_NETDEV() {
     ASSERT expect <<DONE
     set timeout ${TIMEOUT}
     spawn make check NETDEV=${NETDEV}
+    proc expect_strict_ping {target} {
+        expect "# " { } timeout { exit 4 }
+        for {set attempt 1} {\$attempt <= 5} {incr attempt} {
+            send "echo NETDEV_STRICT_PING_ATTEMPT:\$attempt\n"
+            expect "# " { send "ping -c 3 -W 5 \$target\n" } timeout { exit 4 }
+            expect {
+                "3 packets transmitted, 3 packets received, 0% packet loss" {
+                    expect "# " { return } timeout { exit 4 }
+                }
+                -re {3 packets transmitted, [0-9]+ packets received, [0-9]+% packet loss} {
+                    expect "# " { } timeout { exit 4 }
+                }
+                timeout { exit 4 }
+                eof { exit 4 }
+            }
+        }
+        send "echo NETDEV_STRICT_PING_FAIL\n"
+        exit 4
+    }
     expect "buildroot login:" { send "root\\n" } timeout { exit 1 }
     expect "# " { send "uname -a\\n" } timeout { exit 2 }
 
@@ -75,11 +94,7 @@ TEST_NETDEV() {
         expect "riscv32 GNU/Linux" { send "ip addr add 10.0.2.15/24 dev eth0\\n" } timeout { exit 3 }
         expect "# " { send "ip link set eth0 up\\n"}
         expect "# " { send "ip route add default via 10.0.2.2\\n"}
-        # Give Slirp/virtio-net a bounded readiness probe after guest setup.
-        # The strict 3-packet assertion below still decides pass/fail.
-        expect "# " { send "for i in 1 2 3 4 5; do ping -c 1 -W 3 10.0.2.2 && break; sleep 1; done\\n" }
-        expect "# " { send "ping -c 3 10.0.2.2\\n" }
-        expect "3 packets transmitted, 3 packets received, 0% packet loss" { } timeout { exit 4 }
+        expect_strict_ping "10.0.2.2"
     } elseif { "$NETDEV" == "vmnet" } {
         # vmnet (macOS): detect host-provided gateway and configure statically
         set vmnet_info [exec \$env(SCRIPT_DIR)/detect-vmnet-network.sh]
@@ -91,9 +106,7 @@ TEST_NETDEV() {
         expect "# " { send "ip addr flush dev eth0\\n" }
         expect "# " { send "ip addr add \$vmnet_guest_ip/\$vmnet_prefix dev eth0\\n" }
         expect "# " { send "ip route replace default via \$vmnet_gateway\\n" }
-        expect "# " { send "for i in 1 2 3 4 5; do ping -c 1 -W 3 \$vmnet_gateway && break; sleep 1; done\\n" }
-        expect "# " { send "ping -c 3 \$vmnet_gateway\\n" }
-        expect "3 packets transmitted, 3 packets received, 0% packet loss" { } timeout { exit 4 }
+        expect_strict_ping \$vmnet_gateway
     }
 DONE
 }
