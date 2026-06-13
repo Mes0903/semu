@@ -1,4 +1,5 @@
 #include "device.h"
+#include "riscv_private.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -119,6 +120,59 @@ static void dedicated_wake_hart(struct emu_state *emu_opaque, uint32_t hart_id)
     pthread_mutex_unlock(&wait->mutex);
 }
 
+static int dedicated_request_pause(struct emu_state *emu_opaque,
+                                   uint64_t pause_seq,
+                                   const bool *targets)
+{
+    emu_state_t *emu = emu_opaque;
+    if (!dedicated_state(emu) || !emu->vm.hart || !targets)
+        return -EINVAL;
+
+    for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
+        hart_t *hart = emu->vm.hart[i];
+        if (!targets[i] || !hart)
+            continue;
+        hart_pause_request(hart, pause_seq);
+        dedicated_wake_hart(emu_opaque, i);
+    }
+    return 0;
+}
+
+static bool executor_rfence_targets_hart(uint32_t hart_id,
+                                         uint32_t hart_mask,
+                                         uint32_t hart_mask_base)
+{
+    if (hart_mask_base == UINT32_MAX)
+        return true;
+    if (hart_id < hart_mask_base)
+        return false;
+
+    uint32_t offset = hart_id - hart_mask_base;
+    if (offset >= 32)
+        return false;
+    return (hart_mask & (UINT32_C(1) << offset)) != 0;
+}
+
+static int dedicated_request_rfence(struct emu_state *emu_opaque,
+                                    uint32_t hart_mask,
+                                    uint32_t hart_mask_base,
+                                    uint64_t rfence_seq UNUSED)
+{
+    emu_state_t *emu = emu_opaque;
+    if (!dedicated_state(emu) || !emu->vm.hart)
+        return -EINVAL;
+
+    for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
+        hart_t *hart = emu->vm.hart[i];
+        if (!hart ||
+            !executor_rfence_targets_hart(i, hart_mask, hart_mask_base))
+            continue;
+        hart_pending_rfence_store(hart, true);
+        dedicated_wake_hart(emu_opaque, i);
+    }
+    return 0;
+}
+
 static int dedicated_join(struct emu_state *emu_opaque)
 {
     emu_state_t *emu = emu_opaque;
@@ -152,6 +206,21 @@ static void single_request_stop(struct emu_state *emu_opaque)
     emu_stopped_store_executor(emu, true);
 }
 
+static int single_request_pause(struct emu_state *emu_opaque UNUSED,
+                                uint64_t pause_seq UNUSED,
+                                const bool *targets UNUSED)
+{
+    return 0;
+}
+
+static int single_request_rfence(struct emu_state *emu_opaque UNUSED,
+                                 uint32_t hart_mask UNUSED,
+                                 uint32_t hart_mask_base UNUSED,
+                                 uint64_t rfence_seq UNUSED)
+{
+    return 0;
+}
+
 static int noop_join(struct emu_state *emu_opaque UNUSED)
 {
     return 0;
@@ -161,6 +230,8 @@ static const struct hart_executor_ops dedicated_ops = {
     .start = dedicated_start,
     .request_stop = dedicated_request_stop,
     .wake_hart = dedicated_wake_hart,
+    .request_pause = dedicated_request_pause,
+    .request_rfence = dedicated_request_rfence,
     .join = dedicated_join,
 };
 
@@ -168,6 +239,8 @@ static const struct hart_executor_ops single_ops = {
     .start = single_start,
     .request_stop = single_request_stop,
     .wake_hart = NULL,
+    .request_pause = single_request_pause,
+    .request_rfence = single_request_rfence,
     .join = noop_join,
 };
 
@@ -266,18 +339,24 @@ void hart_executor_wake_all(struct emu_state *emu_opaque)
         hart_executor_wake_hart(emu_opaque, i);
 }
 
-int hart_executor_request_pause(struct emu_state *emu UNUSED,
-                                uint64_t pause_seq UNUSED)
+int hart_executor_request_pause(struct emu_state *emu,
+                                uint64_t pause_seq,
+                                const bool *targets)
 {
-    return -ENOTSUP;
+    if (!emu || !emu->executor.ops || !emu->executor.ops->request_pause)
+        return -EINVAL;
+    return emu->executor.ops->request_pause(emu, pause_seq, targets);
 }
 
-int hart_executor_request_rfence(struct emu_state *emu UNUSED,
-                                 uint32_t hart_mask UNUSED,
-                                 uint32_t hart_mask_base UNUSED,
-                                 uint64_t rfence_seq UNUSED)
+int hart_executor_request_rfence(struct emu_state *emu,
+                                 uint32_t hart_mask,
+                                 uint32_t hart_mask_base,
+                                 uint64_t rfence_seq)
 {
-    return -ENOTSUP;
+    if (!emu || !emu->executor.ops || !emu->executor.ops->request_rfence)
+        return -EINVAL;
+    return emu->executor.ops->request_rfence(emu, hart_mask, hart_mask_base,
+                                             rfence_seq);
 }
 
 int hart_executor_join(struct emu_state *emu)

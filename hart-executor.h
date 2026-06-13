@@ -22,7 +22,9 @@ struct hart_executor_ops {
     int (*start)(struct emu_state *emu);
     void (*request_stop)(struct emu_state *emu);
     void (*wake_hart)(struct emu_state *emu, uint32_t hart_id);
-    int (*request_pause)(struct emu_state *emu, uint64_t pause_seq);
+    int (*request_pause)(struct emu_state *emu,
+                         uint64_t pause_seq,
+                         const bool *targets);
     int (*request_rfence)(struct emu_state *emu,
                           uint32_t hart_mask,
                           uint32_t hart_mask_base,
@@ -49,7 +51,9 @@ int hart_executor_start(struct emu_state *emu);
 void hart_executor_request_stop(struct emu_state *emu);
 void hart_executor_wake_hart(struct emu_state *emu, uint32_t hart_id);
 void hart_executor_wake_all(struct emu_state *emu);
-int hart_executor_request_pause(struct emu_state *emu, uint64_t pause_seq);
+int hart_executor_request_pause(struct emu_state *emu,
+                                uint64_t pause_seq,
+                                const bool *targets);
 int hart_executor_request_rfence(struct emu_state *emu,
                                  uint32_t hart_mask,
                                  uint32_t hart_mask_base,
