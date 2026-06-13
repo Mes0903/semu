@@ -1632,6 +1632,7 @@ static void op_amo(hart_t *vm, const decoded_insn_t *decoded)
 
 void vm_init(hart_t *vm)
 {
+    semu_hart_mailbox_init(&vm->mailbox);
     mmu_invalidate(vm);
     vm->ram_load_last_page = 0xFFFFFFFF;
     vm->ram_store_last_page = 0xFFFFFFFF;

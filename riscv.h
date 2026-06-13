@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "hart-mailbox.h"
 #include "utils.h"
 
 /* ERR_EXCEPTION indicates that the instruction has raised one of the
@@ -147,7 +148,7 @@ struct __hart_internal {
     bool s_mode;
     _Atomic uint32_t sie;
     _Atomic uint32_t sip;
-    _Atomic bool pending_rfence;
+    semu_hart_mailbox_t mailbox;
 
     semu_timer_t time;
 
@@ -181,7 +182,6 @@ struct __hart_internal {
 
     vm_t *vm;
     _Atomic int32_t hsm_status;
-    _Atomic bool hsm_resume_pending;
     bool hsm_resume_is_ret;
     int32_t hsm_resume_pc;
     int32_t hsm_resume_opaque;
@@ -258,12 +258,15 @@ static inline void hart_in_wfi_store(hart_t *hart, bool value)
 
 static inline bool hart_pending_rfence_load(const hart_t *hart)
 {
-    return __atomic_load_n(&hart->pending_rfence, __ATOMIC_ACQUIRE);
+    return semu_hart_mailbox_has(&hart->mailbox, SEMU_HART_MAILBOX_RFENCE);
 }
 
 static inline void hart_pending_rfence_store(hart_t *hart, bool value)
 {
-    __atomic_store_n(&hart->pending_rfence, value, __ATOMIC_RELEASE);
+    if (value)
+        semu_hart_mailbox_request(&hart->mailbox, SEMU_HART_MAILBOX_RFENCE);
+    else
+        semu_hart_mailbox_clear(&hart->mailbox, SEMU_HART_MAILBOX_RFENCE);
 }
 
 static inline int32_t hart_hsm_status_load(const hart_t *hart)
@@ -287,12 +290,15 @@ static inline bool hart_hsm_status_compare_exchange(hart_t *hart,
 
 static inline bool hart_hsm_resume_pending_load(const hart_t *hart)
 {
-    return __atomic_load_n(&hart->hsm_resume_pending, __ATOMIC_ACQUIRE);
+    return semu_hart_mailbox_has(&hart->mailbox, SEMU_HART_MAILBOX_HSM_RESUME);
 }
 
 static inline void hart_hsm_resume_pending_store(hart_t *hart, bool value)
 {
-    __atomic_store_n(&hart->hsm_resume_pending, value, __ATOMIC_RELEASE);
+    if (value)
+        semu_hart_mailbox_request(&hart->mailbox, SEMU_HART_MAILBOX_HSM_RESUME);
+    else
+        semu_hart_mailbox_clear(&hart->mailbox, SEMU_HART_MAILBOX_HSM_RESUME);
 }
 
 void vm_init(hart_t *vm);

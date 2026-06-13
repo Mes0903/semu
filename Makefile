@@ -234,6 +234,7 @@ OBJS := \
 	platform.o \
 	plic.o \
 	irq-source.o \
+	hart-mailbox.o \
 	uart.o \
 	main.o \
 	aclint.o \
