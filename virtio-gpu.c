@@ -1186,6 +1186,7 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
     memset(&virtio_gpu_data, 0, sizeof(virtio_gpu_data));
     vgpu->ram = emu->ram;
     vgpu->priv = &virtio_gpu_data;
+    virtio_gpu_sw_backend_init(vgpu);
 
     config = (struct virtio_device_common_config) {
         .emu = emu,

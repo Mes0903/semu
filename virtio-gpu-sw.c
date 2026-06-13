@@ -41,11 +41,13 @@ struct vgpu_sw_resource_2d {
     struct list_head list;
 };
 
-/* Process-wide singleton: semu currently assumes at most one software
- * virtio-gpu backend instance per process.
- */
-static LIST_HEAD(g_vgpu_sw_res_2d_list);
-static size_t g_vgpu_sw_hostmem;
+#define SW(vgpu) (&((vgpu)->sw_backend))
+
+void virtio_gpu_sw_backend_init(virtio_gpu_state_t *vgpu)
+{
+    INIT_LIST_HEAD(&SW(vgpu)->res_2d_list);
+    SW(vgpu)->hostmem = 0;
+}
 
 static size_t vgpu_sw_iov_to_buf(const struct iovec *iov,
                                  unsigned int iov_cnt,
@@ -197,19 +199,22 @@ static bool vgpu_sw_copy_image_from_pages(
     return true;
 }
 
-static void vgpu_sw_destroy_resource_2d(struct vgpu_sw_resource_2d *res_2d)
+static void vgpu_sw_destroy_resource_2d(virtio_gpu_state_t *vgpu,
+                                        struct vgpu_sw_resource_2d *res_2d)
 {
     list_del(&res_2d->list);
-    g_vgpu_sw_hostmem -= res_2d->image_size;
+    SW(vgpu)->hostmem -= res_2d->image_size;
     free(res_2d->image);
     free(res_2d->iovec);
     free(res_2d);
 }
 
-static struct vgpu_sw_resource_2d *vgpu_sw_get_resource_2d(uint32_t resource_id)
+static struct vgpu_sw_resource_2d *vgpu_sw_get_resource_2d(
+    virtio_gpu_state_t *vgpu,
+    uint32_t resource_id)
 {
     struct vgpu_sw_resource_2d *res_2d;
-    list_for_each_entry (res_2d, &g_vgpu_sw_res_2d_list, list) {
+    list_for_each_entry (res_2d, &SW(vgpu)->res_2d_list, list) {
         if (res_2d->resource_id == resource_id)
             return res_2d;
     }
@@ -361,11 +366,11 @@ static void vgpu_sw_reset(virtio_gpu_state_t *vgpu)
     }
 
     struct list_head *curr, *next;
-    list_for_each_safe (curr, next, &g_vgpu_sw_res_2d_list) {
+    list_for_each_safe (curr, next, &SW(vgpu)->res_2d_list) {
         struct vgpu_sw_resource_2d *res_2d =
             list_entry(curr, struct vgpu_sw_resource_2d, list);
 
-        vgpu_sw_destroy_resource_2d(res_2d);
+        vgpu_sw_destroy_resource_2d(vgpu, res_2d);
     }
 }
 
@@ -426,7 +431,7 @@ static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
      * confuse later 'TRANSFER' / 'FLUSH' / 'UNREF' requests that target the
      * same id. Spec explicitly allows the device to fail this.
      */
-    if (vgpu_sw_get_resource_2d(request->resource_id)) {
+    if (vgpu_sw_get_resource_2d(vgpu, request->resource_id)) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX "%s(): resource id %u already in use\n",
                 __func__, request->resource_id);
@@ -523,7 +528,7 @@ static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
     }
 
     if (image_size > VGPU_SW_MAX_HOSTMEM ||
-        g_vgpu_sw_hostmem > VGPU_SW_MAX_HOSTMEM - image_size) {
+        SW(vgpu)->hostmem > VGPU_SW_MAX_HOSTMEM - image_size) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
                 "%s(): image memory limit exceeded (%zu bytes)\n",
@@ -551,8 +556,8 @@ static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
         return;
     }
     res_2d->image_size = image_size;
-    g_vgpu_sw_hostmem += image_size;
-    list_push(&res_2d->list, &g_vgpu_sw_res_2d_list);
+    SW(vgpu)->hostmem += image_size;
+    list_push(&res_2d->list, &SW(vgpu)->res_2d_list);
 
     *plen = virtio_gpu_write_ctrl_response(vgpu, &request->hdr, response_desc,
                                            VIRTIO_GPU_RESP_OK_NODATA);
@@ -581,7 +586,7 @@ static void vgpu_sw_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
     }
 
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(request->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, request->resource_id);
     if (!res_2d) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
@@ -615,7 +620,7 @@ static void vgpu_sw_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
         }
     }
 
-    vgpu_sw_destroy_resource_2d(res_2d);
+    vgpu_sw_destroy_resource_2d(vgpu, res_2d);
 
     *plen = virtio_gpu_write_ctrl_response(vgpu, &request->hdr, response_desc,
                                            VIRTIO_GPU_RESP_OK_NODATA);
@@ -673,7 +678,7 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(request->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, request->resource_id);
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, request->resource_id);
@@ -756,7 +761,7 @@ static void vgpu_sw_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(request->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, request->resource_id);
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, request->resource_id);
@@ -842,7 +847,7 @@ static void vgpu_sw_cmd_transfer_to_host_2d_handler(virtio_gpu_state_t *vgpu,
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(req->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, req->resource_id);
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, req->resource_id);
@@ -1048,7 +1053,7 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
     }
 
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(backing_info->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, backing_info->resource_id);
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, backing_info->resource_id);
@@ -1159,7 +1164,7 @@ static void vgpu_sw_cmd_resource_detach_backing_handler(
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(request->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, request->resource_id);
 
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
@@ -1266,7 +1271,7 @@ static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
 
     /* Update cursor image */
     struct vgpu_sw_resource_2d *res_2d =
-        vgpu_sw_get_resource_2d(cursor->resource_id);
+        vgpu_sw_get_resource_2d(vgpu, cursor->resource_id);
     if (!res_2d) {
         fprintf(stderr, VIRTIO_GPU_LOG_PREFIX "%s(): invalid resource id %u\n",
                 __func__, cursor->resource_id);
