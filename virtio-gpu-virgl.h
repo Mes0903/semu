@@ -27,6 +27,7 @@ struct vgpu_virgl_debug_stats {
 };
 
 int vgpu_virgl_init_renderer(void *cookie);
+void vgpu_virgl_publish_capsets(virtio_gpu_state_t *vgpu);
 void vgpu_virgl_reset_renderer(void);
 bool vgpu_virgl_submit_fence(uint64_t generation,
                              bool context_fence,

@@ -681,18 +681,52 @@ void vgpu_virgl_reset_renderer(void)
     virgl_renderer_reset();
 }
 
-static uint32_t vgpu_virgl_capset_id_for_index(uint32_t capset_index)
+static uint32_t vgpu_virgl_count_capsets(void)
 {
+    uint32_t count = 0;
     uint32_t max_version = 0;
     uint32_t max_size = 0;
-
-    if (capset_index != 0)
-        return 0;
 
     virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL, &max_version,
                                &max_size);
     if (max_version && max_size)
-        return VIRTIO_GPU_CAPSET_VIRGL;
+        count++;
+
+    max_version = 0;
+    max_size = 0;
+    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2, &max_version,
+                               &max_size);
+    if (max_version && max_size)
+        count++;
+
+    return count;
+}
+
+void vgpu_virgl_publish_capsets(virtio_gpu_state_t *vgpu)
+{
+    virtio_gpu_set_num_capsets(vgpu, vgpu_virgl_count_capsets());
+}
+
+static uint32_t vgpu_virgl_capset_id_for_index(uint32_t capset_index)
+{
+    uint32_t max_version = 0;
+    uint32_t max_size = 0;
+    uint32_t index = 0;
+
+    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL, &max_version,
+                               &max_size);
+    if (max_version && max_size) {
+        if (capset_index == index)
+            return VIRTIO_GPU_CAPSET_VIRGL;
+        index++;
+    }
+
+    max_version = 0;
+    max_size = 0;
+    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2, &max_version,
+                               &max_size);
+    if (max_version && max_size && capset_index == index)
+        return VIRTIO_GPU_CAPSET_VIRGL2;
 
     return 0;
 }
@@ -888,7 +922,8 @@ static void vgpu_virgl_execute_ctrl_request(
         uint32_t max_version = 0;
         uint32_t max_size = 0;
 
-        if (cmd->capset_id != VIRTIO_GPU_CAPSET_VIRGL) {
+        if (cmd->capset_id != VIRTIO_GPU_CAPSET_VIRGL &&
+            cmd->capset_id != VIRTIO_GPU_CAPSET_VIRGL2) {
             response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
             break;
         }
@@ -928,7 +963,8 @@ static void vgpu_virgl_execute_ctrl_request(
         const struct virtio_gpu_ctx_create *cmd = &payload->cmd.ctx_create;
         int ret;
 
-        if (cmd->context_init && cmd->context_init != VIRTIO_GPU_CAPSET_VIRGL) {
+        if (cmd->context_init && cmd->context_init != VIRTIO_GPU_CAPSET_VIRGL &&
+            cmd->context_init != VIRTIO_GPU_CAPSET_VIRGL2) {
             response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
             break;
         }
@@ -1440,6 +1476,8 @@ void vgpu_virgl_execute_renderer_request(
         break;
     case VGPU_RENDERER_REQ_RESET:
         vgpu_virgl_reset_renderer();
+        if (request->payload)
+            vgpu_virgl_publish_capsets(request->payload);
         break;
     case VGPU_RENDERER_REQ_CTRL:
         vgpu_virgl_execute_ctrl_request(

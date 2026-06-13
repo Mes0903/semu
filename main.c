@@ -2493,6 +2493,10 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
     bool window_ready =
         g_window.window_init(headless, SCREEN_WIDTH, SCREEN_HEIGHT);
+#if SEMU_HAS(VIRTIOGPU) && SEMU_HAS(VIRGL)
+    if (window_ready && !headless)
+        vgpu_virgl_publish_capsets(&emu->vgpu);
+#endif
 #if SEMU_HAS(VIRTIOGPU)
     if (!window_ready)
         virtio_gpu_disable_virgl_runtime(&emu->vgpu);
