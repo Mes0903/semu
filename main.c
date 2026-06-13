@@ -206,41 +206,45 @@ static void UNUSED semu_resume_hart(emu_state_t *emu, uint32_t hartid)
         semu_signal_hart(emu, hartid);
 }
 
-static void semu_pause_ack_at_safe_point(hart_t *hart)
+static void semu_pause_ack_locked(emu_state_t *emu,
+                                  hart_t *hart,
+                                  uint64_t pause_seq)
 {
-    uint64_t pause_seq = hart_pause_request_seq_load(hart);
     if (pause_seq == 0)
         return;
 
-    semu_process_pending_rfence(hart);
-
-    emu_state_t *emu = PRIV(hart);
-    pthread_mutex_lock(&emu->lifecycle.lock);
     enum semu_vm_lifecycle_state state = emu->lifecycle.state;
     if (semu_lifecycle_pause_active(state) &&
         hart_pause_ack_seq_load(hart) < pause_seq) {
         hart_pause_ack(hart, pause_seq);
         pthread_cond_broadcast(&emu->lifecycle.cond);
     }
-    pthread_mutex_unlock(&emu->lifecycle.lock);
 }
 
 static void semu_finish_hsm_park(emu_state_t *emu, hart_t *hart)
 {
+    bool resume_after_suspend = false;
+
+    semu_process_pending_rfence(hart);
+
+    pthread_mutex_lock(&emu->lifecycle.lock);
     int32_t state = hart_hsm_status_load(hart);
 
     if (state == SBI_HSM_STATE_STOP_PENDING) {
-        semu_pause_ack_at_safe_point(hart);
+        semu_pause_ack_locked(emu, hart, hart_pause_request_seq_load(hart));
         hart_hsm_status_store(hart, SBI_HSM_STATE_STOPPED);
+        pthread_mutex_unlock(&emu->lifecycle.lock);
         return;
     }
 
-    if (state != SBI_HSM_STATE_SUSPEND_PENDING)
-        return;
+    if (state == SBI_HSM_STATE_SUSPEND_PENDING) {
+        semu_pause_ack_locked(emu, hart, hart_pause_request_seq_load(hart));
+        hart_hsm_status_store(hart, SBI_HSM_STATE_SUSPENDED);
+        resume_after_suspend = semu_hart_has_enabled_interrupt(hart);
+    }
+    pthread_mutex_unlock(&emu->lifecycle.lock);
 
-    semu_pause_ack_at_safe_point(hart);
-    hart_hsm_status_store(hart, SBI_HSM_STATE_SUSPENDED);
-    if (semu_hart_has_enabled_interrupt(hart))
+    if (resume_after_suspend)
         semu_resume_hart(emu, hart->mhartid);
 }
 
@@ -473,14 +477,29 @@ static int UNUSED semu_pause_all_harts(emu_state_t *emu)
         return ret;
     }
 
-    uint64_t pause_seq = semu_vm_lifecycle_pause_seq(&emu->lifecycle);
+    ret = pthread_mutex_lock(&emu->lifecycle.lock);
+    if (ret != 0) {
+        free(targets);
+        return -ret;
+    }
+
+    uint64_t pause_seq = emu->lifecycle.pause_seq;
     for (uint32_t i = 0; i < n_hart; i++) {
         hart_t *target = emu->vm.hart[i];
         if (hart_hsm_status_load(target) != SBI_HSM_STATE_STARTED)
             continue;
         targets[i] = true;
         hart_pause_request(target, pause_seq);
-        semu_signal_hart(emu, i);
+    }
+    ret = pthread_mutex_unlock(&emu->lifecycle.lock);
+    if (ret != 0) {
+        free(targets);
+        return -ret;
+    }
+
+    for (uint32_t i = 0; i < n_hart; i++) {
+        if (targets[i])
+            semu_signal_hart(emu, i);
     }
 
     ret = semu_pause_wait_for_targets(emu, targets, pause_seq);

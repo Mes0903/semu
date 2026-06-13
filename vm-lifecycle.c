@@ -347,6 +347,7 @@ int semu_vm_lifecycle_enter_failed(struct semu_vm_lifecycle *lc)
     }
 
     lc->state = SEMU_VM_FAILED;
+    lc->generation++;
     lc->accepting_device_work = false;
     return semu_vm_lifecycle_broadcast_unlock(lc);
 }
