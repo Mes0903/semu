@@ -235,6 +235,7 @@ OBJS := \
 	plic.o \
 	irq-source.o \
 	hart-mailbox.o \
+	semu-event.o \
 	uart.o \
 	main.o \
 	aclint.o \
