@@ -210,6 +210,11 @@ static void virtio_mmio_prepare_activation_request_locked(
     request->pending = true;
 }
 
+/* Transitional lock-order exception: activation still uses backend_lock
+ * before transport_lock while it revalidates generation/status and runs the
+ * activation callback. Reset callbacks run outside common locks. Keep this
+ * path audited when changing activation lock coverage.
+ */
 static int virtio_mmio_complete_activation(
     struct virtio_device_common *common,
     const struct virtio_activation_request *request)
@@ -225,6 +230,7 @@ static int virtio_mmio_complete_activation(
     pthread_mutex_lock(&common->transport_lock);
     status = atomic_load_explicit(&common->status, memory_order_acquire);
     still_current = common->generation == request->ctx.generation &&
+                    !common->reset_in_progress &&
                     (status & VIRTIO_STATUS__DRIVER_OK);
     pthread_mutex_unlock(&common->transport_lock);
 
@@ -243,6 +249,7 @@ static int virtio_mmio_complete_activation(
                                  memory_order_release);
         common->activated = false;
     } else if (common->generation == request->ctx.generation &&
+               !common->reset_in_progress &&
                (status & VIRTIO_STATUS__DRIVER_OK)) {
         common->activated = true;
     }
@@ -280,6 +287,7 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
         }
 
         still_current = common->generation == generation &&
+                        !common->reset_in_progress &&
                         queue_index < common->num_queues &&
                         common->queues[queue_index].ready;
         lifecycle_accepting =
@@ -535,6 +543,10 @@ void virtio_device_common_destroy(struct virtio_device_common *common)
     memset(common, 0, sizeof(*common));
 }
 
+/* Reset uses backend_lock only as a short barrier against in-flight
+ * activation/notify handoff. Callbacks may wait for actor acknowledgement, so
+ * they run after both common locks are released.
+ */
 int virtio_device_common_reset(struct virtio_device_common *common)
 {
     uint64_t old_generation;
@@ -548,23 +560,31 @@ int virtio_device_common_reset(struct virtio_device_common *common)
 
     pthread_mutex_lock(&common->backend_lock);
     pthread_mutex_lock(&common->transport_lock);
+    if (common->reset_in_progress) {
+        pthread_mutex_unlock(&common->transport_lock);
+        pthread_mutex_unlock(&common->backend_lock);
+        return 0;
+    }
+
     old_generation = common->generation;
     new_generation = old_generation + 1;
     common->generation = new_generation;
+    common->reset_in_progress = true;
     ops = common->ops;
     opaque = common->opaque;
     pthread_mutex_unlock(&common->transport_lock);
+    pthread_mutex_unlock(&common->backend_lock);
 
     if (ops && ops->prepare_reset) {
         ret = ops->prepare_reset(opaque, old_generation, new_generation);
         if (ret < 0) {
             pthread_mutex_lock(&common->transport_lock);
             common->activated = false;
+            common->reset_in_progress = false;
             atomic_fetch_or_explicit(&common->status,
                                      VIRTIO_STATUS__DEVICE_NEEDS_RESET,
                                      memory_order_release);
             pthread_mutex_unlock(&common->transport_lock);
-            pthread_mutex_unlock(&common->backend_lock);
             return ret;
         }
     }
@@ -587,7 +607,10 @@ int virtio_device_common_reset(struct virtio_device_common *common)
 
     if (ops && ops->reset)
         ret = ops->reset(opaque, old_generation, new_generation);
-    pthread_mutex_unlock(&common->backend_lock);
+
+    pthread_mutex_lock(&common->transport_lock);
+    common->reset_in_progress = false;
+    pthread_mutex_unlock(&common->transport_lock);
     return ret;
 }
 
@@ -754,6 +777,10 @@ int virtio_mmio_write(struct virtio_device_common *common,
         if (!virtio_mmio_config_width_ok(width))
             return -EINVAL;
         pthread_mutex_lock(&common->transport_lock);
+        if (common->reset_in_progress) {
+            pthread_mutex_unlock(&common->transport_lock);
+            return -EBUSY;
+        }
         ops = common->ops;
         opaque = common->opaque;
         pthread_mutex_unlock(&common->transport_lock);
@@ -781,6 +808,14 @@ int virtio_mmio_write(struct virtio_device_common *common,
         return ret;
     }
     cfg = virtio_mmio_selected_queue_cfg(common);
+
+    if (common->reset_in_progress) {
+        if (byte_offset == VIRTIO_MMIO_REG(QueueNotify))
+            ret = 0;
+        else
+            ret = -EBUSY;
+        goto out_unlock;
+    }
 
     switch (byte_offset) {
     case VIRTIO_MMIO_REG(DeviceFeaturesSel):
@@ -828,6 +863,12 @@ int virtio_mmio_write(struct virtio_device_common *common,
     case VIRTIO_MMIO_REG(QueueNotify):
         if (value >= common->num_queues || !common->queues[value].ready) {
             ret = -EINVAL;
+            break;
+        }
+        if (common->reset_in_progress ||
+            (atomic_load_explicit(&common->status, memory_order_acquire) &
+             VIRTIO_STATUS__DEVICE_NEEDS_RESET)) {
+            /* Reset-canceled notifies are valid guest MMIO stores. */
             break;
         }
         if (!virtio_mmio_notify_lifecycle_accepting(common,
@@ -903,13 +944,13 @@ int virtio_mmio_write(struct virtio_device_common *common,
         break;
     }
 
-    {
-        int unlock_ret = virtio_mmio_unlock_transport(common, notify_write,
-                                                      &notify_transport_order);
+out_unlock: {
+    int unlock_ret = virtio_mmio_unlock_transport(common, notify_write,
+                                                  &notify_transport_order);
 
-        if (ret == 0 && unlock_ret < 0)
-            ret = unlock_ret;
-    }
+    if (ret == 0 && unlock_ret < 0)
+        ret = unlock_ret;
+}
     {
         int unlock_ret = virtio_mmio_unlock_notify_lifecycle_gate(
             common, &notify_lifecycle_gate);

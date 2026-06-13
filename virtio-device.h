@@ -73,6 +73,7 @@ struct virtio_device_common {
     bool initialized;
     bool irq_initialized;
     bool activated;
+    bool reset_in_progress;
 };
 
 struct virtio_device_common_config {
