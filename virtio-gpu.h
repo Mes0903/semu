@@ -15,6 +15,7 @@
 #define VIRTIO_GPU_LOG_PREFIX "[SEMU VGPU] "
 #define VIRTIO_GPU_CMD_UNDEF virtio_gpu_cmd_undefined_handler
 #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
+#define VIRTIO_GPU_FLAG_INFO_RING_IDX (1 << 1)
 
 #define VIRTIO_GPU_F_VIRGL (UINT64_C(1) << 0)
 #define VIRTIO_GPU_F_EDID (UINT64_C(1) << 1)

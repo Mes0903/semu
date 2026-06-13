@@ -7,6 +7,12 @@
 #include <string.h>
 #include <unistd.h>
 
+#if SEMU_HAS(VIRGL)
+#include <epoxy/gl.h>
+
+#include "vgpu-renderer.h"
+#include "virtio-gpu-virgl.h"
+#endif
 #if SEMU_HAS(VIRTIOGPU)
 #include "vgpu-display.h"
 #include "virtio-gpu.h"
@@ -58,6 +64,20 @@ struct sdl_scanout_info {
 
     SDL_Window *window;
     SDL_Renderer *renderer;
+#if SEMU_HAS(VIRGL)
+    SDL_GLContext gl_context;
+    GLuint gl_primary_fb;
+    GLuint gl_primary_cpu_texture;
+    GLuint gl_cursor_texture;
+    uint32_t gl_primary_cpu_width;
+    uint32_t gl_primary_cpu_height;
+    uint32_t gl_cursor_width;
+    uint32_t gl_cursor_height;
+    bool gl_primary_valid;
+    bool gl_primary_cpu_valid;
+    bool gl_cursor_valid;
+    struct vgpu_display_gl_payload gl_primary;
+#endif
 };
 
 static struct sdl_scanout_info sdl_scanouts[VIRTIO_GPU_MAX_SCANOUTS];
@@ -79,6 +99,20 @@ static void window_wake_backend_sw(void)
         (void) bytes_written;
     }
 }
+
+#if SEMU_HAS(VIRGL)
+static void window_wake_renderer_sw(void)
+{
+    if (!sdl_initialized || headless_mode)
+        return;
+
+    SDL_Event event = {
+        .type = SDL_USEREVENT,
+    };
+    int ret = SDL_PushEvent(&event);
+    (void) ret;
+}
+#endif
 
 static void window_shutdown_sw(void)
 {
@@ -185,10 +219,35 @@ static void sdl_plane_info_cleanup(struct sdl_plane_info *plane)
     memset(plane, 0, sizeof(*plane));
 }
 
+#if SEMU_HAS(VIRGL)
+static void sdl_scanout_detach_gl_context(void)
+{
+    int ret = SDL_GL_MakeCurrent(NULL, NULL);
+    (void) ret;
+}
+#endif
+
 static void sdl_scanout_info_cleanup(struct sdl_scanout_info *scanout)
 {
     sdl_plane_info_cleanup(&scanout->primary_plane);
     sdl_plane_info_cleanup(&scanout->cursor_plane);
+
+#if SEMU_HAS(VIRGL)
+    bool gl_current = false;
+    if (scanout->gl_context && scanout->window)
+        gl_current =
+            SDL_GL_MakeCurrent(scanout->window, scanout->gl_context) == 0;
+    if (gl_current && scanout->gl_primary_fb)
+        glDeleteFramebuffers(1, &scanout->gl_primary_fb);
+    if (gl_current && scanout->gl_primary_cpu_texture)
+        glDeleteTextures(1, &scanout->gl_primary_cpu_texture);
+    if (gl_current && scanout->gl_cursor_texture)
+        glDeleteTextures(1, &scanout->gl_cursor_texture);
+    if (gl_current)
+        sdl_scanout_detach_gl_context();
+    if (scanout->gl_context)
+        SDL_GL_DeleteContext(scanout->gl_context);
+#endif
 
     if (scanout->renderer)
         SDL_DestroyRenderer(scanout->renderer);
@@ -196,6 +255,42 @@ static void sdl_scanout_info_cleanup(struct sdl_scanout_info *scanout)
         SDL_DestroyWindow(scanout->window);
 
     memset(scanout, 0, sizeof(*scanout));
+}
+
+static bool sdl_scanout_is_ready(const struct sdl_scanout_info *scanout)
+{
+    if (!scanout || !scanout->window)
+        return false;
+
+#if SEMU_HAS(VIRGL)
+    if (scanout->gl_context)
+        return true;
+#endif
+    return scanout->renderer != NULL;
+}
+
+static void sdl_scanout_clear_primary(struct sdl_scanout_info *scanout)
+{
+    sdl_plane_info_reset(&scanout->primary_plane);
+#if SEMU_HAS(VIRGL)
+    scanout->gl_primary_cpu_width = 0;
+    scanout->gl_primary_cpu_height = 0;
+    scanout->gl_primary_valid = false;
+    scanout->gl_primary_cpu_valid = false;
+#endif
+}
+
+static void sdl_scanout_clear_cursor(struct sdl_scanout_info *scanout)
+{
+    memset(&scanout->cursor_rect, 0, sizeof(scanout->cursor_rect));
+    scanout->cursor_hot_x = 0;
+    scanout->cursor_hot_y = 0;
+    sdl_plane_info_reset(&scanout->cursor_plane);
+#if SEMU_HAS(VIRGL)
+    scanout->gl_cursor_width = 0;
+    scanout->gl_cursor_height = 0;
+    scanout->gl_cursor_valid = false;
+#endif
 }
 
 static bool sdl_plane_info_get_sdl_format(
@@ -441,8 +536,464 @@ static bool sdl_scanout_apply_cursor_frame(
     return true;
 }
 
-static void sdl_scanout_render(const struct sdl_scanout_info *scanout)
+#if SEMU_HAS(VIRGL)
+static bool sdl_scanout_apply_gl_cpu_primary_frame(
+    struct sdl_scanout_info *scanout,
+    const struct vgpu_display_payload *payload)
 {
+    if (!scanout->gl_context || !payload ||
+        payload->type != VGPU_DISPLAY_PAYLOAD_CPU)
+        return false;
+
+    const struct vgpu_display_cpu_payload *frame = &payload->cpu;
+    uint32_t src_sdl_format;
+    if (!sdl_plane_info_get_sdl_format(&scanout->primary_plane, payload,
+                                       &src_sdl_format))
+        return false;
+
+    if (frame->width == 0 || frame->height == 0 || frame->texture_width == 0 ||
+        frame->texture_height == 0 || frame->dst_width == 0 ||
+        frame->dst_height == 0 || frame->dst_width != frame->width ||
+        frame->dst_height != frame->height ||
+        frame->dst_x >= frame->texture_width ||
+        frame->dst_y >= frame->texture_height ||
+        frame->dst_width > frame->texture_width - frame->dst_x ||
+        frame->dst_height > frame->texture_height - frame->dst_y ||
+        frame->texture_width > INT_MAX || frame->texture_height > INT_MAX) {
+        fprintf(stderr,
+                "%s(): invalid GL primary CPU frame metadata payload=%ux%u "
+                "dst=%u,%u %ux%u texture=%ux%u\n",
+                __func__, frame->width, frame->height, frame->dst_x,
+                frame->dst_y, frame->dst_width, frame->dst_height,
+                frame->texture_width, frame->texture_height);
+        return false;
+    }
+
+    uint64_t required_stride = (uint64_t) frame->width * 4u;
+    if (frame->bits_per_pixel != 32 || frame->stride < required_stride ||
+        frame->stride % 4u != 0 || required_stride > INT_MAX ||
+        frame->stride > INT_MAX) {
+        fprintf(stderr,
+                WINDOW_LOG_PREFIX
+                "%s(): unsupported GL primary CPU layout (%u bpp stride=%u "
+                "width=%u)\n",
+                __func__, frame->bits_per_pixel, frame->stride, frame->width);
+        return false;
+    }
+
+    bool full_update = vgpu_display_cpu_payload_is_full_texture_update(frame);
+    bool reuse_texture =
+        scanout->gl_primary_cpu_valid && scanout->gl_primary_cpu_texture &&
+        scanout->gl_primary_cpu_width == frame->texture_width &&
+        scanout->gl_primary_cpu_height == frame->texture_height;
+    if (!full_update && !reuse_texture) {
+        fprintf(stderr,
+                "%s(): rejecting partial GL primary CPU update without "
+                "retained texture\n",
+                __func__);
+        return false;
+    }
+
+    uint64_t rgba_size = required_stride * frame->height;
+    if (rgba_size / frame->height != required_stride || rgba_size > SIZE_MAX) {
+        fprintf(stderr, "%s(): primary conversion size overflow\n", __func__);
+        return false;
+    }
+
+    void *rgba_pixels = SDL_malloc((size_t) rgba_size);
+    if (!rgba_pixels) {
+        fprintf(stderr, "%s(): failed to allocate primary conversion buffer\n",
+                __func__);
+        return false;
+    }
+
+    if (SDL_ConvertPixels((int) frame->width, (int) frame->height,
+                          src_sdl_format, frame->pixels, (int) frame->stride,
+                          SDL_PIXELFORMAT_RGBA32, rgba_pixels,
+                          (int) required_stride) < 0) {
+        fprintf(stderr, "%s(): failed to convert primary pixels: %s\n",
+                __func__, SDL_GetError());
+        SDL_free(rgba_pixels);
+        return false;
+    }
+
+    if (SDL_GL_MakeCurrent(scanout->window, scanout->gl_context) < 0) {
+        fprintf(stderr, "%s(): failed to make GL context current: %s\n",
+                __func__, SDL_GetError());
+        SDL_free(rgba_pixels);
+        return false;
+    }
+
+    GLuint old_texture = scanout->gl_primary_cpu_texture;
+    GLuint texture = old_texture;
+    bool replace_texture = !reuse_texture;
+    if (replace_texture)
+        glGenTextures(1, &texture);
+
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (replace_texture) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) frame->texture_width,
+                     (GLsizei) frame->texture_height, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, NULL);
+    }
+    glTexSubImage2D(GL_TEXTURE_2D, 0, (GLint) frame->dst_x,
+                    (GLint) frame->dst_y, (GLsizei) frame->width,
+                    (GLsizei) frame->height, GL_RGBA, GL_UNSIGNED_BYTE,
+                    rgba_pixels);
+    GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        fprintf(stderr,
+                "%s(): failed to upload GL primary CPU texture error=0x%x\n",
+                __func__, (unsigned) error);
+        if (replace_texture && texture)
+            glDeleteTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        sdl_scanout_detach_gl_context();
+        SDL_free(rgba_pixels);
+        return false;
+    }
+
+    if (replace_texture && old_texture)
+        glDeleteTextures(1, &old_texture);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    sdl_scanout_detach_gl_context();
+    SDL_free(rgba_pixels);
+
+    scanout->gl_primary_cpu_texture = texture;
+    scanout->gl_primary_cpu_width = frame->texture_width;
+    scanout->gl_primary_cpu_height = frame->texture_height;
+    scanout->gl_primary_cpu_valid = true;
+    scanout->gl_primary_valid = false;
+    return true;
+}
+
+static bool sdl_scanout_apply_gl_cursor_frame(
+    struct sdl_scanout_info *scanout,
+    const struct vgpu_display_payload *payload,
+    int32_t x,
+    int32_t y,
+    uint32_t hot_x,
+    uint32_t hot_y)
+{
+    if (!scanout->gl_context || !payload ||
+        payload->type != VGPU_DISPLAY_PAYLOAD_CPU)
+        return false;
+
+    const struct vgpu_display_cpu_payload *frame = &payload->cpu;
+    SDL_Rect new_cursor_rect = scanout->cursor_rect;
+    uint32_t src_sdl_format;
+
+    if (!vgpu_display_cpu_payload_is_full_texture_update(frame)) {
+        fprintf(stderr,
+                WINDOW_LOG_PREFIX "%s(): rejecting partial GL cursor update\n",
+                __func__);
+        return false;
+    }
+    if (frame->width == 0 || frame->height == 0 || frame->width > INT_MAX ||
+        frame->height > INT_MAX) {
+        fprintf(stderr,
+                WINDOW_LOG_PREFIX
+                "%s(): cursor size out of GL/SDL range (%ux%u)\n",
+                __func__, frame->width, frame->height);
+        return false;
+    }
+
+    uint64_t required_stride = (uint64_t) frame->width * 4u;
+    if (frame->bits_per_pixel != 32 || frame->stride < required_stride ||
+        frame->stride % 4u != 0) {
+        fprintf(stderr,
+                WINDOW_LOG_PREFIX
+                "%s(): unsupported cursor layout (%u bpp stride=%u width=%u)\n",
+                __func__, frame->bits_per_pixel, frame->stride, frame->width);
+        return false;
+    }
+    if (required_stride > INT_MAX || frame->stride > INT_MAX) {
+        fprintf(stderr,
+                WINDOW_LOG_PREFIX
+                "%s(): cursor pitch out of SDL range (stride=%u row=%" PRIu64
+                ")\n",
+                __func__, frame->stride, required_stride);
+        return false;
+    }
+    if (!sdl_plane_info_get_sdl_format(&scanout->cursor_plane, payload,
+                                       &src_sdl_format))
+        return false;
+    if (!sdl_cursor_rect_update_position(&new_cursor_rect, x, y, hot_x, hot_y))
+        return false;
+
+    uint64_t rgba_size = required_stride * frame->height;
+    if (rgba_size / frame->height != required_stride || rgba_size > SIZE_MAX) {
+        fprintf(stderr, "%s(): cursor conversion size overflow\n", __func__);
+        return false;
+    }
+
+    void *rgba_pixels = SDL_malloc((size_t) rgba_size);
+    if (!rgba_pixels) {
+        fprintf(stderr, "%s(): failed to allocate cursor conversion buffer\n",
+                __func__);
+        return false;
+    }
+
+    if (SDL_ConvertPixels((int) frame->width, (int) frame->height,
+                          src_sdl_format, frame->pixels, (int) frame->stride,
+                          SDL_PIXELFORMAT_RGBA32, rgba_pixels,
+                          (int) required_stride) < 0) {
+        fprintf(stderr, "%s(): failed to convert cursor pixels: %s\n", __func__,
+                SDL_GetError());
+        SDL_free(rgba_pixels);
+        return false;
+    }
+
+    if (SDL_GL_MakeCurrent(scanout->window, scanout->gl_context) < 0) {
+        fprintf(stderr, "%s(): failed to make GL context current: %s\n",
+                __func__, SDL_GetError());
+        SDL_free(rgba_pixels);
+        return false;
+    }
+
+    if (!scanout->gl_cursor_texture)
+        glGenTextures(1, &scanout->gl_cursor_texture);
+
+    glBindTexture(GL_TEXTURE_2D, scanout->gl_cursor_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint) frame->width);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) frame->width,
+                 (GLsizei) frame->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 rgba_pixels);
+    GLenum error = glGetError();
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    sdl_scanout_detach_gl_context();
+    SDL_free(rgba_pixels);
+    if (error != GL_NO_ERROR) {
+        fprintf(stderr, "%s(): failed to upload GL cursor texture error=0x%x\n",
+                __func__, (unsigned) error);
+        return false;
+    }
+
+    scanout->cursor_hot_x = hot_x;
+    scanout->cursor_hot_y = hot_y;
+    new_cursor_rect.w = (int) frame->width;
+    new_cursor_rect.h = (int) frame->height;
+    scanout->cursor_rect = new_cursor_rect;
+    scanout->gl_cursor_width = frame->width;
+    scanout->gl_cursor_height = frame->height;
+    scanout->gl_cursor_valid = true;
+
+    return true;
+}
+
+static bool sdl_scanout_validate_gl_frame(
+    const struct vgpu_display_gl_payload *frame)
+{
+    if (!frame || frame->texture_id == 0 || frame->width == 0 ||
+        frame->height == 0 || frame->src_width == 0 || frame->src_height == 0) {
+        fprintf(stderr, "%s(): invalid empty VirGL scanout metadata\n",
+                __func__);
+        return false;
+    }
+
+    if (frame->width > INT_MAX || frame->height > INT_MAX ||
+        frame->src_x >= frame->width || frame->src_y >= frame->height ||
+        frame->src_width > frame->width - frame->src_x ||
+        frame->src_height > frame->height - frame->src_y) {
+        fprintf(stderr,
+                "%s(): invalid VirGL scanout source texture=%ux%u src=%u,%u "
+                "%ux%u\n",
+                __func__, frame->width, frame->height, frame->src_x,
+                frame->src_y, frame->src_width, frame->src_height);
+        return false;
+    }
+
+    return true;
+}
+
+static bool sdl_scanout_apply_gl_frame(
+    struct sdl_scanout_info *scanout,
+    const struct vgpu_display_gl_payload *frame)
+{
+    if (!scanout->gl_context || !sdl_scanout_validate_gl_frame(frame))
+        return false;
+
+    if (SDL_GL_MakeCurrent(scanout->window, scanout->gl_context) < 0) {
+        fprintf(stderr, "%s(): failed to make GL context current: %s\n",
+                __func__, SDL_GetError());
+        return false;
+    }
+
+    if (!scanout->gl_primary_fb)
+        glGenFramebuffers(1, &scanout->gl_primary_fb);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, scanout->gl_primary_fb);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, (GLuint) frame->texture_id, 0);
+    GLenum status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr,
+                "%s(): incomplete VirGL scanout framebuffer status=0x%x\n",
+                __func__, (unsigned) status);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        sdl_scanout_detach_gl_context();
+        return false;
+    }
+
+    scanout->gl_primary = *frame;
+    scanout->gl_primary_valid = true;
+    scanout->gl_primary_cpu_valid = false;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    sdl_scanout_detach_gl_context();
+    return true;
+}
+
+static void sdl_scanout_render_gl_cpu_primary(struct sdl_scanout_info *scanout,
+                                              int window_width,
+                                              int window_height)
+{
+    if (!scanout->gl_primary_cpu_valid || !scanout->gl_primary_cpu_texture)
+        return;
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0.0, (GLdouble) window_width, (GLdouble) window_height, 0.0, -1.0,
+            1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    glDisable(GL_BLEND);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, scanout->gl_primary_cpu_texture);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 0.0f);
+    glVertex2f(0.0f, 0.0f);
+    glTexCoord2f(1.0f, 0.0f);
+    glVertex2f((GLfloat) window_width, 0.0f);
+    glTexCoord2f(1.0f, 1.0f);
+    glVertex2f((GLfloat) window_width, (GLfloat) window_height);
+    glTexCoord2f(0.0f, 1.0f);
+    glVertex2f(0.0f, (GLfloat) window_height);
+    glEnd();
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_TEXTURE_2D);
+}
+
+static void sdl_scanout_render_gl_cursor(struct sdl_scanout_info *scanout,
+                                         int window_width,
+                                         int window_height)
+{
+    if (!scanout->gl_cursor_valid || !scanout->gl_cursor_texture ||
+        scanout->cursor_rect.w <= 0 || scanout->cursor_rect.h <= 0)
+        return;
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0.0, (GLdouble) window_width, (GLdouble) window_height, 0.0, -1.0,
+            1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, scanout->gl_cursor_texture);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+    GLfloat x0 = (GLfloat) scanout->cursor_rect.x;
+    GLfloat y0 = (GLfloat) scanout->cursor_rect.y;
+    GLfloat x1 = (GLfloat) (scanout->cursor_rect.x + scanout->cursor_rect.w);
+    GLfloat y1 = (GLfloat) (scanout->cursor_rect.y + scanout->cursor_rect.h);
+
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 0.0f);
+    glVertex2f(x0, y0);
+    glTexCoord2f(1.0f, 0.0f);
+    glVertex2f(x1, y0);
+    glTexCoord2f(1.0f, 1.0f);
+    glVertex2f(x1, y1);
+    glTexCoord2f(0.0f, 1.0f);
+    glVertex2f(x0, y1);
+    glEnd();
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+}
+
+static void sdl_scanout_render_gl(struct sdl_scanout_info *scanout)
+{
+    if (!scanout->gl_context)
+        return;
+
+    if (SDL_GL_MakeCurrent(scanout->window, scanout->gl_context) < 0)
+        return;
+
+    int width = 0;
+    int height = 0;
+    SDL_GetWindowSize(scanout->window, &width, &height);
+    if (width <= 0 || height <= 0) {
+        sdl_scanout_detach_gl_context();
+        return;
+    }
+
+    glViewport(0, 0, width, height);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (scanout->gl_primary_valid) {
+        const struct vgpu_display_gl_payload *frame = &scanout->gl_primary;
+        GLint src_x0 = (GLint) frame->src_x;
+        GLint src_x1 = (GLint) (frame->src_x + frame->src_width);
+        GLint src_y0 = (GLint) frame->src_y;
+        GLint src_y1 = (GLint) (frame->src_y + frame->src_height);
+
+        /* Y_0_TOP textures are already scanout-oriented. Normal GL-origin
+         * resources need a reversed read rectangle when blitted into the SDL
+         * window framebuffer.
+         */
+        if (!frame->y_0_top) {
+            src_y0 = (GLint) (frame->src_y + frame->src_height);
+            src_y1 = (GLint) frame->src_y;
+        }
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, scanout->gl_primary_fb);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glBlitFramebuffer(src_x0, src_y0, src_x1, src_y1, 0, 0, width, height,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    } else if (scanout->gl_primary_cpu_valid) {
+        sdl_scanout_render_gl_cpu_primary(scanout, width, height);
+    }
+
+    sdl_scanout_render_gl_cursor(scanout, width, height);
+    SDL_GL_SwapWindow(scanout->window);
+    sdl_scanout_detach_gl_context();
+}
+#endif
+
+static void sdl_scanout_render(struct sdl_scanout_info *scanout)
+{
+#if SEMU_HAS(VIRGL)
+    if (scanout->gl_context) {
+        sdl_scanout_render_gl(scanout);
+        return;
+    }
+#endif
+
     SDL_RenderClear(scanout->renderer);
 
     if (scanout->primary_plane.texture)
@@ -470,60 +1021,111 @@ static void window_drain_display_queue(void)
          * command entered the display bridge.
          */
         struct sdl_scanout_info *scanout = &sdl_scanouts[cmd.scanout_id];
-        if (!scanout->window || !scanout->renderer) {
+        if (!sdl_scanout_is_ready(scanout)) {
             vgpu_display_release_cmd(&cmd);
             continue;
         }
 
         switch (cmd.type) {
         case VGPU_DISPLAY_CMD_PRIMARY_CLEAR:
-            sdl_plane_info_reset(&scanout->primary_plane);
+            sdl_scanout_clear_primary(scanout);
             dirty_scanouts[cmd.scanout_id] = true;
             break;
         case VGPU_DISPLAY_CMD_CURSOR_CLEAR:
-            memset(&scanout->cursor_rect, 0, sizeof(scanout->cursor_rect));
-            scanout->cursor_hot_x = 0;
-            scanout->cursor_hot_y = 0;
-            sdl_plane_info_reset(&scanout->cursor_plane);
+            sdl_scanout_clear_cursor(scanout);
             dirty_scanouts[cmd.scanout_id] = true;
             break;
-        case VGPU_DISPLAY_CMD_PRIMARY_SET:
+        case VGPU_DISPLAY_CMD_PRIMARY_SET: {
             /* Use '|=' to keep earlier dirty state for this scanout. A failed
              * upload leaves the old texture visible and does not dirty the
              * scanout by itself.
              */
-            dirty_scanouts[cmd.scanout_id] |= sdl_plane_info_update_texture(
-                scanout->renderer, &scanout->primary_plane,
-                cmd.u.primary_set.payload, "primary");
+            struct vgpu_display_payload *payload = cmd.u.primary_set.payload;
+            if (!payload)
+                break;
+            if (payload->type == VGPU_DISPLAY_PAYLOAD_CPU) {
+#if SEMU_HAS(VIRGL)
+                if (scanout->gl_context) {
+                    dirty_scanouts[cmd.scanout_id] |=
+                        sdl_scanout_apply_gl_cpu_primary_frame(scanout,
+                                                               payload);
+                    break;
+                }
+#endif
+                dirty_scanouts[cmd.scanout_id] |= sdl_plane_info_update_texture(
+                    scanout->renderer, &scanout->primary_plane, payload,
+                    "primary");
+#if SEMU_HAS(VIRGL)
+            } else if (payload->type == VGPU_DISPLAY_PAYLOAD_GL) {
+                dirty_scanouts[cmd.scanout_id] |=
+                    sdl_scanout_apply_gl_frame(scanout, &payload->gl);
+#endif
+            } else {
+                fprintf(stderr, "%s(): unsupported primary payload type %u\n",
+                        __func__, (unsigned) payload->type);
+            }
             break;
+        }
         case VGPU_DISPLAY_CMD_CURSOR_SET:
             /* Use '|=' to keep earlier dirty state for this scanout. A failed
              * upload leaves the old cursor visible and does not dirty the
              * scanout by itself.
              */
+#if SEMU_HAS(VIRGL)
+            if (scanout->gl_context) {
+                dirty_scanouts[cmd.scanout_id] |=
+                    sdl_scanout_apply_gl_cursor_frame(
+                        scanout, cmd.u.cursor_set.payload, cmd.u.cursor_set.x,
+                        cmd.u.cursor_set.y, cmd.u.cursor_set.hot_x,
+                        cmd.u.cursor_set.hot_y);
+                break;
+            }
+#endif
             dirty_scanouts[cmd.scanout_id] |= sdl_scanout_apply_cursor_frame(
                 scanout, cmd.u.cursor_set.payload, cmd.u.cursor_set.x,
                 cmd.u.cursor_set.y, cmd.u.cursor_set.hot_x,
                 cmd.u.cursor_set.hot_y);
             break;
-        case VGPU_DISPLAY_CMD_CURSOR_MOVE:
+        case VGPU_DISPLAY_CMD_CURSOR_MOVE: {
+            int old_cursor_x = scanout->cursor_rect.x;
+            int old_cursor_y = scanout->cursor_rect.y;
             if (!sdl_cursor_rect_update_position(
                     &scanout->cursor_rect, cmd.u.cursor_move.x,
                     cmd.u.cursor_move.y, scanout->cursor_hot_x,
                     scanout->cursor_hot_y))
                 break;
+            if (old_cursor_x == scanout->cursor_rect.x &&
+                old_cursor_y == scanout->cursor_rect.y)
+                break;
+#if SEMU_HAS(VIRGL)
+            if (scanout->gl_context && !scanout->gl_cursor_valid)
+                break;
+#endif
             dirty_scanouts[cmd.scanout_id] = true;
             break;
+        }
         }
 
         vgpu_display_release_cmd(&cmd);
     }
 
     for (uint32_t i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
-        if (!dirty_scanouts[i] || !sdl_scanouts[i].window ||
-            !sdl_scanouts[i].renderer)
+        if (!dirty_scanouts[i] || !sdl_scanout_is_ready(&sdl_scanouts[i]))
             continue;
         sdl_scanout_render(&sdl_scanouts[i]);
+    }
+}
+#endif
+
+#if SEMU_HAS(VIRGL)
+static void window_drain_renderer_queue(void)
+{
+    struct vgpu_renderer_request request;
+
+    while (vgpu_renderer_pop_request(&request)) {
+        vgpu_renderer_debug_note_execute_begin(&request);
+        vgpu_virgl_execute_renderer_request(&request);
+        vgpu_renderer_debug_note_execute_end();
     }
 }
 #endif
@@ -576,6 +1178,9 @@ static void window_main_loop_sw(void)
         }
 #endif
 
+#if SEMU_HAS(VIRGL)
+        window_drain_renderer_queue();
+#endif
 #if SEMU_HAS(VIRTIOGPU)
         window_drain_display_queue();
 #endif
@@ -584,6 +1189,10 @@ static void window_main_loop_sw(void)
 
 static void window_init_sw(bool headless, uint32_t width, uint32_t height)
 {
+#if SEMU_HAS(VIRGL)
+    vgpu_renderer_set_wake_frontend(window_wake_backend_sw);
+#endif
+
     if (headless) {
         headless_mode = true;
 #if SEMU_HAS(VIRTIOGPU)
@@ -604,6 +1213,9 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
         return;
     }
     sdl_initialized = true;
+#if SEMU_HAS(VIRGL)
+    vgpu_renderer_set_wake_renderer(window_wake_renderer_sw);
+#endif
 
 #if SEMU_HAS(VIRTIOGPU)
     /* The current machine setup registers exactly one scanout before calling
@@ -612,9 +1224,18 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
      * scanouts or restored to an explicit per-scanout setup path.
      */
     struct sdl_scanout_info *scanout = &sdl_scanouts[0];
+#if SEMU_HAS(VIRGL)
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#endif
     scanout->window = SDL_CreateWindow("semu", SDL_WINDOWPOS_UNDEFINED,
                                        SDL_WINDOWPOS_UNDEFINED, width, height,
-                                       SDL_WINDOW_SHOWN);
+                                       SDL_WINDOW_SHOWN
+#if SEMU_HAS(VIRGL)
+                                           | SDL_WINDOW_OPENGL
+#endif
+    );
     if (!scanout->window) {
         fprintf(stderr,
                 "window_init_sw(): failed to create SDL window for display "
@@ -628,6 +1249,28 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
         return;
     }
 
+#if SEMU_HAS(VIRGL)
+    scanout->gl_context = SDL_GL_CreateContext(scanout->window);
+    if (!scanout->gl_context ||
+        SDL_GL_MakeCurrent(scanout->window, scanout->gl_context) < 0) {
+        fprintf(stderr,
+                "window_init_sw(): failed to create GL context for display "
+                "0: %s\n"
+                "Running in headless mode.\n",
+                SDL_GetError());
+        if (scanout->gl_context) {
+            SDL_GL_DeleteContext(scanout->gl_context);
+            scanout->gl_context = NULL;
+        }
+        SDL_DestroyWindow(scanout->window);
+        scanout->window = NULL;
+        headless_mode = true;
+        SDL_Quit();
+        sdl_initialized = false;
+        vgpu_display_set_unavailable();
+        return;
+    }
+#else
     scanout->renderer =
         SDL_CreateRenderer(scanout->window, -1, SDL_RENDERER_ACCELERATED);
     if (!scanout->renderer) {
@@ -652,6 +1295,7 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
         vgpu_display_set_unavailable();
         return;
     }
+#endif
 
     scanout->window_width = width;
     scanout->window_height = height;
@@ -662,9 +1306,17 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
         sdl_input_window = scanout->window;
 #endif
 
+#if SEMU_HAS(VIRGL)
+    glViewport(0, 0, (GLsizei) width, (GLsizei) height);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    SDL_GL_SwapWindow(scanout->window);
+    sdl_scanout_detach_gl_context();
+#else
     SDL_SetRenderDrawColor(scanout->renderer, 0, 0, 0, 255);
     SDL_RenderClear(scanout->renderer);
     SDL_RenderPresent(scanout->renderer);
+#endif
 #else /* !SEMU_HAS(VIRTIOGPU) */
     sdl_input_window = SDL_CreateWindow("semu", SDL_WINDOWPOS_UNDEFINED,
                                         SDL_WINDOWPOS_UNDEFINED, width, height,
@@ -684,6 +1336,11 @@ static void window_init_sw(bool headless, uint32_t width, uint32_t height)
 
 static void window_cleanup_sw(void)
 {
+#if SEMU_HAS(VIRGL)
+    vgpu_renderer_set_wake_renderer(NULL);
+    vgpu_renderer_set_wake_frontend(NULL);
+#endif
+
 #if SEMU_HAS(VIRTIOINPUT)
     if (sdl_initialized)
         window_set_mouse_grab_sw(false);
@@ -722,6 +1379,63 @@ static void window_cleanup_sw(void)
     headless_mode = false;
     should_exit = false;
 }
+
+#if SEMU_HAS(VIRGL)
+virgl_renderer_gl_context vgpu_window_virgl_create_context(
+    int scanout_idx,
+    struct virgl_renderer_gl_ctx_param *param)
+{
+    if (scanout_idx < 0 || scanout_idx >= VIRTIO_GPU_MAX_SCANOUTS)
+        return NULL;
+
+    struct sdl_scanout_info *scanout = &sdl_scanouts[scanout_idx];
+    if (!scanout->window || !scanout->gl_context)
+        return NULL;
+
+    if (SDL_GL_MakeCurrent(scanout->window, scanout->gl_context) < 0)
+        return NULL;
+
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+    if (param) {
+        if (param->major_ver)
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, param->major_ver);
+        if (param->minor_ver)
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, param->minor_ver);
+        if (param->compat_ctx)
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                                SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+    }
+
+    virgl_renderer_gl_context ctx = SDL_GL_CreateContext(scanout->window);
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+    sdl_scanout_detach_gl_context();
+    return ctx;
+}
+
+void vgpu_window_virgl_destroy_context(virgl_renderer_gl_context ctx)
+{
+    if (ctx)
+        SDL_GL_DeleteContext(ctx);
+}
+
+int vgpu_window_virgl_make_current(int scanout_idx,
+                                   virgl_renderer_gl_context ctx)
+{
+    if (scanout_idx < 0 || scanout_idx >= VIRTIO_GPU_MAX_SCANOUTS)
+        return -1;
+
+    if (!ctx) {
+        sdl_scanout_detach_gl_context();
+        return 0;
+    }
+
+    struct sdl_scanout_info *scanout = &sdl_scanouts[scanout_idx];
+    if (!scanout->window)
+        return -1;
+
+    return SDL_GL_MakeCurrent(scanout->window, ctx);
+}
+#endif
 
 const struct window_backend g_window = {
     .window_init = window_init_sw,

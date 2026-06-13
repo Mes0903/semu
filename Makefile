@@ -240,6 +240,9 @@ ifeq ($(call has, VIRTIOGPU), 1)
     OBJS_EXTRA += vgpu-display.o
     OBJS_EXTRA += vgpu-rect.o
     OBJS_EXTRA += vgpu-renderer.o
+    ifeq ($(call has, VIRGL), 1)
+        OBJS_EXTRA += virtio-gpu-virgl.o
+    endif
 endif
 
 ifneq ($(filter 1,$(call has, VIRTIOGPU) $(call has, VIRTIOINPUT)),)
