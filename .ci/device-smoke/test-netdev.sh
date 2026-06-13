@@ -75,6 +75,9 @@ TEST_NETDEV() {
         expect "riscv32 GNU/Linux" { send "ip addr add 10.0.2.15/24 dev eth0\\n" } timeout { exit 3 }
         expect "# " { send "ip link set eth0 up\\n"}
         expect "# " { send "ip route add default via 10.0.2.2\\n"}
+        # Give Slirp/virtio-net a bounded readiness probe after guest setup.
+        # The strict 3-packet assertion below still decides pass/fail.
+        expect "# " { send "for i in 1 2 3 4 5; do ping -c 1 -W 3 10.0.2.2 && break; sleep 1; done\\n" }
         expect "# " { send "ping -c 3 10.0.2.2\\n" }
         expect "3 packets transmitted, 3 packets received, 0% packet loss" { } timeout { exit 4 }
     } elseif { "$NETDEV" == "vmnet" } {

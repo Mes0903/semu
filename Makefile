@@ -449,6 +449,8 @@ DISKIMG_OPT := $(if $(DISKIMG_FILE),-d $(DISKIMG_FILE))
 VIRTIOFS_OPT := $(if $(filter 1,$(call has,VIRTIOFS)),-s $(SHARED_DIRECTORY))
 SMP_OPT := -c $(SMP)
 NETDEV_OPT := $(if $(NETDEV),-n $(NETDEV))
+EXECUTOR ?=
+EXECUTOR_OPT := $(if $(EXECUTOR),--executor=$(EXECUTOR))
 
 .PHONY: bench-login
 bench-login: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE)
@@ -456,7 +458,7 @@ bench-login: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE)
 
 check: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE) $(SHARED_DIRECTORY)
 	@$(call notice, Ready to launch Linux kernel. Please be patient.)
-	$(Q)./$(BIN) $(strip $(KERNEL_OPT) $(DTB_OPT) $(HEADLESS_OPT) $(INITRD_OPT) $(DISKIMG_OPT) $(VIRTIOFS_OPT) $(SMP_OPT) $(NETDEV_OPT))
+	$(Q)./$(BIN) $(strip $(KERNEL_OPT) $(DTB_OPT) $(HEADLESS_OPT) $(INITRD_OPT) $(DISKIMG_OPT) $(VIRTIOFS_OPT) $(SMP_OPT) $(EXECUTOR_OPT) $(NETDEV_OPT))
 
 ARTIFACTS ?= all
 .PHONY: build-artifacts
