@@ -65,6 +65,36 @@ extern const struct virtio_gpu_cmd_backend g_virtio_gpu_backend;
 static virtio_gpu_data_t virtio_gpu_data;
 static bool virtio_gpu_instance_initialized;
 
+static struct virtio_gpu_sw_display_counters
+virtio_gpu_display_counters_snapshot(
+    const struct virtio_gpu_sw_display_counter_storage *counters)
+{
+    return (struct virtio_gpu_sw_display_counters) {
+        .full_frame_bytes =
+            virtio_gpu_debug_counter_load(&counters->full_frame_bytes),
+        .dirty_rect_bytes =
+            virtio_gpu_debug_counter_load(&counters->dirty_rect_bytes),
+        .queue_backpressure =
+            virtio_gpu_debug_counter_load(&counters->queue_backpressure),
+        .dirty_merges = virtio_gpu_debug_counter_load(&counters->dirty_merges),
+        .full_resync_escalations =
+            virtio_gpu_debug_counter_load(&counters->full_resync_escalations),
+    };
+}
+
+struct virtio_gpu_debug_counters virtio_gpu_debug_counters(
+    virtio_gpu_state_t *vgpu)
+{
+    struct virtio_gpu_debug_counters counters = {0};
+
+    if (!vgpu)
+        return counters;
+
+    counters.display = virtio_gpu_display_counters_snapshot(
+        &vgpu->sw_backend.display_counters);
+    return counters;
+}
+
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
                                    uint32_t addr,
                                    uint32_t size)

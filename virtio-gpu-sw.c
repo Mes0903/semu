@@ -44,10 +44,24 @@ struct vgpu_sw_resource_2d {
 
 #define SW(vgpu) (&((vgpu)->sw_backend))
 
+static void vgpu_sw_display_counters_reset(virtio_gpu_state_t *vgpu)
+{
+    virtio_gpu_debug_counter_store(&SW(vgpu)->display_counters.full_frame_bytes,
+                                   0);
+    virtio_gpu_debug_counter_store(&SW(vgpu)->display_counters.dirty_rect_bytes,
+                                   0);
+    virtio_gpu_debug_counter_store(
+        &SW(vgpu)->display_counters.queue_backpressure, 0);
+    virtio_gpu_debug_counter_store(&SW(vgpu)->display_counters.dirty_merges, 0);
+    virtio_gpu_debug_counter_store(
+        &SW(vgpu)->display_counters.full_resync_escalations, 0);
+}
+
 void virtio_gpu_sw_backend_init(virtio_gpu_state_t *vgpu)
 {
     INIT_LIST_HEAD(&SW(vgpu)->res_2d_list);
     SW(vgpu)->hostmem = 0;
+    vgpu_sw_display_counters_reset(vgpu);
 }
 
 static size_t vgpu_sw_iov_to_buf(const struct iovec *iov,
@@ -239,6 +253,22 @@ static bool vgpu_sw_can_publish_command(virtio_gpu_state_t *vgpu)
     return virtio_gpu_actor_drain_current(vgpu);
 }
 
+static void vgpu_sw_count_publish_backpressure(
+    virtio_gpu_state_t *vgpu,
+    enum vgpu_display_publish_result result)
+{
+    if (result == VGPU_DISPLAY_PUBLISH_QUEUE_FULL ||
+        result == VGPU_DISPLAY_PUBLISH_BACKPRESSURE)
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.queue_backpressure);
+}
+
+static void vgpu_sw_count_can_publish_false(virtio_gpu_state_t *vgpu)
+{
+    virtio_gpu_debug_counter_inc(
+        &SW(vgpu)->display_counters.queue_backpressure);
+}
+
 static enum vgpu_display_publish_result vgpu_sw_publish_primary_clear(
     virtio_gpu_state_t *vgpu,
     uint32_t scanout_id)
@@ -426,11 +456,14 @@ static void vgpu_sw_accumulate_primary_dirty(
     struct vgpu_dirty_rect merged;
     if (vgpu_dirty_rect_merge_exact(&dirty->rect, src_rect, &merged)) {
         dirty->rect = merged;
+        virtio_gpu_debug_counter_inc(&SW(vgpu)->display_counters.dirty_merges);
         return;
     }
 
     dirty->needs_full_resync = true;
     dirty->rect = vgpu_sw_scanout_src_rect(scanout);
+    virtio_gpu_debug_counter_inc(
+        &SW(vgpu)->display_counters.full_resync_escalations);
 }
 
 static struct vgpu_display_payload *vgpu_sw_create_window_payload(
@@ -572,25 +605,40 @@ static enum vgpu_display_publish_result vgpu_sw_publish_pending_primary_dirty(
     } else if (!vgpu_rect_compute_update(&scanout_src, &dirty->rect, &update)) {
         dirty->needs_full_resync = true;
         dirty->rect = scanout_src;
+        virtio_gpu_debug_counter_inc(
+            &SW(vgpu)->display_counters.full_resync_escalations);
         if (!vgpu_rect_compute_full_update(&scanout_src, &update))
             return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
     }
 
-    if (!vgpu_sw_can_publish_command(vgpu))
+    if (!vgpu_sw_can_publish_command(vgpu)) {
+        vgpu_sw_count_can_publish_false(vgpu);
         return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
+    }
 
+    bool full_frame_payload = update.dst.x == 0 && update.dst.y == 0 &&
+                              update.dst.width == scanout_src.width &&
+                              update.dst.height == scanout_src.height;
     struct vgpu_display_payload *payload = vgpu_sw_create_window_payload(
         res_2d, &update, scanout_src.width, scanout_src.height, "primary");
     if (!payload)
         return VGPU_DISPLAY_PUBLISH_BACKPRESSURE;
 
+    uint64_t bytes = (uint64_t) payload->cpu.stride * payload->cpu.height;
     enum vgpu_display_publish_result result =
         vgpu_sw_publish_primary_set(vgpu, scanout_id, payload);
     if (result != VGPU_DISPLAY_PUBLISH_OK) {
+        vgpu_sw_count_publish_backpressure(vgpu, result);
         free(payload);
         return result;
     }
 
+    if (dirty->needs_full_resync || full_frame_payload)
+        virtio_gpu_debug_counter_add(
+            &SW(vgpu)->display_counters.full_frame_bytes, bytes);
+    else
+        virtio_gpu_debug_counter_add(
+            &SW(vgpu)->display_counters.dirty_rect_bytes, bytes);
     vgpu_sw_reset_primary_dirty_state(
         scanout, vgpu_display_primary_generation(scanout_id));
     return VGPU_DISPLAY_PUBLISH_OK;
@@ -637,6 +685,8 @@ static void vgpu_sw_reset(virtio_gpu_state_t *vgpu)
 
         vgpu_sw_destroy_resource_2d(vgpu, res_2d);
     }
+
+    vgpu_sw_display_counters_reset(vgpu);
 }
 
 static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
@@ -872,6 +922,7 @@ static void vgpu_sw_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
     enum vgpu_display_publish_result clear_result =
         vgpu_sw_publish_resource_unref_clears(vgpu, request->resource_id);
     if (!vgpu_display_lifecycle_publish_succeeded(clear_result)) {
+        vgpu_sw_count_publish_backpressure(vgpu, clear_result);
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
                 "%s(): failed to clear visible resource %u before unref\n",
@@ -953,6 +1004,7 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
         if (!vgpu_scanout_primary_clear_if_published(
                 scanout, clear_result,
                 vgpu_display_primary_generation(request->scanout_id))) {
+            vgpu_sw_count_publish_backpressure(vgpu, clear_result);
             fprintf(stderr,
                     VIRTIO_GPU_LOG_PREFIX
                     "%s(): failed to disable scanout %u; keeping binding\n",
@@ -1012,8 +1064,10 @@ static void vgpu_sw_cmd_set_scanout_handler(virtio_gpu_state_t *vgpu,
 
     uint32_t primary_generation;
     if (!vgpu_sw_advance_primary_generation(vgpu, request->scanout_id,
-                                            &primary_generation))
+                                            &primary_generation)) {
+        vgpu_sw_count_can_publish_false(vgpu);
         goto leave;
+    }
 
     struct vgpu_dirty_rect src = {
         .x = request->r.x,
@@ -1612,6 +1666,7 @@ static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
      * a clear.
      */
     if (!vgpu_sw_can_publish_command(vgpu)) {
+        vgpu_sw_count_can_publish_false(vgpu);
         *plen = 0;
         return;
     }
@@ -1634,6 +1689,7 @@ static void vgpu_sw_cmd_update_cursor_handler(virtio_gpu_state_t *vgpu,
     if (result == VGPU_DISPLAY_PUBLISH_OK) {
         scanout->cursor_resource_id = cursor->resource_id;
     } else {
+        vgpu_sw_count_publish_backpressure(vgpu, result);
         free(payload);
     }
 

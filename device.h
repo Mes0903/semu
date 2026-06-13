@@ -1,6 +1,7 @@
 #pragma once
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -295,9 +296,30 @@ bool virtio_input_irq_pending(virtio_input_state_t *vinput);
 #define IRQ_VGPU 9
 #define IRQ_VGPU_BIT (1 << IRQ_VGPU)
 
+struct virtio_gpu_sw_display_counters {
+    uint64_t full_frame_bytes;
+    uint64_t dirty_rect_bytes;
+    uint64_t queue_backpressure;
+    uint64_t dirty_merges;
+    uint64_t full_resync_escalations;
+};
+
+struct virtio_gpu_debug_counters {
+    struct virtio_gpu_sw_display_counters display;
+};
+
+struct virtio_gpu_sw_display_counter_storage {
+    _Atomic uint64_t full_frame_bytes;
+    _Atomic uint64_t dirty_rect_bytes;
+    _Atomic uint64_t queue_backpressure;
+    _Atomic uint64_t dirty_merges;
+    _Atomic uint64_t full_resync_escalations;
+};
+
 struct virtio_gpu_sw_backend_state {
     struct list_head res_2d_list;
     size_t hostmem;
+    struct virtio_gpu_sw_display_counter_storage display_counters;
 };
 
 typedef struct {
