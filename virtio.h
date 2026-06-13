@@ -10,6 +10,7 @@
 
 #define VIRTIO_DESC_F_NEXT 1
 #define VIRTIO_DESC_F_WRITE 2
+#define VIRTIO_DESC_F_INDIRECT 4
 
 #define VIRTIO_BLK_T_IN 0
 #define VIRTIO_BLK_T_OUT 1
