@@ -395,7 +395,7 @@ void mmu_invalidate_range(hart_t *vm, uint32_t start_addr, uint32_t size)
 /* Pre-verify the root page table to minimize page table access during
  * translation time.
  */
-static void mmu_set(hart_t *vm, uint32_t satp)
+void mmu_set_satp(hart_t *vm, uint32_t satp)
 {
     mmu_invalidate(vm);
     if (satp >> 31) {
@@ -1303,7 +1303,7 @@ static void csr_write(hart_t *vm, uint16_t addr, uint32_t value)
         vm->stvec_vectored = (value & (1 << (0))) != 0;
         break;
     case RV_CSR_SATP:
-        mmu_set(vm, value);
+        mmu_set_satp(vm, value);
         break;
     case RV_CSR_SCOUNTEREN:
         vm->scounteren = value;
