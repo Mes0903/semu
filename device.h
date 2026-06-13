@@ -33,7 +33,7 @@ void ram_write(hart_t *core,
 
 /* PLIC */
 
-typedef struct {
+typedef struct plic_state {
     uint32_t masked;
     uint32_t ip;     /* support 32 interrupt sources only */
     uint32_t ie[32]; /* support 32 sources to 32 contexts only */
@@ -41,6 +41,10 @@ typedef struct {
     uint32_t active;
 } plic_state_t;
 
+bool plic_set_source_level(vm_t *vm,
+                           plic_state_t *plic,
+                           uint32_t source_id,
+                           bool level);
 void plic_update_interrupts(vm_t *vm, plic_state_t *plic);
 void plic_read(hart_t *core,
                plic_state_t *plic,
@@ -577,7 +581,7 @@ typedef struct {
     pthread_cond_t cond;
 } hart_wait_t;
 
-typedef struct {
+typedef struct emu_state {
     int exit_code;
     bool debug;
     _Atomic bool stopped;

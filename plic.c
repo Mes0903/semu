@@ -69,6 +69,24 @@ void plic_update_interrupts(vm_t *vm, plic_state_t *plic)
     }
 }
 
+
+bool plic_set_source_level(vm_t *vm,
+                           plic_state_t *plic,
+                           uint32_t source_id,
+                           bool level)
+{
+    if (!vm || !plic || source_id == 0 || source_id >= 32)
+        return false;
+
+    uint32_t bit = UINT32_C(1) << source_id;
+    if (level)
+        plic->active |= bit;
+    else
+        plic->active &= ~bit;
+    plic_update_interrupts(vm, plic);
+    return true;
+}
+
 static bool plic_reg_read(plic_state_t *plic, uint32_t addr, uint32_t *value)
 {
     /* no priority support: source priority hardwired to 1 */

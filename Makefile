@@ -233,6 +233,7 @@ OBJS := \
 	mmio-bus.o \
 	platform.o \
 	plic.o \
+	irq-source.o \
 	uart.o \
 	main.o \
 	aclint.o \
