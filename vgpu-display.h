@@ -11,12 +11,17 @@
 
 /* Immutable CPU-frame payload published by the VirtIO GPU backend and later
  * consumed by the window backend when it uploads pixels into its own textures.
+ * 'width'/'height' describe the packed payload pixels. 'texture_*' is
+ * the retained texture size for the plane, and 'dst_*' describes the
+ * destination rectangle inside that texture.
  */
 struct vgpu_display_cpu_payload {
     enum virtio_gpu_formats format;
     uint32_t width, height;
     uint32_t stride;
     uint32_t bits_per_pixel;
+    uint32_t texture_width, texture_height;
+    uint32_t dst_x, dst_y, dst_width, dst_height;
     uint8_t *pixels;
 };
 
@@ -104,6 +109,8 @@ void vgpu_display_set_unavailable(void);
  */
 void vgpu_display_shutdown_after_producer_stopped(void);
 bool vgpu_display_can_publish(void);
+bool vgpu_display_cpu_payload_is_full_texture_update(
+    const struct vgpu_display_cpu_payload *payload);
 enum vgpu_display_publish_result vgpu_display_publish_primary_set(
     uint32_t scanout_id,
     struct vgpu_display_payload *payload);

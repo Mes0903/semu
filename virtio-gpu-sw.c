@@ -518,6 +518,12 @@ static struct vgpu_display_payload *vgpu_sw_create_window_payload(
     payload->cpu.height = height;
     payload->cpu.stride = (uint32_t) row_bytes;
     payload->cpu.bits_per_pixel = res_2d->bits_per_pixel;
+    payload->cpu.texture_width = width;
+    payload->cpu.texture_height = height;
+    payload->cpu.dst_x = 0;
+    payload->cpu.dst_y = 0;
+    payload->cpu.dst_width = width;
+    payload->cpu.dst_height = height;
     payload->cpu.pixels = (uint8_t *) (payload + 1);
 
     /* The cropped view is contiguous only when the source stride matches this

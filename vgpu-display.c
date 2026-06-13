@@ -258,6 +258,18 @@ bool vgpu_display_can_publish(void)
            !vgpu_display_is_cmd_queue_full();
 }
 
+
+bool vgpu_display_cpu_payload_is_full_texture_update(
+    const struct vgpu_display_cpu_payload *payload)
+{
+    return payload && payload->texture_width != 0 &&
+           payload->texture_height != 0 && payload->dst_x == 0 &&
+           payload->dst_y == 0 && payload->width == payload->texture_width &&
+           payload->height == payload->texture_height &&
+           payload->dst_width == payload->texture_width &&
+           payload->dst_height == payload->texture_height;
+}
+
 enum vgpu_display_publish_result vgpu_display_publish_primary_set(
     uint32_t scanout_id,
     struct vgpu_display_payload *payload)
