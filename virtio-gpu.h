@@ -478,6 +478,15 @@ void virtio_gpu_virgl_resource_detach_backing_handler(
     virtio_gpu_state_t *vgpu,
     struct virtq_desc *vq_desc,
     uint32_t *plen);
+void virtio_gpu_virgl_transfer_to_host_3d_handler(virtio_gpu_state_t *vgpu,
+                                                  struct virtq_desc *vq_desc,
+                                                  uint32_t *plen);
+void virtio_gpu_virgl_transfer_from_host_3d_handler(virtio_gpu_state_t *vgpu,
+                                                    struct virtq_desc *vq_desc,
+                                                    uint32_t *plen);
+void virtio_gpu_virgl_submit_3d_handler(virtio_gpu_state_t *vgpu,
+                                        struct virtq_desc *vq_desc,
+                                        uint32_t *plen);
 bool virtio_gpu_virgl_resource_id_exists(uint32_t resource_id);
 void virtio_gpu_virgl_discard_resource_unref(uint32_t resource_id);
 void virtio_gpu_virgl_apply_renderer_side_effect(

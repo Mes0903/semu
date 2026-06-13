@@ -1824,9 +1824,15 @@ const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
 #else
     .resource_create_3d = VIRTIO_GPU_CMD_UNDEF,
 #endif
+#if SEMU_HAS(VIRGL)
+    .transfer_to_host_3d = virtio_gpu_virgl_transfer_to_host_3d_handler,
+    .transfer_from_host_3d = virtio_gpu_virgl_transfer_from_host_3d_handler,
+    .submit_3d = virtio_gpu_virgl_submit_3d_handler,
+#else
     .transfer_to_host_3d = VIRTIO_GPU_CMD_UNDEF,
     .transfer_from_host_3d = VIRTIO_GPU_CMD_UNDEF,
     .submit_3d = VIRTIO_GPU_CMD_UNDEF,
+#endif
     .resource_map_blob = VIRTIO_GPU_CMD_UNDEF,
     .resource_unmap_blob = VIRTIO_GPU_CMD_UNDEF,
     .update_cursor = vgpu_sw_cmd_update_cursor_handler,
