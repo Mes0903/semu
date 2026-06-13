@@ -1,10 +1,13 @@
 #include <SDL.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #if SEMU_HAS(VIRGL)
@@ -28,6 +31,13 @@ static int wake_write_fd = -1;
 static bool sdl_initialized = false;
 static bool headless_mode = false;
 static bool should_exit = false;
+
+static bool test_window_close_configured = false;
+static bool test_window_close_enabled = false;
+static bool test_window_close_armed = false;
+static uint64_t test_window_close_after_ms = 0;
+static uint64_t test_window_close_deadline_ms = 0;
+static const char *test_window_close_arm_file = NULL;
 
 #if SEMU_HAS(VIRTIOINPUT)
 static bool mouse_grabbed = false;
@@ -127,6 +137,87 @@ static void window_shutdown_sw(void)
 static bool window_is_closed_sw(void)
 {
     return __atomic_load_n(&should_exit, __ATOMIC_RELAXED);
+}
+
+static uint64_t window_test_monotonic_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0;
+
+    return ((uint64_t) now.tv_sec * UINT64_C(1000)) +
+           ((uint64_t) now.tv_nsec / UINT64_C(1000000));
+}
+
+static bool window_test_parse_u64(const char *value, uint64_t *parsed)
+{
+    char *end = NULL;
+    unsigned long long result;
+
+    if (!value || !*value) {
+        *parsed = 0;
+        return true;
+    }
+
+    errno = 0;
+    result = strtoull(value, &end, 10);
+    if (errno != 0 || !end || *end != '\0')
+        return false;
+
+    *parsed = (uint64_t) result;
+    return true;
+}
+
+static void window_test_close_configure(void)
+{
+    const char *arm_file = getenv("SEMU_TEST_WINDOW_CLOSE_ARM_FILE");
+    uint64_t after_ms = 0;
+
+    test_window_close_configured = true;
+    test_window_close_enabled = false;
+    test_window_close_armed = false;
+    test_window_close_after_ms = 0;
+    test_window_close_deadline_ms = 0;
+    test_window_close_arm_file = NULL;
+
+    if (!arm_file || !*arm_file)
+        return;
+
+    if (!window_test_parse_u64(getenv("SEMU_TEST_WINDOW_CLOSE_AFTER_MS"),
+                               &after_ms)) {
+        fprintf(stderr, WINDOW_LOG_PREFIX
+                "invalid SEMU_TEST_WINDOW_CLOSE_AFTER_MS; disabling test "
+                "window close hook\n");
+        return;
+    }
+
+    test_window_close_arm_file = arm_file;
+    test_window_close_after_ms = after_ms;
+    test_window_close_enabled = true;
+}
+
+static bool window_test_close_requested(void)
+{
+    uint64_t now;
+
+    if (!test_window_close_configured)
+        window_test_close_configure();
+    if (!test_window_close_enabled || window_is_closed_sw())
+        return false;
+
+    if (!test_window_close_armed) {
+        if (access(test_window_close_arm_file, F_OK) != 0)
+            return false;
+
+        now = window_test_monotonic_ms();
+        test_window_close_deadline_ms = now + test_window_close_after_ms;
+        test_window_close_armed = true;
+        return test_window_close_after_ms == 0;
+    }
+
+    now = window_test_monotonic_ms();
+    return now >= test_window_close_deadline_ms;
 }
 
 #if SEMU_HAS(VIRTIOINPUT)
@@ -359,7 +450,6 @@ static SDL_Texture *sdl_plane_info_create_texture(
 
     return texture;
 }
-
 
 static bool sdl_frame_rect_to_sdl(const struct vgpu_display_cpu_payload *frame,
                                   SDL_Rect *rect)
@@ -1163,6 +1253,11 @@ static void window_main_loop_sw(void)
      * is provided by 'pthread_join()', not by this flag.
      */
     while (!window_is_closed_sw()) {
+        if (window_test_close_requested()) {
+            window_shutdown_sw();
+            return;
+        }
+
 #if SEMU_HAS(VIRTIOINPUT)
         if (vinput_handle_events()) {
             /* User closed the window. Set the flag so 'window_shutdown_sw()'
@@ -1203,6 +1298,8 @@ static void window_main_loop_sw(void)
 
 static bool window_init_sw(bool headless, uint32_t width, uint32_t height)
 {
+    test_window_close_configured = false;
+
 #if SEMU_HAS(VIRGL)
     vgpu_renderer_set_wake_frontend(window_wake_backend_sw);
 #endif

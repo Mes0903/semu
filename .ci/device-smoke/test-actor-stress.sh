@@ -70,6 +70,24 @@ script_for_test() {
         sound)
             printf '%s\n' "${SCRIPT_DIR}/test-sound-actor.sh"
             ;;
+        gpu3d)
+            printf '%s\n' "${SCRIPT_DIR}/test-gpu-3d.sh"
+            ;;
+        gpu3d-stress)
+            printf '%s\n' "${SCRIPT_DIR}/test-gpu-3d-stress.sh"
+            ;;
+        gpu3d-reboot)
+            printf '%s\n' "${SCRIPT_DIR}/test-gpu-3d-reboot-stress.sh"
+            ;;
+        gpu3d-window-close)
+            printf '%s\n' "${SCRIPT_DIR}/test-gpu-3d-window-close-stress.sh"
+            ;;
+        gpu3d-reset-long)
+            printf '%s\n' "${SCRIPT_DIR}/test-gpu-3d-reset-stress-long.sh"
+            ;;
+        gpu3d-soak)
+            printf '%s\n' "${SCRIPT_DIR}/test-gpu-3d-soak.sh"
+            ;;
         all-soak)
             printf '%s\n' "${SCRIPT_DIR}/test-actor-stress-all-soak.sh"
             ;;
@@ -85,7 +103,7 @@ script_for_test() {
 for test_name in "${ACTOR_STRESS_TESTS[@]}"; do
     if ! script_for_test "${test_name}" >/dev/null; then
         echo "FAIL: unknown actor stress test '${test_name}'" >&2
-        echo "Known tests: gpu vinput netdev sound all-soak all-reboot" >&2
+        echo "Known tests: gpu vinput netdev sound gpu3d gpu3d-stress gpu3d-reboot gpu3d-window-close gpu3d-reset-long gpu3d-soak all-soak all-reboot" >&2
         exit 1
     fi
 done
