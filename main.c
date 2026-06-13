@@ -23,6 +23,7 @@
 #include "irq-source.h"
 #include "mmio-bus.h"
 #include "platform.h"
+#include "semu-event.h"
 #if SEMU_HAS(VIRTIOINPUT)
 #include "virtio-input-event.h"
 #endif
@@ -76,6 +77,10 @@ enum {
     SEMU_SMP_SLICE_STEPS = 8,
     SEMU_SMP_BATCH_STEPS = 4096,
     SEMU_SINGLE_SLICE_STEPS = 512,
+};
+
+enum {
+    SEMU_IO_EVENT_TOKEN_VNET = SEMU_EVENT_TOKEN_FIRST_DEVICE,
 };
 
 enum {
@@ -828,9 +833,13 @@ static void UNUSED emu_update_vfs_interrupts(vm_t *vm)
  *
  * For simple non-blocking I/O, inline polling is superior.
  */
-static void io_poll_peripherals(emu_state_t *emu)
+static void io_poll_peripherals_common(emu_state_t *emu, bool refresh_net)
 {
     bool pending;
+
+#if !SEMU_HAS(VIRTIONET)
+    (void) refresh_net;
+#endif
 
     EMU_DEVICE_CALL(emu->uart_lock, u8250_check_ready(&emu->uart);
                     u8250_flush_out(&emu->uart);
@@ -839,8 +848,10 @@ static void io_poll_peripherals(emu_state_t *emu)
     emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_UART, pending);
 
 #if SEMU_HAS(VIRTIONET)
-    EMU_DEVICE_CALL(emu->vnet_lock, virtio_net_refresh_queue(&emu->vnet);
-                    pending = virtio_net_irq_pending(&emu->vnet));
+    EMU_DEVICE_CALL(
+        emu->vnet_lock, if (refresh_net) {
+            virtio_net_refresh_queue(&emu->vnet);
+        } pending = virtio_net_irq_pending(&emu->vnet));
     emu_update_plic_irq(emu, SEMU_IRQ_SOURCE_VNET, pending);
 #endif
 
@@ -893,6 +904,11 @@ static void io_poll_peripherals(emu_state_t *emu)
     if (g_window.window_is_closed())
         semu_set_stopped(emu, true);
 #endif
+}
+
+static void io_poll_peripherals(emu_state_t *emu)
+{
+    io_poll_peripherals_common(emu, true);
 }
 
 static inline void emu_tick_peripherals(emu_state_t *emu)
@@ -2733,19 +2749,101 @@ static void *hart_thread_func(void *arg)
 
 static void io_poll_peripherals_threaded(emu_state_t *emu)
 {
-    io_poll_peripherals(emu);
+    io_poll_peripherals_common(emu, false);
     semu_wake_interruptible_harts(emu);
+}
+
+static int io_sync_net_events_threaded(emu_state_t *emu,
+                                       struct semu_event_loop *event_loop)
+{
+    int ret = 0;
+
+#if SEMU_HAS(VIRTIONET)
+    EMU_DEVICE_CALL(emu->vnet_lock,
+                    ret = virtio_net_event_sync(&emu->vnet, event_loop,
+                                                SEMU_IO_EVENT_TOKEN_VNET));
+#else
+    (void) emu;
+    (void) event_loop;
+#endif
+    return ret;
+}
+
+static void io_dispatch_events_threaded(emu_state_t *emu,
+                                        const struct semu_event *events,
+                                        int event_count)
+{
+#if SEMU_HAS(VIRTIONET)
+    for (int i = 0; i < event_count; i++) {
+        EMU_DEVICE_CALL(emu->vnet_lock,
+                        (void) virtio_net_event_handle(
+                            &emu->vnet, &events[i], SEMU_IO_EVENT_TOKEN_VNET));
+    }
+#else
+    (void) emu;
+    (void) events;
+    (void) event_count;
+#endif
+}
+
+static void io_poll_event_fallback_threaded(emu_state_t *emu)
+{
+#if SEMU_HAS(VIRTIONET)
+    EMU_DEVICE_CALL(emu->vnet_lock, virtio_net_event_poll_fallback(&emu->vnet));
+#else
+    (void) emu;
+#endif
+}
+
+static void io_unregister_events_threaded(emu_state_t *emu,
+                                          struct semu_event_loop *event_loop)
+{
+#if SEMU_HAS(VIRTIONET)
+    EMU_DEVICE_CALL(emu->vnet_lock,
+                    virtio_net_event_unregister(&emu->vnet, event_loop,
+                                                SEMU_IO_EVENT_TOKEN_VNET));
+#else
+    (void) emu;
+    (void) event_loop;
+#endif
 }
 
 static void *io_thread_func(void *arg)
 {
     emu_state_t *emu = (emu_state_t *) arg;
+    struct semu_event_loop event_loop;
+    struct semu_event events[8];
+
+    if (semu_event_loop_init(&event_loop, "io-thread") < 0) {
+        emu_threaded_fatal_store(emu, true);
+        semu_set_stopped(emu, true);
+        semu_signal_all_harts(emu);
+        return NULL;
+    }
 
     while (!emu_stopped_load(emu)) {
+        int event_count;
+
         if (signal_received) {
             semu_set_stopped(emu, true);
             break;
         }
+
+        if (io_sync_net_events_threaded(emu, &event_loop) < 0) {
+            emu_threaded_fatal_store(emu, true);
+            semu_set_stopped(emu, true);
+            break;
+        }
+
+        event_count = semu_event_wait(&event_loop, events,
+                                      sizeof(events) / sizeof(events[0]), 1);
+        if (event_count < 0) {
+            emu_threaded_fatal_store(emu, true);
+            semu_set_stopped(emu, true);
+            break;
+        }
+        io_dispatch_events_threaded(emu, events, event_count);
+        io_poll_event_fallback_threaded(emu);
 
         io_poll_peripherals_threaded(emu);
         for (uint32_t i = 0; i < emu->vm.n_hart; i++) {
@@ -2753,9 +2851,10 @@ static void *io_thread_func(void *arg)
             emu_update_swi_interrupt(emu->vm.hart[i]);
             semu_wake_hart_if_interrupt_pending(emu, i);
         }
-        poll(NULL, 0, 1);
     }
 
+    io_unregister_events_threaded(emu, &event_loop);
+    semu_event_loop_destroy(&event_loop);
     semu_signal_all_harts(emu);
     return NULL;
 }

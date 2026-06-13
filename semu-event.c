@@ -153,14 +153,15 @@ int semu_event_mod_fd(struct semu_event_loop *loop,
 int semu_event_del_fd(struct semu_event_loop *loop, int fd)
 {
     ssize_t index;
-    int ret;
 
     if (!loop)
         return -EINVAL;
-    ret = semu_event_check_fd(fd);
-    if (ret < 0)
-        return ret;
+    if (fd < 0)
+        return -EINVAL;
 
+    /* Do not validate fd with fcntl() here. Loop owners may need to cancel a
+     * registration after the underlying host fd has already been closed.
+     */
     index = semu_event_find_fd(loop, fd);
     if (index < 0)
         return -ENOENT;

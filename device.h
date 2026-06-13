@@ -7,6 +7,7 @@
 
 #if SEMU_HAS(VIRTIONET)
 #include "netdev.h"
+#include "semu-event.h"
 #endif
 #include "executor-config.h"
 #include "mmio-bus.h"
@@ -132,6 +133,16 @@ void virtio_net_write(hart_t *core,
                       uint8_t width,
                       uint32_t value);
 void virtio_net_refresh_queue(virtio_net_state_t *vnet);
+int virtio_net_event_sync(virtio_net_state_t *vnet,
+                          struct semu_event_loop *loop,
+                          semu_event_token_t token_base);
+bool virtio_net_event_handle(virtio_net_state_t *vnet,
+                             const struct semu_event *event,
+                             semu_event_token_t token_base);
+void virtio_net_event_poll_fallback(virtio_net_state_t *vnet);
+void virtio_net_event_unregister(virtio_net_state_t *vnet,
+                                 struct semu_event_loop *loop,
+                                 semu_event_token_t token_base);
 
 void virtio_net_recv_from_peer(void *peer);
 

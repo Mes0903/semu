@@ -129,6 +129,23 @@ static int poll_to_slirp_poll(int events)
     return ret;
 }
 
+static short slirp_poll_to_poll(int events)
+{
+    short ret = 0;
+
+    if (events & SLIRP_POLL_IN)
+        ret |= POLLIN;
+    if (events & SLIRP_POLL_OUT)
+        ret |= POLLOUT;
+    if (events & SLIRP_POLL_PRI)
+        ret |= POLLPRI;
+    if (events & SLIRP_POLL_ERR)
+        ret |= POLLERR;
+    if (events & SLIRP_POLL_HUP)
+        ret |= POLLHUP;
+    return ret;
+}
+
 int semu_slirp_get_revents(int idx, void *opaque)
 {
     net_user_options_t *usr = opaque;
@@ -150,7 +167,7 @@ int semu_slirp_add_poll_socket(slirp_os_socket fd, int events, void *opaque)
         int idx = usr->pfd_len++;
         usr->pfd[idx].fd = fd;
 
-        usr->pfd[idx].events = poll_to_slirp_poll(events);
+        usr->pfd[idx].events = slirp_poll_to_poll(events);
         return idx;
     } else {
         return -1;
