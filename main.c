@@ -75,6 +75,10 @@ enum {
     SEMU_SLIRP_SLICE_STEPS = 8,
 };
 
+enum {
+    SEMU_OPT_EXECUTOR = 1000,
+};
+
 static inline bool emu_stopped_load(const emu_state_t *emu)
 {
     return __atomic_load_n(&emu->stopped, __ATOMIC_RELAXED);
@@ -108,7 +112,8 @@ static inline void emu_peripheral_update_ctr_store(emu_state_t *emu,
 
 static bool UNUSED semu_should_use_threaded_runtime(const emu_state_t *emu)
 {
-    return emu->vm.n_hart > 1;
+    return emu->executor_backend == HART_EXEC_DEDICATED_THREADS ||
+           emu->executor_backend == HART_EXEC_WORKER_POOL;
 }
 
 static semu_wfi_handler_t semu_wfi_handler_for_config(const emu_state_t *emu)
@@ -1821,7 +1826,8 @@ static void usage(const char *execpath)
 {
     fprintf(stderr,
             "Usage: %s -k linux-image [-b dtb] [-i initrd-image] [-d "
-            "disk-image] [-s shared-directory] [-H]\n",
+            "disk-image] [-s shared-directory] [-H] "
+            "[--executor=<mode>]\n",
             execpath);
 }
 
@@ -1833,6 +1839,8 @@ static void handle_options(int argc,
                            char **disk_file,
                            char **net_dev,
                            int *hart_count,
+                           enum semu_executor_mode *executor_mode,
+                           bool *executor_mode_set,
                            bool *debug,
                            bool *headless,
                            char **shared_dir)
@@ -1841,12 +1849,17 @@ static void handle_options(int argc,
         *shared_dir = NULL;
 
     int optidx = 0;
-    struct option opts[] = {
-        {"kernel", 1, NULL, 'k'},     {"dtb", 1, NULL, 'b'},
-        {"initrd", 1, NULL, 'i'},     {"disk", 1, NULL, 'd'},
-        {"netdev", 1, NULL, 'n'},     {"smp", 1, NULL, 'c'},
-        {"gdbstub", 0, NULL, 'g'},    {"help", 0, NULL, 'h'},
-        {"shared_dir", 1, NULL, 's'}, {"headless", 0, NULL, 'H'}};
+    struct option opts[] = {{"kernel", 1, NULL, 'k'},
+                            {"dtb", 1, NULL, 'b'},
+                            {"initrd", 1, NULL, 'i'},
+                            {"disk", 1, NULL, 'd'},
+                            {"netdev", 1, NULL, 'n'},
+                            {"smp", 1, NULL, 'c'},
+                            {"executor", 1, NULL, SEMU_OPT_EXECUTOR},
+                            {"gdbstub", 0, NULL, 'g'},
+                            {"help", 0, NULL, 'h'},
+                            {"shared_dir", 1, NULL, 's'},
+                            {"headless", 0, NULL, 'H'}};
 
     int c;
     while ((c = getopt_long(argc, argv, "k:b:i:d:n:c:s:ghH", opts, &optidx)) !=
@@ -1888,6 +1901,18 @@ static void handle_options(int argc,
         }
         case 's':
             *shared_dir = optarg;
+            break;
+        case SEMU_OPT_EXECUTOR:
+            if (semu_executor_mode_parse(optarg, executor_mode) != 0) {
+                fprintf(stderr,
+                        "%s: invalid --executor='%s'; expected one of: "
+                        "single-thread, "
+                        "threaded-cpu-with-legacy-device-gate, "
+                        "threaded-cpu-with-device-actors\n",
+                        argv[0], optarg);
+                exit(2);
+            }
+            *executor_mode_set = true;
             break;
         case 'g':
             *debug = true;
@@ -2001,12 +2026,16 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     char *netdev;
     char *shared_dir;
     int hart_count = 1;
+    enum semu_executor_mode executor_mode = SEMU_EXECUTOR_SINGLE_THREAD;
+    bool executor_mode_set = false;
     bool debug = false;
     bool headless = false;
     vm_t *vm = &emu->vm;
     handle_options(argc, argv, &kernel_file, &dtb_file, &initrd_file,
-                   &disk_file, &netdev, &hart_count, &debug, &headless,
-                   &shared_dir);
+                   &disk_file, &netdev, &hart_count, &executor_mode,
+                   &executor_mode_set, &debug, &headless, &shared_dir);
+    if (!executor_mode_set)
+        executor_mode = semu_executor_default_mode((uint32_t) hart_count);
 #if !SEMU_HAS(VIRTIOINPUT) && !SEMU_HAS(VIRTIOGPU)
     (void) headless;
 #endif
@@ -2016,8 +2045,30 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     if (boot_option_status)
         return boot_option_status;
 
+    struct semu_executor_device_gate actor_gate =
+        semu_executor_check_actor_device_gate(executor_mode);
+    if (!actor_gate.allowed) {
+        fprintf(stderr,
+                "--executor=%s is unavailable because these enabled "
+                "VirtIO devices still use legacy/blocking host I/O paths: "
+                "%s\n",
+                semu_executor_mode_name(executor_mode),
+                actor_gate.unsupported_devices);
+        fprintf(stderr, "fallback: %s\n", actor_gate.fallback_command);
+        return 2;
+    }
+
     /* Initialize the emulator */
     memset(emu, 0, sizeof(*emu));
+    emu->executor_mode = executor_mode;
+    emu->executor_backend = semu_executor_backend_for_mode(executor_mode);
+    if (executor_mode == SEMU_EXECUTOR_THREADED_CPU_WITH_LEGACY_DEVICE_GATE) {
+        fprintf(stderr,
+                "semu: executor threaded-cpu-with-legacy-device-gate is a "
+                "transitional mode using the legacy device gate; switch to "
+                "--executor=threaded-cpu-with-device-actors once all enabled "
+                "VirtIO devices are actor-ready.\n");
+    }
 
     int lifecycle_ret = semu_vm_lifecycle_init(&emu->lifecycle);
     if (lifecycle_ret < 0) {
@@ -2236,7 +2287,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     g_window.window_init(headless, SCREEN_WIDTH, SCREEN_HEIGHT);
 
     emu->wake_fd[0] = emu->wake_fd[1] = -1;
-    if (vm->n_hart > 1 && g_window.window_main_loop) {
+    if (semu_should_use_threaded_runtime(emu) && g_window.window_main_loop) {
         if (pipe(emu->wake_fd) < 0) {
             perror("failed to create emulator wake pipe");
 #if SEMU_HAS(VIRTIOGPU)

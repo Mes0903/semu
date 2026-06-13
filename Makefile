@@ -244,6 +244,7 @@ OBJS := \
 	virtq.o \
 	virtio-mmio.o \
 	uart.o \
+	executor-config.o \
 	main.o \
 	aclint.o \
 	$(OBJS_EXTRA)
