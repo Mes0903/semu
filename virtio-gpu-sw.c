@@ -237,6 +237,12 @@ static struct vgpu_sw_resource_2d *vgpu_sw_get_resource_2d(
     return NULL;
 }
 
+bool virtio_gpu_sw_resource_2d_exists(virtio_gpu_state_t *vgpu,
+                                      uint32_t resource_id)
+{
+    return vgpu && vgpu_sw_get_resource_2d(vgpu, resource_id) != NULL;
+}
+
 static struct virtio_gpu_scanout_info *vgpu_sw_get_scanout(
     virtio_gpu_state_t *vgpu,
     uint32_t scanout_id)
@@ -746,7 +752,11 @@ static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
      * confuse later 'TRANSFER' / 'FLUSH' / 'UNREF' requests that target the
      * same id. Spec explicitly allows the device to fail this.
      */
-    if (vgpu_sw_get_resource_2d(vgpu, request->resource_id)) {
+    if (vgpu_sw_get_resource_2d(vgpu, request->resource_id)
+#if SEMU_HAS(VIRGL)
+        || virtio_gpu_virgl_resource_id_exists(request->resource_id)
+#endif
+    ) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX "%s(): resource id %u already in use\n",
                 __func__, request->resource_id);
@@ -873,6 +883,9 @@ static void vgpu_sw_resource_create_2d_handler(virtio_gpu_state_t *vgpu,
     res_2d->image_size = image_size;
     SW(vgpu)->hostmem += image_size;
     list_push(&res_2d->list, &SW(vgpu)->res_2d_list);
+#if SEMU_HAS(VIRGL)
+    virtio_gpu_virgl_discard_resource_unref(request->resource_id);
+#endif
 
     *plen = virtio_gpu_write_ctrl_response(vgpu, &request->hdr, response_desc,
                                            VIRTIO_GPU_RESP_OK_NODATA);
@@ -899,6 +912,13 @@ static void vgpu_sw_cmd_resource_unref_handler(virtio_gpu_state_t *vgpu,
         *plen = 0;
         return;
     }
+
+#if SEMU_HAS(VIRGL)
+    if (virtio_gpu_virgl_resource_id_exists(request->resource_id)) {
+        virtio_gpu_virgl_resource_unref_handler(vgpu, vq_desc, plen);
+        return;
+    }
+#endif
 
     struct vgpu_sw_resource_2d *res_2d =
         vgpu_sw_get_resource_2d(vgpu, request->resource_id);
@@ -1108,6 +1128,7 @@ static void vgpu_sw_cmd_resource_flush_handler(virtio_gpu_state_t *vgpu,
         *plen = 0;
         return;
     }
+
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
@@ -1343,6 +1364,13 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
         return;
     }
 
+#if SEMU_HAS(VIRGL)
+    if (virtio_gpu_virgl_resource_id_exists(backing_info->resource_id)) {
+        virtio_gpu_virgl_resource_attach_backing_handler(vgpu, vq_desc, plen);
+        return;
+    }
+#endif
+
     if (vq_desc[1].flags & VIRTIO_DESC_F_WRITE) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
@@ -1508,6 +1536,13 @@ static void vgpu_sw_cmd_resource_detach_backing_handler(
         *plen = 0;
         return;
     }
+
+#if SEMU_HAS(VIRGL)
+    if (virtio_gpu_virgl_resource_id_exists(request->resource_id)) {
+        virtio_gpu_virgl_resource_detach_backing_handler(vgpu, vq_desc, plen);
+        return;
+    }
+#endif
 
     /* Retrieve 2D resource */
     struct vgpu_sw_resource_2d *res_2d =
@@ -1763,17 +1798,32 @@ const struct virtio_gpu_cmd_backend g_virtio_gpu_backend = {
     .transfer_to_host_2d = vgpu_sw_cmd_transfer_to_host_2d_handler,
     .resource_attach_backing = vgpu_sw_cmd_resource_attach_backing_handler,
     .resource_detach_backing = vgpu_sw_cmd_resource_detach_backing_handler,
+#if SEMU_HAS(VIRGL)
+    .get_capset_info = virtio_gpu_virgl_get_capset_info_handler,
+    .get_capset = virtio_gpu_virgl_get_capset_handler,
+#else
     .get_capset_info = VIRTIO_GPU_CMD_UNDEF,
     .get_capset = VIRTIO_GPU_CMD_UNDEF,
+#endif
     .get_edid = virtio_gpu_get_edid_handler,
     .resource_assign_uuid = VIRTIO_GPU_CMD_UNDEF,
     .resource_create_blob = VIRTIO_GPU_CMD_UNDEF,
     .set_scanout_blob = VIRTIO_GPU_CMD_UNDEF,
+#if SEMU_HAS(VIRGL)
+    .ctx_create = virtio_gpu_virgl_ctx_create_handler,
+    .ctx_destroy = virtio_gpu_virgl_ctx_destroy_handler,
+#else
     .ctx_create = VIRTIO_GPU_CMD_UNDEF,
     .ctx_destroy = VIRTIO_GPU_CMD_UNDEF,
+#endif
     .ctx_attach_resource = VIRTIO_GPU_CMD_UNDEF,
     .ctx_detach_resource = VIRTIO_GPU_CMD_UNDEF,
+#if SEMU_HAS(VIRGL)
+    .resource_create_3d = virtio_gpu_virgl_resource_create_3d_handler,
+    .apply_renderer_side_effect = virtio_gpu_virgl_apply_renderer_side_effect,
+#else
     .resource_create_3d = VIRTIO_GPU_CMD_UNDEF,
+#endif
     .transfer_to_host_3d = VIRTIO_GPU_CMD_UNDEF,
     .transfer_from_host_3d = VIRTIO_GPU_CMD_UNDEF,
     .submit_3d = VIRTIO_GPU_CMD_UNDEF,

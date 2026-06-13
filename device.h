@@ -304,10 +304,20 @@ struct virtio_gpu_sw_backend_state {
     struct virtio_gpu_sw_display_counter_storage display_counters;
 };
 
+struct virtio_gpu_ctrl_dispatch_context {
+    bool active;
+    uint16_t queue_index;
+    uint32_t desc_head;
+    uint64_t actor_generation;
+    uint64_t common_generation;
+    bool trigger_irq;
+};
+
 typedef struct {
     struct virtio_device_common common;
     struct virtio_actor actor;
     struct virtio_gpu_sw_backend_state sw_backend;
+    struct virtio_gpu_ctrl_dispatch_context ctrl_dispatch;
     uint64_t actor_drain_generation;
     bool actor_initialized;
     /* supplied by environment */
