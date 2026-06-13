@@ -792,22 +792,14 @@ static inline uint32_t lr_reservation_addr(uint32_t phys_addr)
 
 static inline void lr_reservation_lock(vm_t *machine)
 {
-#if SEMU_HAS(THREADED)
     if (machine)
         pthread_mutex_lock(&machine->reservation_lock);
-#else
-    (void) machine;
-#endif
 }
 
 static inline void lr_reservation_unlock(vm_t *machine)
 {
-#if SEMU_HAS(THREADED)
     if (machine)
         pthread_mutex_unlock(&machine->reservation_lock);
-#else
-    (void) machine;
-#endif
 }
 
 static void lr_reservation_recompute_any_locked(vm_t *machine)

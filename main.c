@@ -18,14 +18,6 @@
 #include <sys/time.h>
 #endif
 
-#ifdef __APPLE__
-#include <sys/event.h>
-#include <sys/time.h>
-#else
-#include <sys/timerfd.h>
-#endif
-
-#include "coro.h"
 #include "device.h"
 #include "mini-gdbstub/include/gdbstub.h"
 #if SEMU_HAS(VIRTIOINPUT)
@@ -43,15 +35,13 @@
 #define PRIV(x) ((emu_state_t *) x->priv)
 
 /* Forward declarations for runtime support */
-#if !SEMU_HAS(THREADED)
-static void wfi_handler(hart_t *hart);
-static void hart_exec_loop(void *arg);
-#endif
-#if SEMU_HAS(THREADED)
+typedef void (*semu_wfi_handler_t)(hart_t *hart);
+static void UNUSED wfi_handler_single_hart(hart_t *hart);
 static void wfi_handler_threaded(hart_t *hart);
 static void *hart_thread_func(void *arg);
 static void *io_thread_func(void *arg);
-#endif
+static bool UNUSED semu_should_use_threaded_runtime(const emu_state_t *emu);
+static semu_wfi_handler_t semu_wfi_handler_for_config(const emu_state_t *emu);
 static volatile sig_atomic_t signal_received = 0;
 static void semu_process_pending_rfence(hart_t *hart);
 static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps);
@@ -96,9 +86,20 @@ static inline void emu_peripheral_update_ctr_store(emu_state_t *emu,
     __atomic_store_n(&emu->peripheral_update_ctr, value, __ATOMIC_RELAXED);
 }
 
+static bool UNUSED semu_should_use_threaded_runtime(const emu_state_t *emu)
+{
+    return emu->vm.n_hart > 1;
+}
+
+static semu_wfi_handler_t semu_wfi_handler_for_config(const emu_state_t *emu)
+{
+    if (semu_should_use_threaded_runtime(emu))
+        return wfi_handler_threaded;
+    return wfi_handler_single_hart;
+}
+
 static inline bool emu_peripheral_tick_due(emu_state_t *emu)
 {
-#if SEMU_HAS(THREADED)
     for (;;) {
         uint32_t counter =
             __atomic_load_n(&emu->peripheral_update_ctr, __ATOMIC_RELAXED);
@@ -117,31 +118,16 @@ static inline bool emu_peripheral_tick_due(emu_state_t *emu)
                                         __ATOMIC_RELAXED))
             return false;
     }
-#else
-    if (emu->peripheral_update_ctr-- == 0) {
-        emu->peripheral_update_ctr = 64;
-        return true;
-    }
-    return false;
-#endif
 }
 
 static inline void emu_device_lock(pthread_mutex_t *lock)
 {
-#if SEMU_HAS(THREADED)
     pthread_mutex_lock(lock);
-#else
-    (void) lock;
-#endif
 }
 
 static inline void emu_device_unlock(pthread_mutex_t *lock)
 {
-#if SEMU_HAS(THREADED)
     pthread_mutex_unlock(lock);
-#else
-    (void) lock;
-#endif
 }
 
 #define EMU_DEVICE_CALL(lock, ...)  \
@@ -161,17 +147,12 @@ static int emu_mutex_init(pthread_mutex_t *lock)
 
 static void semu_signal_hart(emu_state_t *emu, uint32_t hartid)
 {
-#if SEMU_HAS(THREADED)
     if (!emu->hart_wait || hartid >= emu->vm.n_hart)
         return;
 
     pthread_mutex_lock(&emu->hart_wait[hartid].mutex);
     pthread_cond_signal(&emu->hart_wait[hartid].cond);
     pthread_mutex_unlock(&emu->hart_wait[hartid].mutex);
-#else
-    (void) emu;
-    (void) hartid;
-#endif
 }
 
 static bool UNUSED semu_hart_has_enabled_interrupt(hart_t *hart)
@@ -179,9 +160,14 @@ static bool UNUSED semu_hart_has_enabled_interrupt(hart_t *hart)
     return (hart_sip_load(hart) & hart_sie_load(hart)) != 0;
 }
 
+static void UNUSED wfi_handler_single_hart(hart_t *hart)
+{
+    if (semu_hart_has_enabled_interrupt(hart))
+        hart_in_wfi_store(hart, false);
+}
+
 static void UNUSED semu_resume_hart(emu_state_t *emu, uint32_t hartid)
 {
-#if SEMU_HAS(THREADED)
     if (hartid >= emu->vm.n_hart)
         return;
 
@@ -189,10 +175,6 @@ static void UNUSED semu_resume_hart(emu_state_t *emu, uint32_t hartid)
     int32_t expected = SBI_HSM_STATE_SUSPENDED;
     hart_hsm_status_compare_exchange(hart, &expected, SBI_HSM_STATE_STARTED);
     semu_signal_hart(emu, hartid);
-#else
-    (void) emu;
-    (void) hartid;
-#endif
 }
 
 static void semu_finish_hsm_park(emu_state_t *emu, hart_t *hart)
@@ -214,37 +196,24 @@ static void semu_finish_hsm_park(emu_state_t *emu, hart_t *hart)
 
 static void semu_signal_all_harts(emu_state_t *emu)
 {
-#if SEMU_HAS(THREADED)
     for (uint32_t i = 0; i < emu->vm.n_hart; i++)
         semu_signal_hart(emu, i);
-#else
-    (void) emu;
-#endif
 }
 
 static void semu_wake_hart_if_interrupt_pending(emu_state_t *emu,
                                                 uint32_t hartid)
 {
-#if SEMU_HAS(THREADED)
     if (hartid >= emu->vm.n_hart)
         return;
 
     if (semu_hart_has_enabled_interrupt(emu->vm.hart[hartid]))
         semu_resume_hart(emu, hartid);
-#else
-    (void) emu;
-    (void) hartid;
-#endif
 }
 
 static void semu_wake_interruptible_harts(emu_state_t *emu)
 {
-#if SEMU_HAS(THREADED)
     for (uint32_t i = 0; i < emu->vm.n_hart; i++)
         semu_wake_hart_if_interrupt_pending(emu, i);
-#else
-    (void) emu;
-#endif
 }
 
 static inline bool semu_rfence_initialized_load(emu_state_t *emu)
@@ -359,7 +328,6 @@ static void UNUSED semu_rfence_ack(emu_state_t *emu)
 
 static void semu_process_pending_rfence(hart_t *hart)
 {
-#if SEMU_HAS(THREADED)
     if (!hart_pending_rfence_load(hart))
         return;
 
@@ -371,24 +339,16 @@ static void semu_process_pending_rfence(hart_t *hart)
     hart_pending_rfence_store(hart, false);
     semu_apply_rfence(hart, type, start_addr, size);
     semu_rfence_ack(emu);
-#else
-    (void) hart;
-#endif
 }
 
 static void UNUSED semu_lock_rfence_issue(emu_state_t *emu, hart_t *requester)
 {
-#if SEMU_HAS(THREADED)
     for (;;) {
         semu_process_pending_rfence(requester);
         if (pthread_mutex_trylock(&emu->rfence.issue_mutex) == 0)
             return;
         sched_yield();
     }
-#else
-    (void) emu;
-    (void) requester;
-#endif
 }
 
 static void emu_update_plic_irq(emu_state_t *emu, uint32_t irq_bit, bool active)
@@ -1056,7 +1016,6 @@ static sbi_ret_t UNUSED semu_rfence_threaded(hart_t *hart,
                                              uint32_t size,
                                              uint32_t asid)
 {
-#if SEMU_HAS(THREADED)
     emu_state_t *emu = PRIV(hart);
     vm_t *vm = hart->vm;
     int32_t pending_count = 0;
@@ -1106,16 +1065,6 @@ static sbi_ret_t UNUSED semu_rfence_threaded(hart_t *hart,
         semu_rfence_type_store(emu, SEMU_RFENCE_NONE);
     pthread_mutex_unlock(&emu->rfence.issue_mutex);
     return (sbi_ret_t) {stopped ? SBI_ERR_FAILED : SBI_SUCCESS, 0};
-#else
-    (void) hart;
-    (void) type;
-    (void) hart_mask;
-    (void) hart_mask_base;
-    (void) start_addr;
-    (void) size;
-    (void) asid;
-    return (sbi_ret_t) {SBI_ERR_FAILED, 0};
-#endif
 }
 
 static sbi_ret_t UNUSED semu_rfence_direct(hart_t *hart,
@@ -1140,14 +1089,8 @@ static sbi_ret_t semu_rfence_request(hart_t *hart,
                                      uint32_t size,
                                      uint32_t asid)
 {
-#if SEMU_HAS(THREADED)
     return semu_rfence_threaded(hart, type, hart_mask, hart_mask_base,
                                 start_addr, size, asid);
-#else
-    (void) asid;
-    return semu_rfence_direct(hart, type, hart_mask, hart_mask_base, start_addr,
-                              size);
-#endif
 }
 
 static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
@@ -1493,9 +1436,6 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     int hart_count = 1;
     bool debug = false;
     bool headless = false;
-#if SEMU_HAS(VIRTIONET) && !SEMU_HAS(THREADED)
-    bool netdev_ready = false;
-#endif
     vm_t *vm = &emu->vm;
     handle_options(argc, argv, &kernel_file, &dtb_file, &initrd_file,
                    &disk_file, &netdev, &hart_count, &debug, &headless,
@@ -1615,7 +1555,6 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
         perror("rfence init");
         return 1;
     }
-#if SEMU_HAS(THREADED)
     if (pthread_mutex_init(&vm->reservation_lock, NULL)) {
         perror("reservation lock init");
         return 1;
@@ -1634,7 +1573,6 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             return 1;
         }
     }
-#endif
     for (uint32_t i = 0; i < vm->n_hart; i++) {
         hart_t *newhart = calloc(1, sizeof(hart_t));
         if (!newhart) {
@@ -1652,18 +1590,12 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
         }
 
         newhart->vm = vm;
-#if SEMU_HAS(THREADED)
-        newhart->wfi = wfi_handler_threaded;
-#else
-        newhart->wfi = wfi_handler; /* Set WFI callback for coroutine support */
-#endif
+        newhart->wfi = semu_wfi_handler_for_config(emu);
         vm->hart[i] = newhart;
     }
 
     /* Set up peripherals */
     emu->uart.in_fd = 0, emu->uart.out_fd = 1;
-    emu->uart.waiting_hart_id = UINT32_MAX;
-    emu->uart.has_waiting_hart = false;
     capture_keyboard_input(); /* set up uart */
 #if SEMU_HAS(VIRTIONET)
     /* Always set ram pointer, even if netdev is not configured.
@@ -1675,9 +1607,6 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             fprintf(stderr, "Failed to initialize virtio-net device.\n");
             return 1;
         }
-#if !SEMU_HAS(THREADED)
-        netdev_ready = true;
-#endif
     }
 #endif
 #if SEMU_HAS(VIRTIOBLK)
@@ -1756,97 +1685,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     emu_peripheral_update_ctr_store(emu, 0);
     emu->debug = debug;
 
-#if !SEMU_HAS(THREADED)
-    /* Initialize coroutine system for multi-hart mode (SMP > 1) */
-    if (vm->n_hart > 1) {
-        uint32_t total_slots = vm->n_hart;
-#if SEMU_HAS(VIRTIONET)
-        if (netdev_ready)
-            total_slots++;
-#endif
-        if (!coro_init(total_slots, vm->n_hart)) {
-            fprintf(stderr, "Failed to initialize coroutine subsystem\n");
-            fflush(stderr);
-#if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
-            if (emu->wake_fd[0] >= 0)
-                close(emu->wake_fd[0]);
-            if (emu->wake_fd[1] >= 0)
-                close(emu->wake_fd[1]);
-            emu->wake_fd[0] = emu->wake_fd[1] = -1;
-            g_window.window_cleanup();
-#endif
-            return 1;
-        }
-
-        /* Create coroutine for each hart */
-        for (uint32_t i = 0; i < vm->n_hart; i++) {
-            if (!coro_create_hart(i, hart_exec_loop, vm->hart[i])) {
-                fprintf(stderr, "Failed to create coroutine for hart %u\n", i);
-                coro_cleanup();
-#if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
-                if (emu->wake_fd[0] >= 0)
-                    close(emu->wake_fd[0]);
-                if (emu->wake_fd[1] >= 0)
-                    close(emu->wake_fd[1]);
-                emu->wake_fd[0] = emu->wake_fd[1] = -1;
-                g_window.window_cleanup();
-#endif
-                return 1;
-            }
-        }
-    }
-#endif
-
     return 0;
 }
 
-#if !SEMU_HAS(THREADED)
-/* WFI callback for coroutine-based scheduling in SMP mode
- *
- * This handler implements the RISC-V WFI (Wait For Interrupt) instruction
- * semantics in the context of cooperative multitasking with coroutines.
- *
- * Per RISC-V privileged spec:
- * - WFI is a hint to suspend execution until an interrupt becomes pending
- * - WFI returns immediately if an interrupt is already pending
- * - WFI may complete for any reason (implementation-defined)
- *
- * Our implementation:
- * - In SMP mode (n_hart > 1): yield to scheduler if no interrupt pending
- * - In single-hart mode: WFI is a no-op (inline polling handles I/O)
- * - The in_wfi flag tracks whether hart is waiting, allowing scheduler to
- *   block until all harts reach WFI (power-efficient idle state)
- */
-static void wfi_handler(hart_t *hart)
-{
-    /* Per RISC-V spec: WFI returns immediately if interrupt is pending.
-     * We check if any interrupt is actually pending (sip & sie != 0).
-     */
-    bool interrupt_pending = (hart_sip_load(hart) & hart_sie_load(hart)) != 0;
-
-    if (!interrupt_pending) {
-        emu_state_t *emu = PRIV(hart);
-        vm_t *vm = &emu->vm;
-
-        /* Only use coroutine yielding in multi-hart mode where the coroutine
-         * scheduler loop is active. In single-hart mode, WFI is a no-op since
-         * there's no scheduler to resume execution after yield.
-         */
-        if (vm->n_hart > 1) {
-            hart_in_wfi_store(hart, true); /* Mark as waiting for interrupt */
-            coro_yield(); /* Suspend until scheduler resumes us */
-            /* NOTE: Do NOT clear in_wfi here to avoid race condition.
-             * The scheduler needs to see this flag to detect idle state.
-             * The flag will be cleared when an interrupt is actually injected.
-             */
-        }
-    } else {
-        hart_in_wfi_store(hart, false); /* Clear if interrupt already pending */
-    }
-}
-#endif
-
-#if SEMU_HAS(THREADED)
 static void wfi_handler_threaded(hart_t *hart)
 {
     emu_state_t *emu = PRIV(hart);
@@ -1913,7 +1754,6 @@ static void wait_for_hart_start(emu_state_t *emu,
                                 int32_t initial_state)
 {
     (void) initial_state;
-#if SEMU_HAS(THREADED)
     uint32_t id = hart->mhartid;
 
     pthread_mutex_lock(&emu->hart_wait[id].mutex);
@@ -1931,10 +1771,6 @@ static void wait_for_hart_start(emu_state_t *emu,
 
     if (!emu_stopped_load(emu))
         semu_process_hsm_resume_if_started(hart);
-#else
-    (void) emu;
-    (void) hart;
-#endif
 }
 
 static void *hart_thread_func(void *arg)
@@ -2008,74 +1844,11 @@ static void *io_thread_func(void *arg)
     semu_signal_all_harts(emu);
     return NULL;
 }
-#endif
-
-#if !SEMU_HAS(THREADED)
-/* Hart execution loop - each hart runs in its own coroutine
- *
- * This is the main entry point for each RISC-V hart when running in SMP mode.
- * Each hart executes independently as a coroutine, cooperatively yielding to
- * the scheduler to allow other harts and I/O coroutines to make progress.
- *
- * Execution model:
- * - Harts execute in batches before yielding to the scheduler
- * - Peripheral polling and interrupt checks happen every SMP slice
- * - WFI instruction triggers immediate yield (via wfi_handler callback)
- * - Harts in HSM_STATE_STOPPED remain suspended until IPI wakes them
- *
- * This design balances responsiveness and throughput:
- * - Small SMP slices keep latency low for I/O and IPI
- * - Larger scheduler batches avoid excessive coroutine/poll overhead
- * - WFI-based blocking allows efficient idle when all harts are waiting
- */
-static void hart_exec_loop(void *arg)
-{
-    hart_t *hart = (hart_t *) arg;
-    emu_state_t *emu = PRIV(hart);
-
-    /* Run hart until emulator stops */
-    while (!emu_stopped_load(emu)) {
-        /* Check HSM (Hart State Management) state via SBI extension */
-        if (hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED) {
-            /* Hart is STOPPED or SUSPENDED - update peripherals and yield.
-             * An IPI (via SBI_HSM__HART_START) will change state to STARTED.
-             */
-            emu_tick_peripherals(emu);
-            emu_update_timer_interrupt(hart);
-            emu_update_swi_interrupt(hart);
-            coro_yield();
-            continue;
-        }
-
-        /* Execute a batch of instructions before yielding.
-         * Keep peripheral polling at the original slice cadence so I/O and
-         * external interrupt latency do not scale with the batch size.
-         */
-        for (int i = 0; i < SEMU_SMP_BATCH_STEPS; i += SEMU_SMP_SLICE_STEPS) {
-            emu_tick_peripherals(emu);
-            emu_update_timer_interrupt(hart);
-            emu_update_swi_interrupt(hart);
-            if (unlikely(semu_step_chunk(emu, hart, SEMU_SMP_SLICE_STEPS))) {
-                semu_set_stopped(emu, true);
-                goto cleanup;
-            }
-        }
-
-        /* Yield to scheduler after executing batch */
-        coro_yield();
-    }
-cleanup:
-    return;
-}
-#endif
 
 static int semu_step(emu_state_t *emu)
 {
     vm_t *vm = &emu->vm;
 
-    /* TODO: Add support for multi-threaded system emulation after the
-     * RFENCE extension is completely implemented.
-     */
     for (uint32_t i = 0; i < vm->n_hart; i++) {
         if (semu_service_hart_step(emu, vm->hart[i]))
             return 2;
@@ -2268,7 +2041,6 @@ static void print_mmu_cache_stats(vm_t *vm)
 #endif
 
 
-#if SEMU_HAS(THREADED)
 static void semu_run_threaded(emu_state_t *emu)
 {
     vm_t *vm = &emu->vm;
@@ -2309,338 +2081,17 @@ static void semu_run_threaded(emu_state_t *emu)
 
     emu->exit_code = emu_threaded_fatal_load(emu) ? 1 : 0;
 }
-#endif
 
 static void semu_run(emu_state_t *emu)
 {
-#if SEMU_HAS(THREADED)
-    semu_run_threaded(emu);
-    return;
-#endif
-    int ret;
-    vm_t *vm = &emu->vm;
-
-    if (vm->n_hart > 1) {
-        /* SMP mode: Use coroutine-based hart scheduling
-         *
-         * Architecture:
-         * - Each hart runs as an independent coroutine
-         * - Peripherals (VirtIO-Net, UART, etc.) use inline polling
-         * - Main loop acts as scheduler, resuming hart coroutines round-robin
-         * - poll() monitors timer and UART for power management
-         *
-         * Power management optimization:
-         * - When all harts execute WFI (Wait For Interrupt), scheduler blocks
-         *   in poll() with timeout=-1 (indefinite) until:
-         *   * UART input arrives (keyboard)
-         *   * Timer expires (1ms periodic timer for guest timer emulation)
-         * - This avoids busy-waiting when guest OS is idle
-         *
-         * Peripheral I/O handling:
-         * - Peripherals are polled inline during hart execution (see
-         *   emu_tick_peripherals), not via separate coroutines
-         * - Non-blocking poll() for network/disk I/O (~200ns overhead)
-         * - Inline polling provides low latency by checking every SMP slice
-         */
-#ifdef __APPLE__
-        int kq = kqueue();
-        if (kq < 0) {
-            perror("kqueue");
-            emu->exit_code = -1;
-            return;
-        }
-
-        struct kevent kev_timer;
-        EV_SET(&kev_timer, 1, EVFILT_TIMER, EV_ADD | EV_ENABLE, 0, 1, NULL);
-        if (kevent(kq, &kev_timer, 1, NULL, 0, NULL) < 0) {
-            perror("kevent timer setup");
-            close(kq);
-            emu->exit_code = -1;
-            return;
-        }
-
-        if (isatty(emu->uart.in_fd)) {
-            struct kevent kev_uart;
-            EV_SET(&kev_uart, emu->uart.in_fd, EVFILT_READ, EV_ADD | EV_ENABLE,
-                   0, 0, NULL);
-            if (kevent(kq, &kev_uart, 1, NULL, 0, NULL) < 0) {
-                perror("kevent uart setup");
-                close(kq);
-                emu->exit_code = -1;
-                return;
-            }
-        }
-#else
-        int wfi_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-        if (wfi_timer_fd < 0) {
-            perror("timerfd_create");
-            emu->exit_code = -1;
-            return;
-        }
-
-        struct itimerspec its = {
-            .it_interval = {.tv_sec = 0, .tv_nsec = 1000000},
-            .it_value = {.tv_sec = 0, .tv_nsec = 1000000},
-        };
-        if (timerfd_settime(wfi_timer_fd, 0, &its, NULL) < 0) {
-            perror("timerfd_settime");
-            close(wfi_timer_fd);
-            emu->exit_code = -1;
-            return;
-        }
-#endif
-
-        /* Poll-based event loop for I/O monitoring:
-         * - Timer fd: 1 descriptor for periodic timer (kqueue/timerfd)
-         * - UART fd: 1 descriptor for keyboard input
-         */
-        struct pollfd *pfds = NULL;
-        size_t poll_capacity = 0;
-
-        while (!emu_stopped_load(emu)) {
-            /* Break out on SIGINT/SIGTERM so main() returns and atexit
-             * hooks (e.g., virtio-blk msync) run before the process dies.
-             */
-            if (signal_received)
-                break;
-            /* Only need fds for timer and UART (no coroutine I/O),
-             * plus an optional wake pipe when a window backend is enabled.
-             */
-            size_t needed = 2;
-#if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
-            if (emu->wake_fd[0] >= 0)
-                needed++;
-#endif
-
-            /* Grow buffer if needed (amortized realloc) */
-            if (needed > poll_capacity) {
-                struct pollfd *new_pfds =
-                    realloc(pfds, needed * sizeof(*new_pfds));
-                if (!new_pfds) {
-                    free(pfds);
-#ifdef __APPLE__
-                    close(kq);
-#else
-                    close(wfi_timer_fd);
-#endif
-                    emu->exit_code = -1;
-                    return;
-                }
-                pfds = new_pfds;
-                poll_capacity = needed;
-            }
-
-            /* Determine poll timeout based on hart states BEFORE setting up
-             * poll fds. This check must happen before coro_resume_hart()
-             * modifies flags.
-             *
-             * - If no harts are STARTED, block indefinitely (wait for IPI)
-             * - If all STARTED harts are idle (WFI or UART waiting), block
-             * - Otherwise, use non-blocking poll (timeout=0)
-             */
-            int poll_timeout = 0;
-            uint32_t started_harts = 0;
-            uint32_t idle_harts = 0;
-            for (uint32_t i = 0; i < vm->n_hart; i++) {
-                if (hart_hsm_status_load(vm->hart[i]) ==
-                    SBI_HSM_STATE_STARTED) {
-                    started_harts++;
-                    /* Count hart as idle if it's in WFI or waiting for UART */
-                    if (hart_in_wfi_load(vm->hart[i]) ||
-                        (emu->uart.has_waiting_hart &&
-                         emu->uart.waiting_hart_id == i)) {
-                        idle_harts++;
-                    }
-                }
-            }
-
-            /* Collect file descriptors for poll() */
-            size_t pfd_count = 0;
-            int timer_index = -1;
-
-            /* Add periodic timer fd (1ms interval). Excluded when harts are
-             * idle to allow poll() sleep, but always included during:
-             * 1. Single-hart mode (n_hart == 1)
-             * 2. Boot phase (!boot_complete) - prevents deadlock when kernel
-             *    briefly puts all harts in WFI while waiting for timer IRQ
-             * 3. Active execution (idle_harts == 0)
-             */
-            bool all_harts_started = (started_harts >= vm->n_hart);
-            const uint64_t BOOT_SETTLE_ITERATIONS = 5000;
-            bool boot_complete =
-                all_harts_started &&
-                (emu_peripheral_update_ctr_load(emu) > BOOT_SETTLE_ITERATIONS);
-            bool harts_active =
-                (vm->n_hart == 1) || !boot_complete || (idle_harts == 0);
-#ifdef __APPLE__
-            /* macOS: use kqueue with EVFILT_TIMER */
-            if (kq >= 0 && pfd_count < poll_capacity && harts_active) {
-                pfds[pfd_count] = (struct pollfd) {kq, POLLIN, 0};
-                timer_index = (int) pfd_count;
-                pfd_count++;
-            }
-#else
-            /* Linux: use timerfd */
-            if (wfi_timer_fd >= 0 && pfd_count < poll_capacity &&
-                harts_active) {
-                pfds[pfd_count] = (struct pollfd) {wfi_timer_fd, POLLIN, 0};
-                timer_index = (int) pfd_count;
-                pfd_count++;
-            }
-#endif
-
-            /* Add UART input fd (stdin for keyboard input).
-             * Only add UART when:
-             * 1. Single-hart configuration (n_hart == 1), OR
-             * 2. Boot not complete (!boot_complete), OR
-             * 3. All harts are active (idle_harts == 0), OR
-             * 4. A hart is actively waiting for UART input
-             *
-             * This prevents UART (which is always "readable" on TTY) from
-             * preventing poll() sleep when harts are idle. Trade-off: user
-             * input (Ctrl+A x) may be delayed by up to poll_timeout (10ms)
-             * when harts are idle, which is acceptable for an emulator.
-             */
-            bool need_uart = (vm->n_hart == 1) || !boot_complete ||
-                             (idle_harts == 0) || emu->uart.has_waiting_hart;
-            if (emu->uart.in_fd >= 0 && pfd_count < poll_capacity &&
-                need_uart) {
-                pfds[pfd_count] = (struct pollfd) {emu->uart.in_fd, POLLIN, 0};
-                pfd_count++;
-            }
-
-#if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
-            /* Always watch the wake pipe so that backend work such as input
-             * events or SDL window close unblocks 'poll(-1)' immediately.
-             */
-            int wake_pfd_index = -1;
-            if (emu->wake_fd[0] >= 0 && pfd_count < poll_capacity) {
-                pfds[pfd_count] = (struct pollfd) {emu->wake_fd[0], POLLIN, 0};
-                wake_pfd_index = (int) pfd_count;
-                pfd_count++;
-            }
-#endif
-
-            /* Set poll timeout based on current idle state (adaptive timeout).
-             * Three-tier strategy:
-             * 1. Blocking (-1): All harts idle + have fds → wait for events
-             * 2. Short sleep (10ms): Some harts idle → reduce CPU usage
-             * 3. Non-blocking (0): All harts active → maximum responsiveness
-             *
-             * SAFETY: Never use blocking timeout when pfd_count==0, as
-             * poll(0,-1) would hang indefinitely. Always use 10ms timeout as
-             * fallback.
-             */
-            if (pfd_count > 0 &&
-                (started_harts == 0 || idle_harts == started_harts)) {
-                /* All harts idle + have fds: block until event */
-                poll_timeout = -1;
-            } else if (idle_harts > 0) {
-                /* Some/all harts idle (or all idle but no fds): 10ms sleep */
-                poll_timeout = 10;
-            } else {
-                /* All harts active: non-blocking */
-                poll_timeout = 0;
-            }
-
-            /* Execute poll() to wait for I/O events.
-             * - timeout=0: non-blocking poll when harts are active
-             * - timeout=10: short sleep when some harts idle
-             * - timeout=-1: blocking poll when all harts idle (WFI or UART
-             *   wait)
-             *
-             * When pfd_count==0, poll() acts as a pure sleep mechanism.
-             */
-            int nevents = poll(pfds, pfd_count, poll_timeout);
-
-            if (pfd_count > 0 && nevents > 0) {
-                /* Consume timer expiration events to prevent fd staying
-                 * readable
-                 */
-                if (timer_index >= 0 && (pfds[timer_index].revents & POLLIN)) {
-#ifdef __APPLE__
-                    /* drain kqueue events with non-blocking kevent */
-                    struct kevent events[32];
-                    struct timespec timeout_zero = {0, 0};
-                    kevent(kq, NULL, 0, events, 32, &timeout_zero);
-#else
-                    /* Linux: read timerfd to consume expiration count */
-                    uint64_t expirations;
-                    ssize_t ret_read =
-                        read(wfi_timer_fd, &expirations, sizeof(expirations));
-                    (void) ret_read;
-#endif
-                }
-            } else if (nevents < 0 && errno != EINTR) {
-                perror("failed to poll emulator events");
-            }
-
-#if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
-            /* Drain one wake byte if the pipe fired. The virtio-input path
-             * coalesces backend wakeups behind a bool gate, so it contributes
-             * at most one queued notification byte before the emulator thread
-             * drains pending work. Extra shutdown wake bytes do not need to be
-             * fully consumed here because the first one is enough to make
-             * 'emu_tick_peripherals()' observe 'g_window.window_is_closed()'
-             * and stop the emulator.
-             */
-            if (wake_pfd_index >= 0 &&
-                (pfds[wake_pfd_index].revents & POLLIN)) {
-                char wake_byte;
-                ssize_t bytes_drained =
-                    read(emu->wake_fd[0], &wake_byte, sizeof(wake_byte));
-                (void) bytes_drained;
-            }
-#endif
-
-            /* Resume all hart coroutines (round-robin scheduling).
-             * Each hart executes a batch of instructions, then yields back.
-             * Harts in WFI will have their in_wfi flag cleared by interrupt
-             * handlers (ACLINT, PLIC, UART) when interrupts are injected.
-             *
-             * Note: We must always resume harts after poll() returns, even if
-             * all harts appear idle. The in_wfi flag is only cleared when
-             * interrupt sources inject interrupts, so skipping resume would
-             * cause a deadlock where harts remain stuck waiting even after
-             * events arrive.
-             */
-            for (uint32_t i = 0; i < vm->n_hart; i++) {
-                coro_resume_hart(i);
-            }
-
-#if SEMU_HAS(VIRTIONET)
-            /* VirtIO-Net coroutine disabled for now */
-#endif
-        }
-
-        free(pfds);
-#ifdef __APPLE__
-        close(kq);
-#else
-        close(wfi_timer_fd);
-#endif
-        /* Free coroutine stacks/contexts from coro_init() above so the
-         * graceful-exit path matches what coro_create_hart()'s failure
-         * path already does. Idempotent against !initialized.
-         */
-        coro_cleanup();
-
-        /* A closed window is a normal user action, not an error. */
-#if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
-        if (emu_stopped_load(emu) && !g_window.window_is_closed())
-#else
-        if (emu_stopped_load(emu))
-#endif
-        {
-            emu->exit_code = 1;
-            return;
-        }
-
-        emu->exit_code = 0;
+    if (semu_should_use_threaded_runtime(emu)) {
+        semu_run_threaded(emu);
         return;
     }
 
-    /* Single-hart mode: use original scheduling */
+    int ret;
+
+    /* Single-hart mode: use inline scheduling. */
     while (!emu_stopped_load(emu)) {
         /* Break out on SIGINT/SIGTERM so atexit hooks fire on graceful exit. */
         if (signal_received)

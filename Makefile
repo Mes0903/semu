@@ -21,11 +21,8 @@ ROOTFS_CP ?= cp
 ROOTFS_CHOWN ?= chown
 ROOTFS_FAKEROOT_SHELL ?= /bin/sh
 
-ENABLE_THREADED ?= 0
-$(call set-feature, THREADED)
-ifeq ($(call has, THREADED), 1)
-    LDFLAGS += -lpthread
-endif
+CFLAGS += -pthread
+LDFLAGS += -pthread
 
 # external rootfs: boot from /dev/vda instead of unpacking initramfs.
 # Implies VIRTIOBLK and pulls the userland from rootfs.cpio into ext4.img.
@@ -236,7 +233,6 @@ OBJS := \
 	uart.o \
 	main.o \
 	aclint.o \
-	coro.o \
 	$(OBJS_EXTRA)
 
 deps := $(OBJS:%.o=.%.o.d)
