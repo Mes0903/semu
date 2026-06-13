@@ -14,21 +14,15 @@
 #include "utils.h"
 #include "virtio-actor.h"
 #include "virtio-gpu.h"
+#if SEMU_HAS(VIRGL)
+#include "vgpu-renderer.h"
+#endif
 #include "virtio-mmio.h"
 #include "virtio.h"
 
 #define VIRTIO_GPU_CMD_TRACE_ENABLED 0
 
-#define VIRTIO_GPU_F_VERSION_1 (UINT64_C(1) << 32)
-
 #define VIRTIO_GPU_EVENT_DISPLAY (1 << 0)
-#define VIRTIO_GPU_F_EDID (1 << 1)
-#define VIRTIO_GPU_F_VIRGL (1 << 0)
-#define VIRTIO_GPU_F_CONTEXT_INIT (1 << 4)
-
-#define VIRTIO_GPU_QUEUE_NUM_MAX 1024
-#define VIRTIO_GPU_CONTROLQ 0
-#define VIRTIO_GPU_CURSORQ 1
 
 /* DMT usage macro */
 #define EDID_BLOCK_SIZE 128U
@@ -166,6 +160,64 @@ int virtio_gpu_end_actor_completion(virtio_gpu_state_t *vgpu)
     if (!vgpu || !vgpu->actor_initialized)
         return -EINVAL;
     return virtio_actor_end_completion(&vgpu->actor);
+}
+
+static bool virtio_gpu_begin_actor_generation_completion(
+    virtio_gpu_state_t *vgpu,
+    uint64_t generation)
+{
+    bool accepted = vgpu && vgpu->actor_initialized &&
+                    virtio_actor_begin_completion(&vgpu->actor, generation);
+
+    return accepted;
+}
+
+int virtio_gpu_complete_deferred_ctrl(
+    virtio_gpu_state_t *vgpu,
+    const struct virtio_gpu_deferred_ctrl_completion *completion)
+{
+    struct virtq *queue;
+    int ret;
+
+    if (!vgpu || !completion || !vgpu->actor_initialized)
+        return -EINVAL;
+
+    ret = pthread_mutex_lock(&vgpu->common.transport_lock);
+    if (ret != 0)
+        return -ret;
+
+    if (completion->common_generation != vgpu->common.generation ||
+        vgpu->common.reset_in_progress ||
+        completion->queue_index >= vgpu->common.num_queues) {
+        pthread_mutex_unlock(&vgpu->common.transport_lock);
+        return -ECANCELED;
+    }
+
+    queue = &vgpu->common.queues[completion->queue_index];
+    if (!queue->ready ||
+        (virtio_gpu_status_load(vgpu) & VIRTIO_STATUS__DEVICE_NEEDS_RESET)) {
+        pthread_mutex_unlock(&vgpu->common.transport_lock);
+        return -ECANCELED;
+    }
+
+    if (!virtio_gpu_begin_actor_generation_completion(
+            vgpu, completion->actor_generation)) {
+        pthread_mutex_unlock(&vgpu->common.transport_lock);
+        return -ECANCELED;
+    }
+
+    ret = virtq_add_used(vgpu->common.dma, queue, completion->desc_head,
+                         completion->len);
+    if (ret == 0 && completion->trigger_irq &&
+        !virtq_interrupt_suppressed(vgpu->common.dma, queue))
+        virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__USED_RING);
+
+    virtio_gpu_end_actor_completion(vgpu);
+    pthread_mutex_unlock(&vgpu->common.transport_lock);
+
+    if (ret < 0)
+        virtio_gpu_set_fail(vgpu);
+    return ret;
 }
 
 void *virtio_gpu_get_request(virtio_gpu_state_t *vgpu,
@@ -663,6 +715,162 @@ void virtio_gpu_get_edid_handler(virtio_gpu_state_t *vgpu,
         response->hdr.fence_id = request->hdr.fence_id;
     }
     *plen = sizeof(*response);
+}
+
+#if SEMU_HAS(VIRGL)
+static void virtio_gpu_release_renderer_completion(
+    struct vgpu_renderer_completion *completion)
+{
+    if (!completion || !completion->response)
+        return;
+    if (completion->release_response)
+        completion->release_response(completion->response);
+    else
+        free(completion->response);
+    completion->response = NULL;
+}
+
+static void virtio_gpu_apply_renderer_side_effect(
+    virtio_gpu_state_t *vgpu,
+    const struct vgpu_renderer_completion *completion)
+{
+    if (g_virtio_gpu_backend.apply_renderer_side_effect)
+        g_virtio_gpu_backend.apply_renderer_side_effect(vgpu, completion);
+}
+
+static bool virtio_gpu_write_renderer_completion_response(
+    virtio_gpu_state_t *vgpu,
+    const struct vgpu_renderer_completion *completion,
+    uint32_t *len)
+{
+    if (!completion->has_response_desc)
+        return true;
+
+    if (completion->response) {
+        if (completion->response_size > completion->response_desc.len ||
+            completion->response_size > UINT32_MAX)
+            return false;
+
+        void *dst =
+            virtio_gpu_mem_guest_to_host(vgpu, completion->response_desc.addr,
+                                         (uint32_t) completion->response_size);
+        if (!dst)
+            return false;
+
+        memcpy(dst, completion->response, completion->response_size);
+        *len = (uint32_t) completion->response_size;
+        return true;
+    }
+
+    if (completion->response_type == 0)
+        return false;
+
+    *len = virtio_gpu_write_ctrl_response(vgpu, &completion->request_hdr,
+                                          &completion->response_desc,
+                                          completion->response_type);
+    return *len != 0;
+}
+
+static int virtio_gpu_complete_renderer_ctrl(
+    virtio_gpu_state_t *vgpu,
+    const struct vgpu_renderer_completion *completion)
+{
+    struct virtio_gpu_deferred_ctrl_completion ctrl;
+    struct virtq *queue;
+    uint32_t len;
+    int ret;
+
+    if (!vgpu || !completion || !completion->has_ctrl_completion)
+        return 0;
+
+    ctrl = completion->ctrl_completion;
+    len = ctrl.len;
+
+    ret = pthread_mutex_lock(&vgpu->common.transport_lock);
+    if (ret != 0)
+        return -ret;
+
+    if (ctrl.common_generation != vgpu->common.generation ||
+        vgpu->common.reset_in_progress ||
+        ctrl.queue_index >= vgpu->common.num_queues) {
+        pthread_mutex_unlock(&vgpu->common.transport_lock);
+        return -ECANCELED;
+    }
+
+    queue = &vgpu->common.queues[ctrl.queue_index];
+    if (!queue->ready ||
+        (virtio_gpu_status_load(vgpu) & VIRTIO_STATUS__DEVICE_NEEDS_RESET)) {
+        pthread_mutex_unlock(&vgpu->common.transport_lock);
+        return -ECANCELED;
+    }
+
+    if (!virtio_gpu_begin_actor_generation_completion(vgpu,
+                                                      ctrl.actor_generation)) {
+        pthread_mutex_unlock(&vgpu->common.transport_lock);
+        return -ECANCELED;
+    }
+
+    if (!virtio_gpu_write_renderer_completion_response(vgpu, completion,
+                                                       &len)) {
+        virtio_gpu_end_actor_completion(vgpu);
+        pthread_mutex_unlock(&vgpu->common.transport_lock);
+        virtio_gpu_set_fail(vgpu);
+        return -EFAULT;
+    }
+
+    virtio_gpu_apply_renderer_side_effect(vgpu, completion);
+
+    ctrl.len = len;
+    ret = virtq_add_used(vgpu->common.dma, queue, ctrl.desc_head, ctrl.len);
+    if (ret == 0 && ctrl.trigger_irq &&
+        !virtq_interrupt_suppressed(vgpu->common.dma, queue))
+        virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__USED_RING);
+
+    virtio_gpu_end_actor_completion(vgpu);
+    pthread_mutex_unlock(&vgpu->common.transport_lock);
+
+    if (ret < 0)
+        virtio_gpu_set_fail(vgpu);
+    return ret;
+}
+#endif
+
+void virtio_gpu_drain_renderer_completions(virtio_gpu_state_t *vgpu)
+{
+#if SEMU_HAS(VIRGL)
+    struct vgpu_renderer_completion completion;
+
+    if (!vgpu)
+        return;
+
+    while (vgpu_renderer_pop_completion(&completion)) {
+        switch (completion.type) {
+        case VGPU_RENDERER_DONE_CTRL:
+            if (!completion.has_ctrl_completion) {
+                virtio_gpu_set_fail(vgpu);
+                break;
+            }
+            (void) virtio_gpu_complete_renderer_ctrl(vgpu, &completion);
+            break;
+        case VGPU_RENDERER_DONE_VIRGL_RESOURCE:
+            if (completion.has_ctrl_completion)
+                (void) virtio_gpu_complete_renderer_ctrl(vgpu, &completion);
+            else
+                virtio_gpu_apply_renderer_side_effect(vgpu, &completion);
+            break;
+        case VGPU_RENDERER_DONE_FENCE:
+            if (completion.has_ctrl_completion)
+                (void) virtio_gpu_complete_renderer_ctrl(vgpu, &completion);
+            break;
+        case VGPU_RENDERER_DONE_FATAL:
+            virtio_gpu_set_fail(vgpu);
+            break;
+        }
+        virtio_gpu_release_renderer_completion(&completion);
+    }
+#else
+    (void) vgpu;
+#endif
 }
 
 void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
@@ -1180,7 +1388,12 @@ static int virtio_gpu_reset(void *opaque,
     virtio_gpu_state_t *vgpu = opaque;
 
     (void) old_generation;
+
+#if SEMU_HAS(VIRGL)
+    vgpu_renderer_reset_queues(new_generation);
+#else
     (void) new_generation;
+#endif
 
     if (g_virtio_gpu_backend.reset)
         g_virtio_gpu_backend.reset(vgpu);
@@ -1264,6 +1477,9 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
                 __func__);
         exit(EXIT_FAILURE);
     }
+#if SEMU_HAS(VIRGL)
+    vgpu_renderer_reset_queues(vgpu->common.generation);
+#endif
 
     if (virtio_actor_init(&vgpu->actor, &virtio_gpu_actor_ops, vgpu,
                           ARRAY_SIZE(queue_max_sizes)) < 0) {

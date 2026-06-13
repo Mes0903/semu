@@ -16,12 +16,21 @@
 #define VIRTIO_GPU_CMD_UNDEF virtio_gpu_cmd_undefined_handler
 #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
 
+#define VIRTIO_GPU_F_VIRGL (UINT64_C(1) << 0)
+#define VIRTIO_GPU_F_EDID (UINT64_C(1) << 1)
+#define VIRTIO_GPU_F_CONTEXT_INIT (UINT64_C(1) << 4)
+#define VIRTIO_GPU_F_VERSION_1 (UINT64_C(1) << 32)
+
+#define VIRTIO_GPU_QUEUE_NUM_MAX 1024
+
 /* Common virtq already bounds a descriptor chain by queue size. Keep the
  * backend descriptor view large enough for the full GPU queue so Linux
  * scatter-gather control buffers are not rejected solely because they exceed
  * the old request + data + response shape.
  */
-#define VIRTIO_GPU_MAX_DESC 1024
+#define VIRTIO_GPU_MAX_DESC VIRTIO_GPU_QUEUE_NUM_MAX
+#define VIRTIO_GPU_CONTROLQ 0
+#define VIRTIO_GPU_CURSORQ 1
 
 /* Core per-scanout metadata keyed by the guest-visible 'scanout_id'. This
  * combines guest-visible display info ('width'/'height'/'enabled') with the
@@ -308,13 +317,28 @@ enum virtio_gpu_formats {
     VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM = 134
 };
 
+struct virtio_gpu_deferred_ctrl_completion {
+    uint16_t queue_index;
+    uint32_t desc_head;
+    uint32_t len;
+    uint64_t actor_generation;
+    uint64_t common_generation;
+    bool trigger_irq;
+};
+
+struct vgpu_renderer_completion;
+
 typedef void (*virtio_gpu_cmd_func)(virtio_gpu_state_t *vgpu,
                                     struct virtq_desc *vq_desc,
                                     uint32_t *plen);
 typedef void (*virtio_gpu_backend_lifecycle_func)(virtio_gpu_state_t *vgpu);
+typedef void (*virtio_gpu_renderer_side_effect_func)(
+    virtio_gpu_state_t *vgpu,
+    const struct vgpu_renderer_completion *completion);
 
 struct virtio_gpu_cmd_backend {
     virtio_gpu_backend_lifecycle_func reset;
+    virtio_gpu_renderer_side_effect_func apply_renderer_side_effect;
     /* 2D commands */
     virtio_gpu_cmd_func get_display_info;
     virtio_gpu_cmd_func resource_create_2d;
@@ -376,6 +400,11 @@ uint32_t virtio_gpu_write_ctrl_response(
     uint32_t type);
 
 void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu);
+void virtio_gpu_set_num_capsets(virtio_gpu_state_t *vgpu, uint32_t num_capsets);
+int virtio_gpu_complete_deferred_ctrl(
+    virtio_gpu_state_t *vgpu,
+    const struct virtio_gpu_deferred_ctrl_completion *completion);
+void virtio_gpu_drain_renderer_completions(virtio_gpu_state_t *vgpu);
 struct virtio_gpu_debug_counters virtio_gpu_debug_counters(
     virtio_gpu_state_t *vgpu);
 
