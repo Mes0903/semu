@@ -1841,6 +1841,13 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     /* Initialize the emulator */
     memset(emu, 0, sizeof(*emu));
 
+    int lifecycle_ret = semu_vm_lifecycle_init(&emu->lifecycle);
+    if (lifecycle_ret < 0) {
+        errno = -lifecycle_ret;
+        perror("semu_vm_lifecycle_init");
+        return 1;
+    }
+
 #define INIT_EMU_MUTEX(lock)              \
     do {                                  \
         if (emu_mutex_init(&(lock))) {    \

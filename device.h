@@ -9,6 +9,7 @@
 #include "ram_access.h"
 #include "riscv.h"
 #include "virtio.h"
+#include "vm-lifecycle.h"
 
 /* RAM */
 
@@ -585,6 +586,7 @@ typedef struct emu_state {
     int exit_code;
     bool debug;
     _Atomic bool stopped;
+    struct semu_vm_lifecycle lifecycle;
     uint32_t *ram;
     ram_dma_t ram_dma;
     uint32_t *disk;

@@ -236,6 +236,7 @@ OBJS := \
 	irq-source.o \
 	hart-mailbox.o \
 	semu-event.o \
+	vm-lifecycle.o \
 	uart.o \
 	main.o \
 	aclint.o \
