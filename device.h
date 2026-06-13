@@ -555,6 +555,24 @@ bool virtio_fs_init(virtio_fs_state_t *vfs, char *mtag, char *dir);
 #endif /* SEMU_HAS(VIRTIOFS) */
 
 /* memory mapping */
+typedef enum {
+    SEMU_RFENCE_NONE = 0,
+    SEMU_RFENCE_I,
+    SEMU_RFENCE_VMA,
+} semu_rfence_type_t;
+
+typedef struct {
+    _Atomic bool initialized;
+    _Atomic int type;
+    uint32_t start_addr;
+    uint32_t size;
+    uint32_t asid;
+    _Atomic int32_t pending_count;
+    pthread_mutex_t issue_mutex;
+    pthread_mutex_t completion_mutex;
+    pthread_cond_t completion_cond;
+} rfence_request_t;
+
 typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -631,6 +649,7 @@ typedef struct {
     hart_wait_t *hart_wait;
 
     _Atomic uint32_t peripheral_update_ctr;
+    rfence_request_t rfence;
 
     /* The fields used for debug mode */
     bool is_interrupted;

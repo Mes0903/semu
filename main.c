@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,7 @@ static void *hart_thread_func(void *arg);
 static void *io_thread_func(void *arg);
 #endif
 static volatile sig_atomic_t signal_received = 0;
+static void semu_process_pending_rfence(hart_t *hart);
 static int semu_step_chunk(emu_state_t *emu, hart_t *hart, int steps);
 static int semu_service_hart_step(emu_state_t *emu, hart_t *hart);
 static int semu_run_chunk(emu_state_t *emu, int steps);
@@ -228,11 +230,148 @@ static void semu_wake_interruptible_harts(emu_state_t *emu)
 #endif
 }
 
+static inline bool semu_rfence_initialized_load(emu_state_t *emu)
+{
+    return __atomic_load_n(&emu->rfence.initialized, __ATOMIC_ACQUIRE);
+}
+
+static inline void semu_rfence_initialized_store(emu_state_t *emu, bool value)
+{
+    __atomic_store_n(&emu->rfence.initialized, value, __ATOMIC_RELEASE);
+}
+
 static void semu_set_stopped(emu_state_t *emu, bool value)
 {
     emu_stopped_store(emu, value);
-    if (value)
+    if (value) {
         semu_signal_all_harts(emu);
+        if (semu_rfence_initialized_load(emu)) {
+            pthread_mutex_lock(&emu->rfence.completion_mutex);
+            pthread_cond_broadcast(&emu->rfence.completion_cond);
+            pthread_mutex_unlock(&emu->rfence.completion_mutex);
+        }
+    }
+}
+
+static inline int32_t semu_rfence_pending_count_load(emu_state_t *emu)
+{
+    return __atomic_load_n(&emu->rfence.pending_count, __ATOMIC_ACQUIRE);
+}
+
+static inline void semu_rfence_pending_count_store(emu_state_t *emu,
+                                                   int32_t value)
+{
+    __atomic_store_n(&emu->rfence.pending_count, value, __ATOMIC_RELEASE);
+}
+
+static inline int semu_rfence_type_load(emu_state_t *emu)
+{
+    return __atomic_load_n(&emu->rfence.type, __ATOMIC_ACQUIRE);
+}
+
+static inline void semu_rfence_type_store(emu_state_t *emu, int type)
+{
+    __atomic_store_n(&emu->rfence.type, type, __ATOMIC_RELEASE);
+}
+
+static int semu_rfence_init(emu_state_t *emu)
+{
+    int rc;
+
+    semu_rfence_initialized_store(emu, false);
+    semu_rfence_type_store(emu, SEMU_RFENCE_NONE);
+    semu_rfence_pending_count_store(emu, 0);
+    rc = emu_mutex_init(&emu->rfence.issue_mutex);
+    if (rc)
+        return rc;
+    rc = emu_mutex_init(&emu->rfence.completion_mutex);
+    if (rc)
+        return rc;
+    rc = pthread_cond_init(&emu->rfence.completion_cond, NULL);
+    if (rc) {
+        errno = rc;
+        return rc;
+    }
+    semu_rfence_initialized_store(emu, true);
+    return 0;
+}
+
+static bool semu_rfence_targets_hart(uint32_t hartid,
+                                     uint32_t hart_mask,
+                                     uint32_t hart_mask_base)
+{
+    if (hart_mask_base == UINT32_MAX)
+        return true;
+    if (hartid < hart_mask_base)
+        return false;
+
+    uint32_t bit = hartid - hart_mask_base;
+    if (bit >= 32)
+        return false;
+    return ((hart_mask >> bit) & 1U) != 0;
+}
+
+static void semu_apply_rfence(hart_t *hart,
+                              int type,
+                              uint32_t start_addr,
+                              uint32_t size)
+{
+    switch (type) {
+    case SEMU_RFENCE_I:
+        mmu_invalidate(hart);
+        break;
+    case SEMU_RFENCE_VMA:
+        mmu_invalidate_range(hart, start_addr, size);
+        break;
+    default:
+        break;
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+static void UNUSED semu_rfence_ack(emu_state_t *emu)
+{
+    int32_t old =
+        __atomic_fetch_sub(&emu->rfence.pending_count, 1, __ATOMIC_ACQ_REL);
+    if (old == 1) {
+        pthread_mutex_lock(&emu->rfence.completion_mutex);
+        pthread_cond_broadcast(&emu->rfence.completion_cond);
+        pthread_mutex_unlock(&emu->rfence.completion_mutex);
+    }
+}
+
+static void semu_process_pending_rfence(hart_t *hart)
+{
+#if SEMU_HAS(THREADED)
+    if (!hart_pending_rfence_load(hart))
+        return;
+
+    emu_state_t *emu = PRIV(hart);
+    int type = semu_rfence_type_load(emu);
+    uint32_t start_addr = emu->rfence.start_addr;
+    uint32_t size = emu->rfence.size;
+
+    hart_pending_rfence_store(hart, false);
+    semu_apply_rfence(hart, type, start_addr, size);
+    semu_rfence_ack(emu);
+#else
+    (void) hart;
+#endif
+}
+
+static void UNUSED semu_lock_rfence_issue(emu_state_t *emu, hart_t *requester)
+{
+#if SEMU_HAS(THREADED)
+    for (;;) {
+        semu_process_pending_rfence(requester);
+        if (pthread_mutex_trylock(&emu->rfence.issue_mutex) == 0)
+            return;
+        sched_yield();
+    }
+#else
+    (void) emu;
+    (void) requester;
+#endif
 }
 
 static void emu_update_plic_irq(emu_state_t *emu, uint32_t irq_bit, bool active)
@@ -891,46 +1030,133 @@ static inline sbi_ret_t handle_sbi_ecall_IPI(hart_t *hart, int32_t fid)
     }
 }
 
+static sbi_ret_t UNUSED semu_rfence_threaded(hart_t *hart,
+                                             int type,
+                                             uint32_t hart_mask,
+                                             uint32_t hart_mask_base,
+                                             uint32_t start_addr,
+                                             uint32_t size,
+                                             uint32_t asid)
+{
+#if SEMU_HAS(THREADED)
+    emu_state_t *emu = PRIV(hart);
+    vm_t *vm = hart->vm;
+    int32_t pending_count = 0;
+    bool pending_targets[vm->n_hart];
+
+    memset(pending_targets, 0, sizeof(pending_targets));
+
+    semu_lock_rfence_issue(emu, hart);
+
+    emu->rfence.start_addr = start_addr;
+    emu->rfence.size = size;
+    emu->rfence.asid = asid;
+    semu_rfence_type_store(emu, type);
+
+    for (uint32_t i = 0; i < vm->n_hart; i++) {
+        hart_t *target = vm->hart[i];
+        if (!semu_rfence_targets_hart(i, hart_mask, hart_mask_base))
+            continue;
+
+        if (i == hart->mhartid ||
+            hart_hsm_status_load(target) != SBI_HSM_STATE_STARTED) {
+            semu_apply_rfence(target, type, start_addr, size);
+            continue;
+        }
+
+        pending_targets[i] = true;
+        pending_count++;
+    }
+
+    semu_rfence_pending_count_store(emu, pending_count);
+    for (uint32_t i = 0; i < vm->n_hart; i++) {
+        if (!pending_targets[i])
+            continue;
+        hart_pending_rfence_store(vm->hart[i], true);
+        semu_signal_hart(emu, i);
+    }
+
+    pthread_mutex_lock(&emu->rfence.completion_mutex);
+    while (semu_rfence_pending_count_load(emu) > 0 && !emu_stopped_load(emu)) {
+        pthread_cond_wait(&emu->rfence.completion_cond,
+                          &emu->rfence.completion_mutex);
+    }
+    bool stopped = semu_rfence_pending_count_load(emu) > 0;
+    pthread_mutex_unlock(&emu->rfence.completion_mutex);
+
+    if (!stopped)
+        semu_rfence_type_store(emu, SEMU_RFENCE_NONE);
+    pthread_mutex_unlock(&emu->rfence.issue_mutex);
+    return (sbi_ret_t) {stopped ? SBI_ERR_FAILED : SBI_SUCCESS, 0};
+#else
+    (void) hart;
+    (void) type;
+    (void) hart_mask;
+    (void) hart_mask_base;
+    (void) start_addr;
+    (void) size;
+    (void) asid;
+    return (sbi_ret_t) {SBI_ERR_FAILED, 0};
+#endif
+}
+
+static sbi_ret_t UNUSED semu_rfence_direct(hart_t *hart,
+                                           int type,
+                                           uint32_t hart_mask,
+                                           uint32_t hart_mask_base,
+                                           uint32_t start_addr,
+                                           uint32_t size)
+{
+    for (uint32_t i = 0; i < hart->vm->n_hart; i++) {
+        if (semu_rfence_targets_hart(i, hart_mask, hart_mask_base))
+            semu_apply_rfence(hart->vm->hart[i], type, start_addr, size);
+    }
+    return (sbi_ret_t) {SBI_SUCCESS, 0};
+}
+
+static sbi_ret_t semu_rfence_request(hart_t *hart,
+                                     int type,
+                                     uint32_t hart_mask,
+                                     uint32_t hart_mask_base,
+                                     uint32_t start_addr,
+                                     uint32_t size,
+                                     uint32_t asid)
+{
+#if SEMU_HAS(THREADED)
+    return semu_rfence_threaded(hart, type, hart_mask, hart_mask_base,
+                                start_addr, size, asid);
+#else
+    (void) asid;
+    return semu_rfence_direct(hart, type, hart_mask, hart_mask_base, start_addr,
+                              size);
+#endif
+}
+
 static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
 {
     uint32_t hart_mask, hart_mask_base;
-    uint32_t start_addr, size;
+    uint32_t start_addr, size, asid;
     switch (fid) {
     case SBI_RFENCE__I:
         hart_mask = hart->x_regs[RV_R_A0];
         hart_mask_base = hart->x_regs[RV_R_A1];
-
-        if (hart_mask_base == UINT32_MAX) {
-            for (uint32_t i = 0; i < hart->vm->n_hart; i++)
-                vm_fence_i(hart->vm->hart[i]);
-        } else {
-            for (uint32_t i = hart_mask_base; hart_mask && i < hart->vm->n_hart;
-                 hart_mask >>= 1, i++) {
-                if (hart_mask & 1)
-                    vm_fence_i(hart->vm->hart[i]);
-            }
-        }
-        return (sbi_ret_t) {SBI_SUCCESS, 0};
+        return semu_rfence_request(hart, SEMU_RFENCE_I, hart_mask,
+                                   hart_mask_base, 0, (uint32_t) -1, 0);
     case SBI_RFENCE__VMA:
+        hart_mask = hart->x_regs[RV_R_A0];
+        hart_mask_base = hart->x_regs[RV_R_A1];
+        start_addr = hart->x_regs[RV_R_A2];
+        size = hart->x_regs[RV_R_A3];
+        return semu_rfence_request(hart, SEMU_RFENCE_VMA, hart_mask,
+                                   hart_mask_base, start_addr, size, 0);
     case SBI_RFENCE__VMA_ASID:
         hart_mask = hart->x_regs[RV_R_A0];
         hart_mask_base = hart->x_regs[RV_R_A1];
         start_addr = hart->x_regs[RV_R_A2];
         size = hart->x_regs[RV_R_A3];
-
-        if (hart_mask_base == UINT32_MAX) {
-            /* Flush all harts */
-            for (uint32_t i = 0; i < hart->vm->n_hart; i++)
-                mmu_invalidate_range(hart->vm->hart[i], start_addr, size);
-        } else {
-            /* Flush specified harts based on mask */
-            for (uint32_t i = hart_mask_base; hart_mask && i < hart->vm->n_hart;
-                 hart_mask >>= 1, i++) {
-                if (hart_mask & 1)
-                    mmu_invalidate_range(hart->vm->hart[i], start_addr, size);
-            }
-        }
-        return (sbi_ret_t) {SBI_SUCCESS, 0};
+        asid = hart->x_regs[RV_R_A4];
+        return semu_rfence_request(hart, SEMU_RFENCE_VMA, hart_mask,
+                                   hart_mask_base, start_addr, size, asid);
     case SBI_RFENCE__GVMA_VMID:
     case SBI_RFENCE__GVMA:
     case SBI_RFENCE__VVMA_ASID:
@@ -941,6 +1167,7 @@ static inline sbi_ret_t handle_sbi_ecall_RFENCE(hart_t *hart, int32_t fid)
         return (sbi_ret_t) {SBI_ERR_FAILED, 0};
     }
 }
+
 
 #define RV_MVENDORID 0x12345678
 #define RV_MARCHID ((1ULL << 31) | 1)
@@ -1366,6 +1593,10 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
         return 1;
     }
     __atomic_store_n(&vm->any_reservation_active, false, __ATOMIC_RELAXED);
+    if (semu_rfence_init(emu)) {
+        perror("rfence init");
+        return 1;
+    }
 #if SEMU_HAS(THREADED)
     if (pthread_mutex_init(&vm->reservation_lock, NULL)) {
         perror("reservation lock init");
@@ -1612,8 +1843,11 @@ static void wfi_handler_threaded(hart_t *hart)
     hart_in_wfi_store(hart, true);
     while (!emu_stopped_load(emu) &&
            hart_hsm_status_load(hart) == SBI_HSM_STATE_STARTED) {
+        semu_process_pending_rfence(hart);
         emu_update_timer_interrupt(hart);
         emu_update_swi_interrupt(hart);
+        if (hart_pending_rfence_load(hart))
+            continue;
         if (hart_sip_load(hart) & hart_sie_load(hart))
             break;
 
@@ -1658,6 +1892,12 @@ static void wait_for_hart_start(emu_state_t *emu,
            hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED) {
         int32_t state = hart_hsm_status_load(hart);
         was_suspended |= state == SBI_HSM_STATE_SUSPENDED;
+        if (hart_pending_rfence_load(hart)) {
+            pthread_mutex_unlock(&emu->hart_wait[id].mutex);
+            semu_process_pending_rfence(hart);
+            pthread_mutex_lock(&emu->hart_wait[id].mutex);
+            continue;
+        }
         pthread_cond_wait(&emu->hart_wait[id].cond, &emu->hart_wait[id].mutex);
     }
     pthread_mutex_unlock(&emu->hart_wait[id].mutex);
@@ -1689,6 +1929,7 @@ static void *hart_thread_func(void *arg)
 
         for (int i = 0; i < SEMU_SMP_BATCH_STEPS && !emu_stopped_load(emu);
              i += SEMU_SMP_SLICE_STEPS) {
+            semu_process_pending_rfence(hart);
             if (hart_hsm_status_load(hart) != SBI_HSM_STATE_STARTED)
                 break;
 
@@ -1816,6 +2057,7 @@ static int semu_step(emu_state_t *emu)
 
 static int semu_service_hart_step(emu_state_t *emu, hart_t *hart)
 {
+    semu_process_pending_rfence(hart);
     emu_tick_peripherals(emu);
     emu_update_timer_interrupt(hart);
     emu_update_swi_interrupt(hart);

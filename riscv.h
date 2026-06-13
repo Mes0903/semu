@@ -147,6 +147,7 @@ struct __hart_internal {
     bool s_mode;
     _Atomic uint32_t sie;
     _Atomic uint32_t sip;
+    _Atomic bool pending_rfence;
 
     semu_timer_t time;
 
@@ -250,6 +251,16 @@ static inline bool hart_in_wfi_load(const hart_t *hart)
 static inline void hart_in_wfi_store(hart_t *hart, bool value)
 {
     __atomic_store_n(&hart->in_wfi, value, __ATOMIC_RELAXED);
+}
+
+static inline bool hart_pending_rfence_load(const hart_t *hart)
+{
+    return __atomic_load_n(&hart->pending_rfence, __ATOMIC_ACQUIRE);
+}
+
+static inline void hart_pending_rfence_store(hart_t *hart, bool value)
+{
+    __atomic_store_n(&hart->pending_rfence, value, __ATOMIC_RELEASE);
 }
 
 static inline int32_t hart_hsm_status_load(const hart_t *hart)
