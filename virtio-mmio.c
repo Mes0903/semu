@@ -641,6 +641,10 @@ int virtio_mmio_read(struct virtio_device_common *common,
         if (!virtio_mmio_config_width_ok(width))
             return -EINVAL;
         pthread_mutex_lock(&common->transport_lock);
+        if (common->reset_in_progress) {
+            pthread_mutex_unlock(&common->transport_lock);
+            return -EBUSY;
+        }
         ops = common->ops;
         opaque = common->opaque;
         pthread_mutex_unlock(&common->transport_lock);
