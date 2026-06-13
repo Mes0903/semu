@@ -917,6 +917,59 @@ static void vgpu_sw_cmd_transfer_to_host_2d_handler(virtio_gpu_state_t *vgpu,
         virtio_gpu_set_fail(vgpu);
 }
 
+static size_t vgpu_sw_readable_desc_bytes(const struct virtq_desc *vq_desc,
+                                          size_t first)
+{
+    size_t total = 0;
+
+    for (size_t i = first; i < VIRTIO_GPU_MAX_DESC; i++) {
+        if (vq_desc[i].flags & VIRTIO_DESC_F_WRITE)
+            break;
+        if (vq_desc[i].len == 0)
+            continue;
+        if (SIZE_MAX - total < vq_desc[i].len)
+            return SIZE_MAX;
+        total += vq_desc[i].len;
+    }
+
+    return total;
+}
+
+static bool vgpu_sw_copy_readable_descs(virtio_gpu_state_t *vgpu,
+                                        const struct virtq_desc *vq_desc,
+                                        size_t first,
+                                        void *dst,
+                                        size_t bytes)
+{
+    size_t done = 0;
+
+    for (size_t i = first; i < VIRTIO_GPU_MAX_DESC && done < bytes; i++) {
+        size_t chunk;
+        void *src;
+
+        if (vq_desc[i].flags & VIRTIO_DESC_F_WRITE)
+            break;
+        if (vq_desc[i].len == 0)
+            continue;
+        if (vq_desc[i].addr > UINT32_MAX)
+            return false;
+
+        chunk = MIN((size_t) vq_desc[i].len, bytes - done);
+        if (chunk > UINT32_MAX)
+            return false;
+
+        src = virtio_gpu_mem_guest_to_host(vgpu, (uint32_t) vq_desc[i].addr,
+                                           (uint32_t) chunk);
+        if (!src)
+            return false;
+
+        memcpy((uint8_t *) dst + done, src, chunk);
+        done += chunk;
+    }
+
+    return done == bytes;
+}
+
 static void vgpu_sw_cmd_resource_attach_backing_handler(
     virtio_gpu_state_t *vgpu,
     struct virtq_desc *vq_desc,
@@ -961,16 +1014,13 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
         return;
     }
 
-    /* The entry cap above keeps 'entries_size' small. semu currently targets
-     * 64-bit hosts, so this path does not guard for 32-bit host overflow yet.
-     */
     size_t entries_size =
         sizeof(struct virtio_gpu_mem_entry) * backing_info->nr_entries;
 
-    if (vq_desc[1].len < entries_size) {
+    if (vgpu_sw_readable_desc_bytes(vq_desc, 1) < entries_size) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
-                "%s(): backing entries descriptor too small\n",
+                "%s(): backing entries descriptors too small\n",
                 __func__);
         *plen = virtio_gpu_write_ctrl_response(
             vgpu, &backing_info->hdr, response_desc,
@@ -980,15 +1030,23 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
         return;
     }
 
-    struct virtio_gpu_mem_entry *pages = virtio_gpu_mem_guest_to_host(
-        vgpu, vq_desc[1].addr, (uint32_t) entries_size);
+    struct virtio_gpu_mem_entry *pages = malloc(entries_size);
     if (!pages) {
+        fprintf(stderr,
+                VIRTIO_GPU_LOG_PREFIX "%s(): failed to allocate backing copy\n",
+                __func__);
         virtio_gpu_set_fail(vgpu);
         *plen = 0;
         return;
     }
 
-    /* Retrieve 2D resource */
+    if (!vgpu_sw_copy_readable_descs(vgpu, vq_desc, 1, pages, entries_size)) {
+        free(pages);
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return;
+    }
+
     struct vgpu_sw_resource_2d *res_2d =
         vgpu_sw_get_resource_2d(backing_info->resource_id);
     if (!res_2d) {
@@ -999,10 +1057,10 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
             VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
         if (!*plen)
             virtio_gpu_set_fail(vgpu);
+        free(pages);
         return;
     }
 
-    /* Check if backing is already attached */
     if (res_2d->iovec) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
@@ -1013,10 +1071,10 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
                                                VIRTIO_GPU_RESP_ERR_UNSPEC);
         if (!*plen)
             virtio_gpu_set_fail(vgpu);
+        free(pages);
         return;
     }
 
-    /* Dispatch page memories to the 2D resource */
     res_2d->page_cnt = backing_info->nr_entries;
     res_2d->iovec = malloc(sizeof(struct iovec) * backing_info->nr_entries);
     if (!res_2d->iovec) {
@@ -1025,10 +1083,11 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
                 __func__);
         virtio_gpu_set_fail(vgpu);
         *plen = 0;
+        res_2d->page_cnt = 0;
+        free(pages);
         return;
     }
 
-    /* Convert each guest-provided backing entry into one host-side 'iovec'. */
     for (size_t i = 0; i < backing_info->nr_entries; i++) {
         if (pages[i].addr > UINT32_MAX) {
             fprintf(stderr,
@@ -1042,15 +1101,14 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
                 VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
             if (!*plen)
                 virtio_gpu_set_fail(vgpu);
+            free(pages);
             return;
         }
 
-        /* Attach address and length of i-th page to the 2D resource. */
         res_2d->iovec[i].iov_base = virtio_gpu_mem_guest_to_host(
             vgpu, (uint32_t) pages[i].addr, pages[i].length);
         res_2d->iovec[i].iov_len = pages[i].length;
 
-        /* Corrupted page address */
         if (!res_2d->iovec[i].iov_base) {
             fprintf(stderr,
                     VIRTIO_GPU_LOG_PREFIX
@@ -1066,6 +1124,7 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
                 VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
             if (!*plen)
                 virtio_gpu_set_fail(vgpu);
+            free(pages);
             return;
         }
     }
@@ -1074,6 +1133,7 @@ static void vgpu_sw_cmd_resource_attach_backing_handler(
         vgpu, &backing_info->hdr, response_desc, VIRTIO_GPU_RESP_OK_NODATA);
     if (!*plen)
         virtio_gpu_set_fail(vgpu);
+    free(pages);
 }
 
 static void vgpu_sw_cmd_resource_detach_backing_handler(

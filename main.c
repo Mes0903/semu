@@ -621,7 +621,8 @@ static void UNUSED emu_update_vgpu_interrupts(vm_t *vm)
     emu_state_t *data = PRIV(vm->hart[0]);
     bool pending;
 
-    EMU_DEVICE_CALL(data->vgpu_lock, pending = data->vgpu.InterruptStatus != 0);
+    EMU_DEVICE_CALL(data->vgpu_lock,
+                    pending = virtio_gpu_irq_pending(&data->vgpu));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VGPU, pending);
 }
 #endif
@@ -1253,7 +1254,7 @@ static bool semu_mmio_vgpu_write(hart_t *hart,
     EMU_DEVICE_CALL(
         data->vgpu_lock,
         virtio_gpu_write(hart, &data->vgpu, (uint32_t) off, width, value);
-        pending = data->vgpu.InterruptStatus != 0);
+        pending = virtio_gpu_irq_pending(&data->vgpu));
     emu_update_plic_irq(data, SEMU_IRQ_SOURCE_VGPU, pending);
     return true;
 }
@@ -2225,8 +2226,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
 #endif
 
 #if SEMU_HAS(VIRTIOGPU)
-    emu->vgpu.ram = emu->ram;
-    virtio_gpu_init(&(emu->vgpu));
+    virtio_gpu_init(&(emu->vgpu), emu);
     uint32_t scanout_id =
         virtio_gpu_register_scanout(&(emu->vgpu), SCREEN_WIDTH, SCREEN_HEIGHT);
     vgpu_display_set_scanout_count(scanout_id + 1U);

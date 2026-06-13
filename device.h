@@ -292,25 +292,7 @@ bool virtio_input_irq_pending(virtio_input_state_t *vinput);
 #define IRQ_VGPU_BIT (1 << IRQ_VGPU)
 
 typedef struct {
-    uint32_t QueueNum;
-    uint32_t QueueDesc;
-    uint32_t QueueAvail;
-    uint32_t QueueUsed;
-    uint16_t last_avail;
-    bool ready;
-} virtio_gpu_queue_t;
-
-typedef struct {
-    /* feature negotiation */
-    uint32_t DeviceFeaturesSel;
-    uint32_t DriverFeatures;
-    uint32_t DriverFeaturesSel;
-    /* queue config */
-    uint32_t QueueSel;
-    virtio_gpu_queue_t queues[2];
-    /* status */
-    uint32_t Status;
-    uint32_t InterruptStatus;
+    struct virtio_device_common common;
     /* supplied by environment */
     uint32_t *ram;
     /* implementation-specific */
@@ -332,10 +314,11 @@ void virtio_gpu_write(hart_t *vm,
 /* Initializes the process-wide virtio-gpu singleton. semu currently supports
  * one in-process GPU instance; a second call is fatal.
  */
-void virtio_gpu_init(virtio_gpu_state_t *vgpu);
+void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu);
 uint32_t virtio_gpu_register_scanout(virtio_gpu_state_t *vgpu,
                                      uint32_t width,
                                      uint32_t height);
+bool virtio_gpu_irq_pending(virtio_gpu_state_t *vgpu);
 #endif /* SEMU_HAS(VIRTIOGPU) */
 
 /* ACLINT MTIMER */

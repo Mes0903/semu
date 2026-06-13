@@ -13,18 +13,18 @@
 #include "riscv_private.h"
 #include "utils.h"
 #include "virtio-gpu.h"
+#include "virtio-mmio.h"
 #include "virtio.h"
 
 #define VIRTIO_GPU_CMD_TRACE_ENABLED 0
 
-#define VIRTIO_F_VERSION_1 1
+#define VIRTIO_GPU_F_VERSION_1 (UINT64_C(1) << 32)
 
 #define VIRTIO_GPU_EVENT_DISPLAY (1 << 0)
 #define VIRTIO_GPU_F_EDID (1 << 1)
 #define VIRTIO_GPU_F_CONTEXT_INIT (1 << 4)
 
 #define VIRTIO_GPU_QUEUE_NUM_MAX 1024
-#define VIRTIO_GPU_QUEUE (vgpu->queues[vgpu->QueueSel])
 #define VIRTIO_GPU_CONTROLQ 0
 #define VIRTIO_GPU_CURSORQ 1
 
@@ -67,7 +67,7 @@ void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
                                    uint32_t addr,
                                    uint32_t size)
 {
-    if (addr >= RAM_SIZE || size > RAM_SIZE || addr + size > RAM_SIZE) {
+    if (addr >= RAM_SIZE || size > RAM_SIZE - addr) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
                 "%s(): guest address 0x%x size 0x%x out of bounds\n",
@@ -77,11 +77,18 @@ void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
     return (void *) ((uintptr_t) vgpu->ram + addr);
 }
 
+static inline unsigned virtio_gpu_status_load(virtio_gpu_state_t *vgpu)
+{
+    return atomic_load_explicit(&vgpu->common.status, memory_order_acquire);
+}
+
 void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu)
 {
-    vgpu->Status |= VIRTIO_STATUS__DEVICE_NEEDS_RESET;
-    if (vgpu->Status & VIRTIO_STATUS__DRIVER_OK)
-        vgpu->InterruptStatus |= VIRTIO_INT__CONF_CHANGE;
+    unsigned status = virtio_gpu_status_load(vgpu);
+
+    virtio_device_common_set_needs_reset(&vgpu->common);
+    if (status & VIRTIO_STATUS__DRIVER_OK)
+        virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__CONF_CHANGE);
 }
 
 void *virtio_gpu_get_request(virtio_gpu_state_t *vgpu,
@@ -100,16 +107,13 @@ const struct virtq_desc *virtio_gpu_get_response_desc(
     struct virtq_desc *vq_desc,
     size_t response_size)
 {
-    /* Walk the fixed-shape descriptor chain ('vq_desc[0]' is the request,
-     * optional command data follows, and the first writable descriptor is the
-     * response buffer). A writable descriptor that is too small means the
-     * expected response buffer is malformed; this helper does not skip it and
-     * search for a later writable descriptor.
-     *
-     * TODO: Support generic descriptor-chain parsing.
+    /* The common virtq adapter stores all device-readable segments first and
+     * then all writable response segments. The first writable segment is the
+     * response buffer for current 2D commands; a too-small writable descriptor
+     * is malformed, so do not skip past it looking for another response.
      */
     if (response_size <= UINT32_MAX) {
-        for (int i = 1; i < VIRTIO_GPU_MAX_DESC; i++) {
+        for (size_t i = 1; i < VIRTIO_GPU_MAX_DESC; i++) {
             if (!(vq_desc[i].flags & VIRTIO_DESC_F_WRITE))
                 continue;
             if (vq_desc[i].len < response_size)
@@ -606,46 +610,101 @@ void virtio_gpu_cmd_undefined_handler(virtio_gpu_state_t *vgpu,
     *plen = 0;
 }
 
+static bool virtio_gpu_queue_available(virtio_gpu_state_t *vgpu,
+                                       const struct virtq *queue,
+                                       uint16_t *available)
+{
+    uint16_t avail_idx;
+    uint16_t delta;
+
+    if (!queue || !queue->ready || !available)
+        return false;
+
+    if (!ram_dma_read(vgpu->common.dma, queue->driver_addr + 2, &avail_idx,
+                      sizeof(avail_idx))) {
+        virtio_gpu_set_fail(vgpu);
+        return false;
+    }
+
+    delta = (uint16_t) (avail_idx - queue->last_avail);
+    if (delta > queue->queue_size) {
+        fprintf(stderr,
+                VIRTIO_GPU_LOG_PREFIX
+                "%s(): avail index advanced by %u entries, exceeds queue "
+                "size %u\n",
+                __func__, (unsigned) delta, (unsigned) queue->queue_size);
+        virtio_gpu_set_fail(vgpu);
+        return false;
+    }
+
+    *available = delta;
+    return true;
+}
+
+static int virtio_gpu_append_iov_desc(struct virtq_desc *vq_desc,
+                                      size_t capacity,
+                                      size_t total,
+                                      size_t *count,
+                                      const struct virtq_iov *iov,
+                                      bool writable)
+{
+    uint16_t flags = writable ? VIRTIO_DESC_F_WRITE : 0;
+
+    if (*count >= capacity || !iov)
+        return -1;
+    if (iov->addr > UINT32_MAX)
+        return -1;
+    if (*count + 1 < total)
+        flags |= VIRTIO_DESC_F_NEXT;
+
+    vq_desc[*count] = (struct virtq_desc) {
+        .addr = iov->addr,
+        .len = iov->len,
+        .flags = flags,
+        .next = *count + 1 < total ? (uint16_t) (*count + 1) : 0,
+    };
+    (*count)++;
+    return 0;
+}
+
+static int virtio_gpu_chain_to_descs(const struct virtq_chain *chain,
+                                     struct virtq_desc *vq_desc,
+                                     size_t capacity)
+{
+    size_t count = 0;
+    size_t total;
+
+    if (!chain || !vq_desc || chain->readable_count == 0)
+        return -1;
+    total = chain->readable_count + chain->writable_count;
+    if (total == 0 || total > capacity)
+        return -1;
+
+    for (size_t i = 0; i < chain->readable_count; i++) {
+        if (virtio_gpu_append_iov_desc(vq_desc, capacity, total, &count,
+                                       &chain->readable[i], false) < 0)
+            return -1;
+    }
+    for (size_t i = 0; i < chain->writable_count; i++) {
+        if (virtio_gpu_append_iov_desc(vq_desc, capacity, total, &count,
+                                       &chain->writable[i], true) < 0)
+            return -1;
+    }
+
+    return 0;
+}
+
 static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
-                                   const virtio_gpu_queue_t *queue,
                                    int queue_index,
-                                   uint32_t desc_idx,
+                                   const struct virtq_chain *chain,
                                    uint32_t *plen)
 {
     struct virtq_desc vq_desc[VIRTIO_GPU_MAX_DESC] = {0};
 
-    /* Collect descriptors */
-    for (int i = 0; i < VIRTIO_GPU_MAX_DESC; i++) {
-        if (desc_idx >= queue->QueueNum) {
-            virtio_gpu_set_fail(vgpu);
-            *plen = 0;
-            return -1;
-        }
-
-        /* The size of 'struct virtq_desc' is 4 words. */
-        uint32_t desc_offset = queue->QueueDesc + desc_idx * 4;
-        uint32_t *desc = &vgpu->ram[desc_offset];
-
-        /* The guest is riscv32, so the upper 32 bits of every descriptor
-         * address must be zero. Reject any descriptor whose 'addr_high' is set
-         * before later code truncates it via 'virtio_gpu_mem_guest_to_host()',
-         * which would otherwise silently mask a guest bug.
-         */
-        if (desc[1] != 0) {
-            virtio_gpu_set_fail(vgpu);
-            *plen = 0;
-            return -1;
-        }
-
-        /* Retrieve the fields of the current descriptor. */
-        vq_desc[i].addr = desc[0];
-        vq_desc[i].len = desc[2];
-        vq_desc[i].flags = desc[3];
-        desc_idx = desc[3] >> 16; /* 'vq_desc[desc_cnt].next' */
-
-        /* Leave the loop if 'VIRTIO_DESC_F_NEXT' is not set. */
-        if (!(vq_desc[i].flags & VIRTIO_DESC_F_NEXT))
-            break;
+    if (virtio_gpu_chain_to_descs(chain, vq_desc, ARRAY_SIZE(vq_desc)) < 0) {
+        virtio_gpu_set_fail(vgpu);
+        *plen = 0;
+        return -1;
     }
 
     struct virtio_gpu_ctrl_hdr *header = virtio_gpu_get_request(
@@ -663,39 +722,6 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
         virtio_gpu_set_fail(vgpu);
         *plen = 0;
         return -1;
-    }
-
-    /* Keep the fixed 3-descriptor contract explicit. Longer chains need
-     * multi-SG parsing, so reject them before command dispatch.
-     *
-     * TODO: Support generic descriptor-chain parsing.
-     */
-    if (vq_desc[VIRTIO_GPU_MAX_DESC - 1].flags & VIRTIO_DESC_F_NEXT) {
-        const struct virtq_desc *response_desc = virtio_gpu_get_response_desc(
-            vq_desc, sizeof(struct virtio_gpu_ctrl_hdr));
-        if (!response_desc) {
-            fprintf(stderr,
-                    VIRTIO_GPU_LOG_PREFIX
-                    "%s(): descriptor chain exceeds supported length and has "
-                    "no usable response descriptor\n",
-                    __func__);
-            virtio_gpu_set_fail(vgpu);
-            *plen = 0;
-            return -1;
-        }
-
-        fprintf(stderr,
-                VIRTIO_GPU_LOG_PREFIX
-                "%s(): descriptor chain exceeds supported length\n",
-                __func__);
-        *plen = virtio_gpu_write_ctrl_response(vgpu, header, response_desc,
-                                               VIRTIO_GPU_RESP_ERR_UNSPEC);
-        if (!*plen) {
-            virtio_gpu_set_fail(vgpu);
-            return -1;
-        }
-
-        return 0;
     }
 
     /* Process the command */
@@ -738,206 +764,159 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
 
 static void virtio_gpu_queue_notify_handler(virtio_gpu_state_t *vgpu, int index)
 {
-    uint32_t *ram = vgpu->ram;
-    virtio_gpu_queue_t *queue = &vgpu->queues[index];
-    if (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
+    struct virtq *queue = &vgpu->common.queues[index];
+    struct virtq_iov readable[VIRTIO_GPU_QUEUE_NUM_MAX];
+    struct virtq_iov writable[VIRTIO_GPU_QUEUE_NUM_MAX];
+    bool consumed = false;
+    unsigned status = virtio_gpu_status_load(vgpu);
+
+    if (status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
         return;
 
-    if (!((vgpu->Status & VIRTIO_STATUS__DRIVER_OK) && queue->ready))
-        return virtio_gpu_set_fail(vgpu);
-
-    /* Check for new buffers */
-    uint16_t new_avail = ram_load_high16_acquire(&ram[queue->QueueAvail]);
-    uint16_t avail_delta = (uint16_t) (new_avail - queue->last_avail);
-    if (avail_delta > (uint16_t) queue->QueueNum) {
-        fprintf(stderr,
-                VIRTIO_GPU_LOG_PREFIX
-                "%s(): queue %d avail index advanced by %u entries, exceeds "
-                "queue size %u\n",
-                __func__, index, (unsigned) avail_delta,
-                (unsigned) queue->QueueNum);
+    if (!((status & VIRTIO_STATUS__DRIVER_OK) && queue->ready)) {
         virtio_gpu_set_fail(vgpu);
         return;
     }
 
-    if (queue->last_avail == new_avail)
-        return;
-
-    /* Process them */
-    uint16_t new_used =
-        ram_load_high16(&ram[queue->QueueUsed]); /* 'virtq_used.idx' (le16) */
-    while (queue->last_avail != new_avail) {
-        /* Obtain the index in the ring buffer */
-        uint16_t queue_idx = queue->last_avail % queue->QueueNum;
-
-        /* Since each buffer index occupies 2 bytes but the memory is aligned
-         * with 4 bytes, and the first element of the available queue is stored
-         * at 'ram[queue->QueueAvail + 1]', to acquire the buffer index, it
-         * requires the following array index calculation and bit shifting.
-         * Check also 'struct virtq_avail' in the spec.
-         */
-        uint16_t buffer_idx =
-            ram_load_w_acquire(&ram[queue->QueueAvail + 1 + queue_idx / 2]) >>
-            (16 * (queue_idx % 2));
-
-        /* Consume request from the available queue and process the data in the
-         * descriptor list.
-         */
+    for (;;) {
+        struct virtq_chain chain = {
+            .readable = readable,
+            .readable_capacity = ARRAY_SIZE(readable),
+            .writable = writable,
+            .writable_capacity = ARRAY_SIZE(writable),
+        };
+        uint16_t available;
         uint32_t len = 0;
-        int result =
-            virtio_gpu_desc_handler(vgpu, queue, index, buffer_idx, &len);
-        if (result != 0)
+        int ret;
+
+        if (!virtio_gpu_queue_available(vgpu, queue, &available))
+            return;
+        if (available == 0)
+            break;
+
+        ret = virtq_pop(vgpu->common.dma, queue, &chain);
+        if (ret < 0) {
+            virtio_gpu_set_fail(vgpu);
+            return;
+        }
+        if (ret == 0)
+            break;
+
+        if (virtio_gpu_desc_handler(vgpu, index, &chain, &len) != 0)
             return;
 
-        /* Write used element information ('struct virtq_used_elem') to the used
-         * queue
-         */
-        uint32_t vq_used_addr =
-            queue->QueueUsed + 1 + (new_used % queue->QueueNum) * 2;
-        ram_store_w(&ram[vq_used_addr],
-                    buffer_idx); /* 'virtq_used_elem.id'  (le32) */
-        ram_store_w(&ram[vq_used_addr + 1],
-                    len); /* 'virtq_used_elem.len' (le32) */
-        queue->last_avail++;
-        new_used++;
+        if (virtq_add_used(vgpu->common.dma, queue, chain.head, len) < 0) {
+            virtio_gpu_set_fail(vgpu);
+            return;
+        }
+        consumed = true;
 
         /* A sub-handler may have written a usable error response above and
          * then marked the device for reset. Deliver that response through the
-         * used.idx update below and stop consuming further descriptors so the
-         * guest can observe the fail signal and reset the queue.
+         * used-ring update and stop consuming further descriptors.
          */
-        if (vgpu->Status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
+        if (virtio_gpu_status_load(vgpu) & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
             break;
     }
 
-    /* Update 'virtq_used.idx' (keep 'virtq_used.flags' in low 16 bits). */
-    ram_store_high16_release(&ram[queue->QueueUsed], new_used);
-
-    /* Send interrupt, unless 'VIRTQ_AVAIL_F_NO_INTERRUPT' is set. */
-    if (!(ram_load_w_acquire(&ram[queue->QueueAvail]) & 1))
-        vgpu->InterruptStatus |= VIRTIO_INT__USED_RING;
+    if (consumed && !virtq_interrupt_suppressed(vgpu->common.dma, queue))
+        virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__USED_RING);
 }
 
-static inline uint32_t virtio_gpu_preprocess(virtio_gpu_state_t *vgpu,
-                                             uint32_t addr)
+static bool virtio_gpu_config_range_valid(uint32_t offset, uint32_t size)
 {
-    if ((addr >= RAM_SIZE) || (addr & 0b11))
-        return virtio_gpu_set_fail(vgpu), 0;
-
-    return addr >> 2;
+    return size != 0 && offset < sizeof(struct virtio_gpu_config) &&
+           size <= sizeof(struct virtio_gpu_config) - offset;
 }
 
-static void virtio_gpu_update_status(virtio_gpu_state_t *vgpu, uint32_t status)
+static inline bool virtio_gpu_is_config_access(uint32_t addr,
+                                               size_t access_size)
 {
-    vgpu->Status |= status;
-    if (status)
-        return;
+    const uint32_t base = VIRTIO_Config << 2;
+    const uint32_t end = base + (uint32_t) sizeof(struct virtio_gpu_config);
 
-    if (g_virtio_gpu_backend.reset)
-        g_virtio_gpu_backend.reset(vgpu);
+    if (access_size == 0 || addr < base || addr >= end)
+        return false;
+    return access_size <= end - addr;
+}
 
-    /* Reset VirtIO device state (feature negotiation, queue descriptors,
-     * avail/used rings, status and interrupt registers). 'ram' and 'priv' are
-     * infrastructure pointers provided by the host, not device state, so
-     * they are saved and restored across the 'memset()'.
-     *
-     * 'vgpu->priv' ('virtio_gpu_data_t') is intentionally NOT reset here.
-     * It holds host-configured scanout info (display dimensions / enabled
-     * flags) set up before the guest driver probes the device. The guest
-     * re-queries this via 'CMD_GET_DISPLAY_INFO' after each reset, so it must
-     * survive. Renderer-specific bindings and resources live behind the
-     * backend hook and are reset before the generic device state is cleared.
+static uint32_t virtio_gpu_read_config(void *opaque,
+                                       uint32_t offset,
+                                       uint32_t size)
+{
+    virtio_gpu_state_t *vgpu = opaque;
+    struct virtio_gpu_config config = {
+        .events_read = 0,
+        .events_clear = 0,
+        .num_scanouts = PRIV(vgpu)->num_scanouts,
+        .num_capsets = 0,
+    };
+    uint32_t value = 0;
+
+    if (!virtio_gpu_config_range_valid(offset, size))
+        return 0;
+
+    memcpy(&value, (uint8_t *) &config + offset, size);
+    return value;
+}
+
+static void virtio_gpu_write_config(void *opaque,
+                                    uint32_t offset,
+                                    uint32_t size,
+                                    uint32_t value)
+{
+    (void) opaque;
+    (void) offset;
+    (void) size;
+    (void) value;
+    /* No display events are currently implemented, so events_clear is a no-op.
      */
-    uint32_t *ram = vgpu->ram;
-    void *priv = vgpu->priv;
-    memset(vgpu, 0, sizeof(*vgpu));
-    vgpu->ram = ram;
-    vgpu->priv = priv;
 }
 
-static bool virtio_gpu_reg_read(virtio_gpu_state_t *vgpu,
-                                uint32_t addr,
-                                uint32_t *value)
+static bool virtio_gpu_load_width_bytes(uint8_t width, size_t *access_size)
 {
-#define _(reg) VIRTIO_##reg
-    switch (addr) {
-    case _(MagicValue):
-        *value = 0x74726976;
+    switch (width) {
+    case RV_MEM_LW:
+        *access_size = 4;
         return true;
-    case _(Version):
-        *value = 2;
+    case RV_MEM_LBU:
+    case RV_MEM_LB:
+        *access_size = 1;
         return true;
-    case _(DeviceID):
-        *value = 16;
-        return true;
-    case _(VendorID):
-        *value = VIRTIO_VENDOR_ID;
-        return true;
-    case _(DeviceFeatures):
-        /* TODO: Advertise virgl/3D and blob-resource feature bits after the
-         * backend supports their command and display paths.
-         */
-        *value = vgpu->DeviceFeaturesSel == 0
-                     ? VIRTIO_GPU_F_EDID
-                     : (vgpu->DeviceFeaturesSel == 1 ? VIRTIO_F_VERSION_1 : 0);
-        return true;
-    case _(QueueNumMax):
-        *value = VIRTIO_GPU_QUEUE_NUM_MAX;
-        return true;
-    case _(QueueReady):
-        *value = VIRTIO_GPU_QUEUE.ready ? 1 : 0;
-        return true;
-    case _(InterruptStatus):
-        *value = vgpu->InterruptStatus;
-        return true;
-    case _(Status):
-        *value = vgpu->Status;
-        return true;
-    case _(SHMLenLow):
-    case _(SHMLenHigh):
-        /* TODO: Implement shared-memory regions before advertising
-         * VIRTIO_GPU_F_RESOURCE_BLOB.
-         */
-        *value = -1;
-        return true;
-    case _(SHMBaseLow):
-    case _(SHMBaseHigh):
-        *value = 0;
-        return true;
-    case _(ConfigGeneration):
-        *value = 0;
+    case RV_MEM_LHU:
+    case RV_MEM_LH:
+        *access_size = 2;
         return true;
     default:
-        /* Unimplemented common registers, including write-only 'SHMSel',
-         * intentionally fault instead of returning placeholder values.
-         * TODO: Implement 'QueueReset' when advertising VIRTIO_F_RING_RESET.
-         */
-        if (!RANGE_CHECK(addr, _(Config), sizeof(struct virtio_gpu_config)))
-            return false;
-
-        /* Read configuration from the corresponding register */
-        uint32_t offset = (addr - _(Config)) << 2;
-        switch (offset) {
-        case offsetof(struct virtio_gpu_config, events_read): {
-            *value = 0; /* No event is implemented currently */
-            return true;
-        }
-        case offsetof(struct virtio_gpu_config, num_scanouts): {
-            *value = PRIV(vgpu)->num_scanouts;
-            return true;
-        }
-        case offsetof(struct virtio_gpu_config, num_capsets): {
-            /* TODO: Return virgl capsets after implementing the corresponding
-             * 3D command backend. Zero capsets keeps guests on the 2D path.
-             */
-            *value = 0;
-            return true;
-        }
-        default:
-            return false;
-        }
+        return false;
     }
-#undef _
+}
+
+static bool virtio_gpu_store_width_bytes(uint8_t width, size_t *access_size)
+{
+    switch (width) {
+    case RV_MEM_SW:
+        *access_size = 4;
+        return true;
+    case RV_MEM_SB:
+        *access_size = 1;
+        return true;
+    case RV_MEM_SH:
+        *access_size = 2;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool virtio_gpu_config_write_allowed(uint32_t addr, size_t size)
+{
+    uint32_t offset = addr - (VIRTIO_Config << 2);
+    uint32_t field = offsetof(struct virtio_gpu_config, events_clear);
+
+    return virtio_gpu_config_range_valid(offset, (uint32_t) size) &&
+           offset >= field && offset < field + sizeof(uint32_t) &&
+           size <= field + sizeof(uint32_t) - offset;
 }
 
 void virtio_gpu_read(hart_t *vm,
@@ -946,183 +925,34 @@ void virtio_gpu_read(hart_t *vm,
                      uint8_t width,
                      uint32_t *value)
 {
-    /* The VGPU device exposes its MMIO registers as aligned 32-bit words
-     * only. It rejects byte and halfword accesses instead of emulating
-     * partial register reads.
-     */
-    switch (width) {
-    case RV_MEM_LW:
-        if (!virtio_gpu_reg_read(vgpu, addr >> 2, value))
-            vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
-        break;
-    case RV_MEM_LBU:
-    case RV_MEM_LB:
-    case RV_MEM_LHU:
-    case RV_MEM_LH:
-        vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
-        return;
-    default:
+    size_t access_size = 0;
+    bool is_cfg;
+    int ret;
+
+    if (!virtio_gpu_load_width_bytes(width, &access_size)) {
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
         return;
     }
-}
 
-/* After 'QueueReady' is set, 'QueueNum' and the ring address registers have
- * already been validated and may be consumed by the device. Reject later
- * writes to that virtqueue configuration instead of letting the guest change
- * it under the running queue.
- */
-static bool virtio_gpu_vq_config_after_ready(virtio_gpu_state_t *vgpu,
-                                             uint32_t addr)
-{
-    if (!VIRTIO_GPU_QUEUE.ready)
-        return false;
-
-#define _(reg) VIRTIO_##reg
-    switch (addr) {
-    case _(QueueNum):
-    case _(QueueDescLow):
-    case _(QueueDescHigh):
-    case _(QueueDriverLow):
-    case _(QueueDriverHigh):
-    case _(QueueDeviceLow):
-    case _(QueueDeviceHigh):
-        return true;
-    default:
-        return false;
-    }
-#undef _
-}
-
-static bool virtio_gpu_reg_write(virtio_gpu_state_t *vgpu,
-                                 uint32_t addr,
-                                 uint32_t value)
-{
-#define _(reg) VIRTIO_##reg
-    if (virtio_gpu_vq_config_after_ready(vgpu, addr)) {
-        virtio_gpu_set_fail(vgpu);
-        return true;
+    is_cfg = virtio_gpu_is_config_access(addr, access_size);
+    if (addr >= (VIRTIO_Config << 2) && !is_cfg) {
+        vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
+        return;
     }
 
-    switch (addr) {
-    case _(DeviceFeaturesSel):
-        vgpu->DeviceFeaturesSel = value;
-        return true;
-    case _(DriverFeatures):
-        if (vgpu->DriverFeaturesSel == 0)
-            vgpu->DriverFeatures = value;
-        return true;
-    case _(DriverFeaturesSel):
-        vgpu->DriverFeaturesSel = value;
-        return true;
-    case _(QueueSel):
-        if (value < ARRAY_SIZE(vgpu->queues))
-            vgpu->QueueSel = value;
-        else
-            virtio_gpu_set_fail(vgpu);
-        return true;
-    case _(QueueNum):
-        if (value > 0 && value <= VIRTIO_GPU_QUEUE_NUM_MAX)
-            VIRTIO_GPU_QUEUE.QueueNum = value;
-        else
-            virtio_gpu_set_fail(vgpu);
-        return true;
-    case _(QueueReady):
-        VIRTIO_GPU_QUEUE.ready = value & 1;
-        if (value & 1) {
-            /* Validate that the full rings fit in guest RAM before allowing
-             * the queue to go live. 'virtio_gpu_preprocess()' only checked the
-             * base addresses. Here we verify the end of each ring region.
-             * All addresses are word indices (byte address >> 2).
-             *
-             * These sizes assume 'VIRTIO_F_EVENT_IDX' is not negotiated. We
-             * never advertise it (see 'DeviceFeatures'), so neither
-             * 'avail.used_event' nor 'used.avail_event' exist. If that flag is
-             * ever added, both end calculations need an extra word for the
-             * trailing '*_event' field.
-             */
-            uint32_t qnum = VIRTIO_GPU_QUEUE.QueueNum;
-            uint32_t ram_words = RAM_SIZE / sizeof(uint32_t);
-
-            /* Desc table: 'QueueNum' entries * 4 words each. */
-            uint32_t desc_end = VIRTIO_GPU_QUEUE.QueueDesc + qnum * 4;
-            /* Avail ring: one word for 'flags' + 'idx', then
-             * ceil('QueueNum' / 2) words for 16-bit descriptor indexes.
-             */
-            uint32_t avail_end =
-                VIRTIO_GPU_QUEUE.QueueAvail + 1 + (qnum + 1) / 2;
-            /* Used ring: one word for 'flags' + 'idx', then 'QueueNum'
-             * entries of 'struct virtq_used_elem' (2 words each).
-             */
-            uint32_t used_end = VIRTIO_GPU_QUEUE.QueueUsed + 1 + qnum * 2;
-
-            if (!qnum || desc_end > ram_words || avail_end > ram_words ||
-                used_end > ram_words) {
-                VIRTIO_GPU_QUEUE.ready = false;
-                virtio_gpu_set_fail(vgpu);
-                return true;
-            }
-            VIRTIO_GPU_QUEUE.last_avail = ram_load_high16_acquire(
-                &vgpu->ram[VIRTIO_GPU_QUEUE.QueueAvail]);
+    if (!is_cfg) {
+        if (access_size != 4 || (addr & 0x3)) {
+            vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
+            return;
         }
-        return true;
-    case _(QueueDescLow):
-        VIRTIO_GPU_QUEUE.QueueDesc = virtio_gpu_preprocess(vgpu, value);
-        return true;
-    case _(QueueDescHigh):
-        if (value)
-            virtio_gpu_set_fail(vgpu);
-        return true;
-    case _(QueueDriverLow):
-        VIRTIO_GPU_QUEUE.QueueAvail = virtio_gpu_preprocess(vgpu, value);
-        return true;
-    case _(QueueDriverHigh):
-        if (value)
-            virtio_gpu_set_fail(vgpu);
-        return true;
-    case _(QueueDeviceLow):
-        VIRTIO_GPU_QUEUE.QueueUsed = virtio_gpu_preprocess(vgpu, value);
-        return true;
-    case _(QueueDeviceHigh):
-        if (value)
-            virtio_gpu_set_fail(vgpu);
-        return true;
-    case _(QueueNotify):
-        if (value < ARRAY_SIZE(vgpu->queues))
-            virtio_gpu_queue_notify_handler(vgpu, value);
-        else
-            virtio_gpu_set_fail(vgpu);
-        return true;
-    case _(InterruptACK):
-        vgpu->InterruptStatus &= ~value;
-        return true;
-    case _(Status):
-        virtio_gpu_update_status(vgpu, value);
-        return true;
-    case _(SHMSel):
-        /* No shared-memory regions are advertised, so the selector is accepted
-         * and ignored.
-         */
-        return true;
-    default:
-        /* Unsupported writes fault instead of updating unknown state.
-         * TODO: Implement 'QueueReset' when advertising VIRTIO_F_RING_RESET.
-         */
-        if (!RANGE_CHECK(addr, _(Config), sizeof(struct virtio_gpu_config)))
-            return false;
-
-        /* Write configuration to the corresponding register */
-        uint32_t offset = (addr - _(Config)) << 2;
-        switch (offset) {
-        case offsetof(struct virtio_gpu_config, events_clear): {
-            /* Ignored, no event is implemented currently */
-            return true;
-        }
-        default:
-            return false;
-        }
+    } else if (addr & (access_size - 1)) {
+        vm_set_exception(vm, RV_EXC_LOAD_MISALIGN, vm->exc_val);
+        return;
     }
-#undef _
+
+    ret = virtio_mmio_read(&vgpu->common, addr, (uint8_t) access_size, value);
+    if (ret < 0)
+        vm_set_exception(vm, RV_EXC_LOAD_FAULT, vm->exc_val);
 }
 
 void virtio_gpu_write(hart_t *vm,
@@ -1131,28 +961,97 @@ void virtio_gpu_write(hart_t *vm,
                       uint8_t width,
                       uint32_t value)
 {
-    /* The VGPU device applies the same rule to writes: only aligned 32-bit
-     * stores are accepted for the MMIO register block, and narrower accesses
-     * fault.
-     */
-    switch (width) {
-    case RV_MEM_SW:
-        if (!virtio_gpu_reg_write(vgpu, addr >> 2, value))
-            vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
-        break;
-    case RV_MEM_SB:
-    case RV_MEM_SH:
-        vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
-        return;
-    default:
+    size_t access_size = 0;
+    bool is_cfg;
+    int ret;
+
+    if (!virtio_gpu_store_width_bytes(width, &access_size)) {
         vm_set_exception(vm, RV_EXC_ILLEGAL_INSN, 0);
         return;
     }
+
+    is_cfg = virtio_gpu_is_config_access(addr, access_size);
+    if (addr >= (VIRTIO_Config << 2) && !is_cfg) {
+        vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
+        return;
+    }
+
+    if (!is_cfg) {
+        if (access_size != 4 || (addr & 0x3)) {
+            vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
+            return;
+        }
+    } else {
+        if (addr & (access_size - 1)) {
+            vm_set_exception(vm, RV_EXC_STORE_MISALIGN, vm->exc_val);
+            return;
+        }
+        if (!virtio_gpu_config_write_allowed(addr, access_size)) {
+            vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
+            return;
+        }
+    }
+
+    ret = virtio_mmio_write(&vgpu->common, addr, (uint8_t) access_size, value);
+    if (ret < 0)
+        vm_set_exception(vm, RV_EXC_STORE_FAULT, vm->exc_val);
 }
 
-void virtio_gpu_init(virtio_gpu_state_t *vgpu)
+bool virtio_gpu_irq_pending(virtio_gpu_state_t *vgpu)
 {
+    return virtio_irq_read_status(&vgpu->common.irq) != 0;
+}
+
+static int virtio_gpu_activate(void *opaque,
+                               const struct virtio_activation_context *ctx)
+{
+    (void) opaque;
+    (void) ctx;
+    return 0;
+}
+
+static int virtio_gpu_reset(void *opaque,
+                            uint64_t old_generation,
+                            uint64_t new_generation)
+{
+    virtio_gpu_state_t *vgpu = opaque;
+    (void) old_generation;
+    (void) new_generation;
+
+    if (g_virtio_gpu_backend.reset)
+        g_virtio_gpu_backend.reset(vgpu);
+    return 0;
+}
+
+static void virtio_gpu_notify_queue(void *opaque,
+                                    uint16_t queue_index,
+                                    uint64_t generation)
+{
+    virtio_gpu_state_t *vgpu = opaque;
+    (void) generation;
+
+    if (queue_index == VIRTIO_GPU_CONTROLQ || queue_index == VIRTIO_GPU_CURSORQ)
+        virtio_gpu_queue_notify_handler(vgpu, queue_index);
+    else
+        virtio_gpu_set_fail(vgpu);
+}
+
+static const struct virtio_device_ops virtio_gpu_ops = {
+    .activate = virtio_gpu_activate,
+    .reset = virtio_gpu_reset,
+    .notify_queue = virtio_gpu_notify_queue,
+    .read_config = virtio_gpu_read_config,
+    .write_config = virtio_gpu_write_config,
+};
+
+void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
+{
+    static const uint16_t queue_max_sizes[] = {
+        [VIRTIO_GPU_CONTROLQ] = VIRTIO_GPU_QUEUE_NUM_MAX,
+        [VIRTIO_GPU_CURSORQ] = VIRTIO_GPU_QUEUE_NUM_MAX,
+    };
     static bool initialized = false;
+    struct virtio_device_common_config config;
 
     if (initialized) {
         fprintf(stderr,
@@ -1161,9 +1060,35 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu)
                 __func__);
         exit(EXIT_FAILURE);
     }
-    initialized = true;
 
+    memset(vgpu, 0, sizeof(*vgpu));
+    memset(&virtio_gpu_data, 0, sizeof(virtio_gpu_data));
+    vgpu->ram = emu->ram;
     vgpu->priv = &virtio_gpu_data;
+
+    config = (struct virtio_device_common_config) {
+        .emu = emu,
+        .dma = &emu->ram_dma,
+        .irq_source = SEMU_IRQ_SOURCE_VGPU,
+        .device_id = 16,
+        .vendor_id = VIRTIO_VENDOR_ID,
+        .device_features = VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VERSION_1,
+        .required_features = VIRTIO_GPU_F_VERSION_1,
+        .queue_max_sizes = queue_max_sizes,
+        .num_queues = ARRAY_SIZE(queue_max_sizes),
+        .ops = &virtio_gpu_ops,
+        .opaque = vgpu,
+    };
+
+    if (virtio_device_common_init(&vgpu->common, &config) < 0) {
+        fprintf(stderr,
+                VIRTIO_GPU_LOG_PREFIX
+                "%s(): failed to initialize common VirtIO transport\n",
+                __func__);
+        exit(EXIT_FAILURE);
+    }
+
+    initialized = true;
 }
 
 uint32_t virtio_gpu_register_scanout(virtio_gpu_state_t *vgpu,

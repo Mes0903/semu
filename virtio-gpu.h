@@ -15,29 +15,12 @@
 #define VIRTIO_GPU_CMD_UNDEF virtio_gpu_cmd_undefined_handler
 #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
 
-/* Maximum descriptor chain length accepted by 'virtio_gpu_desc_handler()'.
- *
- * semu follows the common Linux virtio-gpu control queue shape in
- * 'virtio_gpu_queue_fenced_ctrl_buffer()': 'sgs[3]' holds 'vcmd' (request),
- * optional 'vout' (command data, e.g. 'RESOURCE_ATTACH_BACKING' entries), and
- * optional 'vresp' (response). The supported commands therefore fit in "request
- * + one data segment + response".
- *
- * This is not a general virtio-gpu descriptor-chain limit. Linux allocates the
- * backing-entry array in 'virtio_gpu_object_shmem_init()' with
- * 'kvmalloc_objs()'. If that buffer falls back to 'vmalloc',
- * 'virtio_gpu_queue_fenced_ctrl_buffer()' detects it with 'is_vmalloc_addr()'
- * and 'vmalloc_to_sgt()' expands 'vout' into multiple scatter-gather entries.
- *
- * Supporting that path would require accepting a longer descriptor chain and
- * auditing every handler that indexes 'vq_desc[]'. Longer chains are rejected.
- * The current response-descriptor lookup is also part of this fixed-shape
- * parser: it scans the zero-initialized 3-entry array, not an arbitrary
- * guest-provided scatter-gather chain.
- *
- * TODO: Support generic descriptor-chain parsing.
+/* Common virtq already bounds a descriptor chain by queue size. Keep the
+ * backend descriptor view large enough for the full GPU queue so Linux
+ * scatter-gather control buffers are not rejected solely because they exceed
+ * the old request + data + response shape.
  */
-#define VIRTIO_GPU_MAX_DESC 3
+#define VIRTIO_GPU_MAX_DESC 1024
 
 /* Core per-scanout metadata keyed by the guest-visible 'scanout_id'. This
  * combines guest-visible display info ('width'/'height'/'enabled') with the
