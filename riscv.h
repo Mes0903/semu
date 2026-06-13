@@ -301,6 +301,31 @@ static inline void hart_hsm_resume_pending_store(hart_t *hart, bool value)
         semu_hart_mailbox_clear(&hart->mailbox, SEMU_HART_MAILBOX_HSM_RESUME);
 }
 
+static inline bool hart_pause_pending_load(const hart_t *hart)
+{
+    return semu_hart_mailbox_has(&hart->mailbox, SEMU_HART_MAILBOX_PAUSE);
+}
+
+static inline uint64_t hart_pause_request_seq_load(const hart_t *hart)
+{
+    return semu_hart_mailbox_pause_request_seq(&hart->mailbox);
+}
+
+static inline uint64_t hart_pause_ack_seq_load(const hart_t *hart)
+{
+    return semu_hart_mailbox_pause_ack_seq(&hart->mailbox);
+}
+
+static inline void hart_pause_request(hart_t *hart, uint64_t seq)
+{
+    semu_hart_mailbox_pause_request(&hart->mailbox, seq);
+}
+
+static inline void hart_pause_ack(hart_t *hart, uint64_t seq)
+{
+    semu_hart_mailbox_pause_ack(&hart->mailbox, seq);
+}
+
 void vm_init(hart_t *vm);
 
 /* Emulate the next instruction. This is a no-op if the error is already set. */
