@@ -1,6 +1,7 @@
 #pragma once
 
 #include <pthread.h>
+#include <stdbool.h>
 
 #if SEMU_HAS(VIRTIONET)
 #include "netdev.h"
@@ -8,6 +9,7 @@
 #include "mmio-bus.h"
 #include "ram_access.h"
 #include "riscv.h"
+#include "virtio-actor.h"
 #include "virtio-device.h"
 #include "virtio.h"
 #include "vm-lifecycle.h"
@@ -293,6 +295,9 @@ bool virtio_input_irq_pending(virtio_input_state_t *vinput);
 
 typedef struct {
     struct virtio_device_common common;
+    struct virtio_actor actor;
+    uint64_t actor_drain_generation;
+    bool actor_initialized;
     /* supplied by environment */
     uint32_t *ram;
     /* implementation-specific */

@@ -12,6 +12,7 @@
 #include "riscv.h"
 #include "riscv_private.h"
 #include "utils.h"
+#include "virtio-actor.h"
 #include "virtio-gpu.h"
 #include "virtio-mmio.h"
 #include "virtio.h"
@@ -89,6 +90,27 @@ void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu)
     virtio_device_common_set_needs_reset(&vgpu->common);
     if (status & VIRTIO_STATUS__DRIVER_OK)
         virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__CONF_CHANGE);
+}
+
+bool virtio_gpu_actor_drain_current(virtio_gpu_state_t *vgpu)
+{
+    return vgpu && vgpu->actor_initialized &&
+           virtio_actor_generation(&vgpu->actor) ==
+               vgpu->actor_drain_generation;
+}
+
+bool virtio_gpu_begin_actor_completion(virtio_gpu_state_t *vgpu)
+{
+    return vgpu && vgpu->actor_initialized &&
+           virtio_actor_begin_completion(&vgpu->actor,
+                                         vgpu->actor_drain_generation);
+}
+
+int virtio_gpu_end_actor_completion(virtio_gpu_state_t *vgpu)
+{
+    if (!vgpu || !vgpu->actor_initialized)
+        return -EINVAL;
+    return virtio_actor_end_completion(&vgpu->actor);
 }
 
 void *virtio_gpu_get_request(virtio_gpu_state_t *vgpu,
@@ -762,21 +784,50 @@ static int virtio_gpu_desc_handler(virtio_gpu_state_t *vgpu,
     return 0;
 }
 
-static void virtio_gpu_queue_notify_handler(virtio_gpu_state_t *vgpu, int index)
+static bool virtio_gpu_actor_generation_current(struct virtio_actor *actor,
+                                                uint64_t generation)
 {
-    struct virtq *queue = &vgpu->common.queues[index];
-    struct virtq_iov readable[VIRTIO_GPU_QUEUE_NUM_MAX];
-    struct virtq_iov writable[VIRTIO_GPU_QUEUE_NUM_MAX];
-    bool consumed = false;
+    return actor && virtio_actor_generation(actor) == generation;
+}
+
+static bool virtio_gpu_queue_ready_for_actor(virtio_gpu_state_t *vgpu,
+                                             struct virtq *queue)
+{
     unsigned status = virtio_gpu_status_load(vgpu);
 
     if (status & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
-        return;
+        return false;
+    if ((status & VIRTIO_STATUS__DRIVER_OK) && queue && queue->ready)
+        return true;
 
-    if (!((status & VIRTIO_STATUS__DRIVER_OK) && queue->ready)) {
-        virtio_gpu_set_fail(vgpu);
-        return;
+    virtio_gpu_set_fail(vgpu);
+    return false;
+}
+
+static int virtio_gpu_actor_drain_queue(void *opaque,
+                                        struct virtio_actor *actor,
+                                        uint16_t queue_index,
+                                        uint64_t generation)
+{
+    virtio_gpu_state_t *vgpu = opaque;
+    struct virtq *queue;
+    struct virtq_iov readable[VIRTIO_GPU_QUEUE_NUM_MAX];
+    struct virtq_iov writable[VIRTIO_GPU_QUEUE_NUM_MAX];
+    bool consumed = false;
+
+    if (!vgpu || queue_index >= vgpu->common.num_queues) {
+        if (vgpu)
+            virtio_gpu_set_fail(vgpu);
+        return 0;
     }
+
+    queue = &vgpu->common.queues[queue_index];
+    vgpu->actor_drain_generation = generation;
+
+    if (!virtio_gpu_actor_generation_current(actor, generation))
+        return 0;
+    if (!virtio_gpu_queue_ready_for_actor(vgpu, queue))
+        return 0;
 
     for (;;) {
         struct virtq_chain chain = {
@@ -789,39 +840,73 @@ static void virtio_gpu_queue_notify_handler(virtio_gpu_state_t *vgpu, int index)
         uint32_t len = 0;
         int ret;
 
+        if (!virtio_gpu_actor_generation_current(actor, generation))
+            return 0;
         if (!virtio_gpu_queue_available(vgpu, queue, &available))
-            return;
+            return 0;
         if (available == 0)
             break;
 
         ret = virtq_pop(vgpu->common.dma, queue, &chain);
         if (ret < 0) {
             virtio_gpu_set_fail(vgpu);
-            return;
+            return 0;
         }
         if (ret == 0)
             break;
 
-        if (virtio_gpu_desc_handler(vgpu, index, &chain, &len) != 0)
-            return;
+        if (!virtio_gpu_actor_generation_current(actor, generation))
+            return 0;
+        if (virtio_gpu_desc_handler(vgpu, queue_index, &chain, &len) != 0)
+            return 0;
 
-        if (virtq_add_used(vgpu->common.dma, queue, chain.head, len) < 0) {
+        if (!virtio_actor_begin_completion(actor, generation))
+            return 0;
+        ret = virtq_add_used(vgpu->common.dma, queue, chain.head, len);
+        virtio_actor_end_completion(actor);
+        if (ret < 0) {
             virtio_gpu_set_fail(vgpu);
-            return;
+            return 0;
         }
         consumed = true;
 
-        /* A sub-handler may have written a usable error response above and
-         * then marked the device for reset. Deliver that response through the
-         * used-ring update and stop consuming further descriptors.
-         */
         if (virtio_gpu_status_load(vgpu) & VIRTIO_STATUS__DEVICE_NEEDS_RESET)
             break;
     }
 
-    if (consumed && !virtq_interrupt_suppressed(vgpu->common.dma, queue))
-        virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__USED_RING);
+    if (consumed && virtio_actor_begin_completion(actor, generation)) {
+        if (!virtq_interrupt_suppressed(vgpu->common.dma, queue))
+            virtio_irq_trigger(&vgpu->common.irq, VIRTIO_INT__USED_RING);
+        virtio_actor_end_completion(actor);
+    }
+    return 0;
 }
+
+static bool virtio_gpu_actor_queue_has_work(void *opaque,
+                                            struct virtio_actor *actor,
+                                            uint16_t queue_index,
+                                            uint64_t generation)
+{
+    virtio_gpu_state_t *vgpu = opaque;
+    uint16_t available = 0;
+
+    if (!vgpu || queue_index >= vgpu->common.num_queues)
+        return false;
+    if (!virtio_gpu_actor_generation_current(actor, generation))
+        return false;
+    if (!virtio_gpu_queue_ready_for_actor(vgpu,
+                                          &vgpu->common.queues[queue_index]))
+        return false;
+    if (!virtio_gpu_queue_available(vgpu, &vgpu->common.queues[queue_index],
+                                    &available))
+        return false;
+    return available != 0;
+}
+
+static const struct virtio_actor_ops virtio_gpu_actor_ops = {
+    .drain_queue = virtio_gpu_actor_drain_queue,
+    .queue_has_work = virtio_gpu_actor_queue_has_work,
+};
 
 static bool virtio_gpu_config_range_valid(uint32_t offset, uint32_t size)
 {
@@ -1005,9 +1090,31 @@ bool virtio_gpu_irq_pending(virtio_gpu_state_t *vgpu)
 static int virtio_gpu_activate(void *opaque,
                                const struct virtio_activation_context *ctx)
 {
-    (void) opaque;
+    virtio_gpu_state_t *vgpu = opaque;
+    int ret;
+
     (void) ctx;
-    return 0;
+
+    ret = virtio_actor_start(&vgpu->actor);
+    if (ret < 0 && ret != -EALREADY)
+        return ret;
+
+    ret = virtio_actor_enter_configuring(&vgpu->actor);
+    if (ret < 0)
+        return ret;
+    return virtio_actor_activate(&vgpu->actor);
+}
+
+static int virtio_gpu_prepare_reset(void *opaque,
+                                    uint64_t old_generation,
+                                    uint64_t new_generation)
+{
+    virtio_gpu_state_t *vgpu = opaque;
+
+    (void) old_generation;
+    (void) new_generation;
+
+    return virtio_actor_reset(&vgpu->actor);
 }
 
 static int virtio_gpu_reset(void *opaque,
@@ -1015,6 +1122,7 @@ static int virtio_gpu_reset(void *opaque,
                             uint64_t new_generation)
 {
     virtio_gpu_state_t *vgpu = opaque;
+
     (void) old_generation;
     (void) new_generation;
 
@@ -1023,21 +1131,34 @@ static int virtio_gpu_reset(void *opaque,
     return 0;
 }
 
-static void virtio_gpu_notify_queue(void *opaque,
-                                    uint16_t queue_index,
-                                    uint64_t generation)
+static int virtio_gpu_notify_queue(void *opaque,
+                                   uint16_t queue_index,
+                                   uint64_t generation)
 {
     virtio_gpu_state_t *vgpu = opaque;
+    int ret;
+
     (void) generation;
 
-    if (queue_index == VIRTIO_GPU_CONTROLQ || queue_index == VIRTIO_GPU_CURSORQ)
-        virtio_gpu_queue_notify_handler(vgpu, queue_index);
-    else
+    if (queue_index != VIRTIO_GPU_CONTROLQ &&
+        queue_index != VIRTIO_GPU_CURSORQ) {
         virtio_gpu_set_fail(vgpu);
+        return -EINVAL;
+    }
+
+    ret = virtio_actor_notify_queue(&vgpu->actor, queue_index);
+    if (ret == -EAGAIN)
+        return 0;
+    if (ret < 0) {
+        virtio_gpu_set_fail(vgpu);
+        return ret;
+    }
+    return 0;
 }
 
 static const struct virtio_device_ops virtio_gpu_ops = {
     .activate = virtio_gpu_activate,
+    .prepare_reset = virtio_gpu_prepare_reset,
     .reset = virtio_gpu_reset,
     .notify_queue = virtio_gpu_notify_queue,
     .read_config = virtio_gpu_read_config,
@@ -1087,6 +1208,17 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
                 __func__);
         exit(EXIT_FAILURE);
     }
+
+    if (virtio_actor_init(&vgpu->actor, &virtio_gpu_actor_ops, vgpu,
+                          ARRAY_SIZE(queue_max_sizes)) < 0) {
+        virtio_device_common_destroy(&vgpu->common);
+        fprintf(stderr,
+                VIRTIO_GPU_LOG_PREFIX
+                "%s(): failed to initialize VirtIO actor\n",
+                __func__);
+        exit(EXIT_FAILURE);
+    }
+    vgpu->actor_initialized = true;
 
     initialized = true;
 }

@@ -830,15 +830,16 @@ static int virtio_input_reset(void *opaque,
     return 0;
 }
 
-static void virtio_input_notify_queue(void *opaque,
-                                      uint16_t queue_index,
-                                      uint64_t generation)
+static int virtio_input_notify_queue(void *opaque,
+                                     uint16_t queue_index,
+                                     uint64_t generation)
 {
     virtio_input_state_t *vinput = opaque;
     (void) generation;
 
     if (queue_index == VIRTIO_INPUT_STATUSQ)
         virtio_input_drain_statusq(vinput);
+    return 0;
 }
 
 static const struct virtio_device_ops virtio_input_ops = {

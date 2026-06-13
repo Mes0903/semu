@@ -90,6 +90,9 @@ int virtio_actor_wait_changed_from(struct virtio_actor *actor,
                                    enum virtio_actor_state *observed);
 int virtio_actor_wait_until(struct virtio_actor *actor,
                             enum virtio_actor_state target);
+bool virtio_actor_begin_completion(struct virtio_actor *actor,
+                                   uint64_t generation);
+int virtio_actor_end_completion(struct virtio_actor *actor);
 bool virtio_actor_lock_is_held(struct virtio_actor *actor);
 
 #endif

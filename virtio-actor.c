@@ -741,6 +741,28 @@ int virtio_actor_wait_until(struct virtio_actor *actor,
     return virtio_actor_unlock(actor);
 }
 
+bool virtio_actor_begin_completion(struct virtio_actor *actor,
+                                   uint64_t generation)
+{
+    if (!actor)
+        return false;
+
+    if (virtio_actor_lock(actor) < 0)
+        return false;
+    if (actor->state == VIRTIO_ACTOR_ACTIVE && actor->generation == generation)
+        return true;
+
+    pthread_mutex_unlock(&actor->lock);
+    return false;
+}
+
+int virtio_actor_end_completion(struct virtio_actor *actor)
+{
+    if (!actor)
+        return -EINVAL;
+    return virtio_actor_unlock(actor);
+}
+
 bool virtio_actor_lock_is_held(struct virtio_actor *actor)
 {
     int ret;

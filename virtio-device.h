@@ -23,12 +23,15 @@ struct virtio_activation_context {
 
 struct virtio_device_ops {
     int (*activate)(void *opaque, const struct virtio_activation_context *ctx);
+    int (*prepare_reset)(void *opaque,
+                         uint64_t old_generation,
+                         uint64_t new_generation);
     int (*reset)(void *opaque,
                  uint64_t old_generation,
                  uint64_t new_generation);
-    void (*notify_queue)(void *opaque,
-                         uint16_t queue_index,
-                         uint64_t generation);
+    int (*notify_queue)(void *opaque,
+                        uint16_t queue_index,
+                        uint64_t generation);
     uint32_t (*read_config)(void *opaque, uint32_t offset, uint32_t size);
     void (*write_config)(void *opaque,
                          uint32_t offset,

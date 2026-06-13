@@ -355,11 +355,17 @@ static int virtio_mmio_complete_notify(struct virtio_device_common *common,
          * notify_queue callbacks may take actor-local locks, so run the
          * callback after releasing backend rank.
          */
-        ops->notify_queue(opaque, queue_index, generation);
+        ret = ops->notify_queue(opaque, queue_index, generation);
 
         unlock_ret = semu_lock_order_mutex_unlock(&common->transport_lock,
                                                   &transport_order);
-        ret = virtio_mmio_unlock_notify_lifecycle_gate(common, &lifecycle_gate);
+        if (unlock_ret < 0) {
+            (void) virtio_mmio_unlock_notify_lifecycle_gate(common,
+                                                            &lifecycle_gate);
+            return unlock_ret;
+        }
+        unlock_ret =
+            virtio_mmio_unlock_notify_lifecycle_gate(common, &lifecycle_gate);
         if (unlock_ret < 0)
             return unlock_ret;
         return ret;
@@ -545,6 +551,25 @@ int virtio_device_common_reset(struct virtio_device_common *common)
     old_generation = common->generation;
     new_generation = old_generation + 1;
     common->generation = new_generation;
+    ops = common->ops;
+    opaque = common->opaque;
+    pthread_mutex_unlock(&common->transport_lock);
+
+    if (ops && ops->prepare_reset) {
+        ret = ops->prepare_reset(opaque, old_generation, new_generation);
+        if (ret < 0) {
+            pthread_mutex_lock(&common->transport_lock);
+            common->activated = false;
+            atomic_fetch_or_explicit(&common->status,
+                                     VIRTIO_STATUS__DEVICE_NEEDS_RESET,
+                                     memory_order_release);
+            pthread_mutex_unlock(&common->transport_lock);
+            pthread_mutex_unlock(&common->backend_lock);
+            return ret;
+        }
+    }
+
+    pthread_mutex_lock(&common->transport_lock);
     common->driver_features = 0;
     common->device_features_sel = 0;
     common->driver_features_sel = 0;
@@ -558,8 +583,6 @@ int virtio_device_common_reset(struct virtio_device_common *common)
     }
     if (common->irq_initialized)
         virtio_irq_ack(&common->irq, UINT32_MAX);
-    ops = common->ops;
-    opaque = common->opaque;
     pthread_mutex_unlock(&common->transport_lock);
 
     if (ops && ops->reset)

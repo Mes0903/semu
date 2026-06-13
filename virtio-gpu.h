@@ -373,6 +373,9 @@ uint32_t virtio_gpu_write_ctrl_response(
     uint32_t type);
 
 void virtio_gpu_set_fail(virtio_gpu_state_t *vgpu);
+bool virtio_gpu_actor_drain_current(virtio_gpu_state_t *vgpu);
+bool virtio_gpu_begin_actor_completion(virtio_gpu_state_t *vgpu);
+int virtio_gpu_end_actor_completion(virtio_gpu_state_t *vgpu);
 
 void virtio_gpu_get_display_info_handler(virtio_gpu_state_t *vgpu,
                                          struct virtq_desc *vq_desc,
