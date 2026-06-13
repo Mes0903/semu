@@ -22,6 +22,12 @@ struct vgpu_virgl_pending_fence {
     uint64_t generation;
     uint64_t renderer_fence_id;
     uint64_t guest_fence_id;
+    bool has_ctrl_completion;
+    struct virtio_gpu_deferred_ctrl_completion ctrl_completion;
+    bool has_response_desc;
+    struct virtio_gpu_ctrl_hdr request_hdr;
+    struct virtq_desc response_desc;
+    uint32_t response_type;
 };
 
 static pthread_mutex_t vgpu_virgl_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -88,6 +94,13 @@ static struct vgpu_virgl_box vgpu_virgl_box_from_virtio(
 }
 
 static void vgpu_virgl_detach_iov(uint32_t resource_id);
+static bool vgpu_virgl_submit_fence_internal(
+    uint64_t generation,
+    bool context_fence,
+    uint32_t ctx_id,
+    uint32_t ring_idx,
+    uint64_t guest_fence_id,
+    const struct vgpu_renderer_ctrl_payload *ctrl_payload);
 
 static void vgpu_virgl_clear_renderer_resource_map(
     struct vgpu_virgl_renderer_resource *res)
@@ -393,12 +406,14 @@ static uint64_t vgpu_virgl_alloc_context_renderer_fence_locked(void)
     return vgpu_virgl_next_context_renderer_fence;
 }
 
-static bool vgpu_virgl_record_pending_fence(uint64_t generation,
-                                            bool context_fence,
-                                            uint32_t ctx_id,
-                                            uint32_t ring_idx,
-                                            uint64_t renderer_fence_id,
-                                            uint64_t guest_fence_id)
+static bool vgpu_virgl_record_pending_fence(
+    uint64_t generation,
+    bool context_fence,
+    uint32_t ctx_id,
+    uint32_t ring_idx,
+    uint64_t renderer_fence_id,
+    uint64_t guest_fence_id,
+    const struct vgpu_renderer_ctrl_payload *ctrl_payload)
 {
     for (size_t i = 0; i < VGPU_VIRGL_PENDING_FENCES_MAX; i++) {
         struct vgpu_virgl_pending_fence *pending =
@@ -415,6 +430,14 @@ static bool vgpu_virgl_record_pending_fence(uint64_t generation,
             .renderer_fence_id = renderer_fence_id,
             .guest_fence_id = guest_fence_id,
         };
+        if (ctrl_payload) {
+            pending->has_ctrl_completion = true;
+            pending->ctrl_completion = ctrl_payload->ctrl_completion;
+            pending->has_response_desc = true;
+            pending->request_hdr = ctrl_payload->hdr;
+            pending->response_desc = ctrl_payload->response_desc;
+            pending->response_type = ctrl_payload->response_type;
+        }
         vgpu_virgl_pending_fence_count++;
         debug_fences_created++;
         return true;
@@ -470,17 +493,15 @@ static void vgpu_virgl_request_poll_locked(void)
     debug_poll_requests_dropped++;
 }
 
-static bool vgpu_virgl_take_completed_fence(bool context_fence,
-                                            uint32_t ctx_id,
-                                            uint32_t ring_idx,
-                                            uint64_t renderer_fence_id,
-                                            uint64_t *generation,
-                                            uint64_t *guest_fence_id)
+static bool vgpu_virgl_take_next_completed_fence(
+    bool context_fence,
+    uint32_t ctx_id,
+    uint32_t ring_idx,
+    uint64_t renderer_fence_id,
+    struct vgpu_virgl_pending_fence *out)
 {
-    uint64_t best_renderer_fence = 0;
-    uint64_t best_generation = 0;
-    uint64_t best_guest_fence = 0;
-    size_t best_index = 0;
+    uint64_t oldest_renderer_fence = 0;
+    size_t oldest_index = 0;
     bool found = false;
 
     for (size_t i = 0; i < VGPU_VIRGL_PENDING_FENCES_MAX; i++) {
@@ -491,68 +512,69 @@ static bool vgpu_virgl_take_completed_fence(bool context_fence,
                                              ring_idx) ||
             pending->renderer_fence_id > renderer_fence_id)
             continue;
-        if (found && pending->renderer_fence_id < best_renderer_fence)
+        if (found && pending->renderer_fence_id > oldest_renderer_fence)
             continue;
 
         found = true;
-        best_renderer_fence = pending->renderer_fence_id;
-        best_generation = pending->generation;
-        best_guest_fence = pending->guest_fence_id;
-        best_index = i;
+        oldest_renderer_fence = pending->renderer_fence_id;
+        oldest_index = i;
     }
 
     if (!found)
         return false;
 
-    vgpu_virgl_pending_fences[best_index].active = false;
+    *out = vgpu_virgl_pending_fences[oldest_index];
+    vgpu_virgl_pending_fences[oldest_index].active = false;
     if (vgpu_virgl_pending_fence_count)
         vgpu_virgl_pending_fence_count--;
     debug_fences_completed++;
+    return true;
+}
 
-    for (size_t i = 0; i < VGPU_VIRGL_PENDING_FENCES_MAX; i++) {
-        struct vgpu_virgl_pending_fence *pending =
-            &vgpu_virgl_pending_fences[i];
-        if (!pending->active ||
-            !vgpu_virgl_fence_stream_matches(pending, context_fence, ctx_id,
-                                             ring_idx) ||
-            pending->generation != best_generation ||
-            pending->renderer_fence_id > renderer_fence_id)
-            continue;
+static struct vgpu_renderer_completion vgpu_virgl_fence_completion_from_pending(
+    const struct vgpu_virgl_pending_fence *pending)
+{
+    struct vgpu_renderer_completion completion = {
+        .type = VGPU_RENDERER_DONE_FENCE,
+        .token = {.generation = pending->generation},
+        .context_fence = pending->context_fence,
+        .ctx_id = pending->ctx_id,
+        .ring_idx = pending->ring_idx,
+        .fence_id = pending->guest_fence_id,
+    };
 
-        pending->active = false;
-        if (vgpu_virgl_pending_fence_count)
-            vgpu_virgl_pending_fence_count--;
-        debug_fences_completed++;
+    if (pending->has_ctrl_completion) {
+        completion.has_ctrl_completion = true;
+        completion.ctrl_completion = pending->ctrl_completion;
+        completion.has_response_desc = pending->has_response_desc;
+        completion.request_hdr = pending->request_hdr;
+        completion.response_desc = pending->response_desc;
+        completion.response_type = pending->response_type;
     }
 
-    *generation = best_generation;
-    *guest_fence_id = best_guest_fence;
-    return true;
+    return completion;
 }
 
 static void vgpu_virgl_write_fence(void *cookie, uint32_t fence)
 {
-    struct vgpu_renderer_completion completion = {
-        .type = VGPU_RENDERER_DONE_FENCE,
-    };
-    uint64_t generation = 0;
-    uint64_t guest_fence_id = 0;
-
     (void) cookie;
 
-    pthread_mutex_lock(&vgpu_virgl_lock);
-    if (!vgpu_virgl_take_completed_fence(false, 0, 0, fence, &generation,
-                                         &guest_fence_id)) {
-        pthread_mutex_unlock(&vgpu_virgl_lock);
-        return;
-    }
-    debug_last_ctx0_fence = fence;
-    pthread_mutex_unlock(&vgpu_virgl_lock);
+    for (;;) {
+        struct vgpu_virgl_pending_fence pending = {0};
+        struct vgpu_renderer_completion completion;
 
-    completion.token.generation = generation;
-    completion.context_fence = false;
-    completion.fence_id = guest_fence_id;
-    vgpu_renderer_complete(&completion);
+        pthread_mutex_lock(&vgpu_virgl_lock);
+        if (!vgpu_virgl_take_next_completed_fence(false, 0, 0, fence,
+                                                  &pending)) {
+            pthread_mutex_unlock(&vgpu_virgl_lock);
+            return;
+        }
+        debug_last_ctx0_fence = fence;
+        pthread_mutex_unlock(&vgpu_virgl_lock);
+
+        completion = vgpu_virgl_fence_completion_from_pending(&pending);
+        (void) vgpu_renderer_complete(&completion);
+    }
 }
 
 static void vgpu_virgl_write_context_fence(void *cookie,
@@ -560,31 +582,26 @@ static void vgpu_virgl_write_context_fence(void *cookie,
                                            uint32_t ring_idx,
                                            uint64_t fence_id)
 {
-    struct vgpu_renderer_completion completion = {
-        .type = VGPU_RENDERER_DONE_FENCE,
-    };
-    uint64_t generation = 0;
-    uint64_t guest_fence_id = 0;
-
     (void) cookie;
 
-    pthread_mutex_lock(&vgpu_virgl_lock);
-    if (!vgpu_virgl_take_completed_fence(true, ctx_id, ring_idx, fence_id,
-                                         &generation, &guest_fence_id)) {
-        pthread_mutex_unlock(&vgpu_virgl_lock);
-        return;
-    }
-    debug_last_context_ctx_id = ctx_id;
-    debug_last_context_ring_idx = ring_idx;
-    debug_last_context_fence = fence_id;
-    pthread_mutex_unlock(&vgpu_virgl_lock);
+    for (;;) {
+        struct vgpu_virgl_pending_fence pending = {0};
+        struct vgpu_renderer_completion completion;
 
-    completion.token.generation = generation;
-    completion.context_fence = true;
-    completion.ctx_id = ctx_id;
-    completion.ring_idx = ring_idx;
-    completion.fence_id = guest_fence_id;
-    vgpu_renderer_complete(&completion);
+        pthread_mutex_lock(&vgpu_virgl_lock);
+        if (!vgpu_virgl_take_next_completed_fence(true, ctx_id, ring_idx,
+                                                  fence_id, &pending)) {
+            pthread_mutex_unlock(&vgpu_virgl_lock);
+            return;
+        }
+        debug_last_context_ctx_id = ctx_id;
+        debug_last_context_ring_idx = ring_idx;
+        debug_last_context_fence = fence_id;
+        pthread_mutex_unlock(&vgpu_virgl_lock);
+
+        completion = vgpu_virgl_fence_completion_from_pending(&pending);
+        (void) vgpu_renderer_complete(&completion);
+    }
 }
 
 static virgl_renderer_gl_context vgpu_virgl_create_context(
@@ -1182,16 +1199,28 @@ static void vgpu_virgl_execute_ctrl_request(
             response_type = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
             break;
         }
-        if (cmd->hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
-            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
-            break;
-        }
-
         int ret =
             virgl_renderer_submit_cmd(payload->submit_data, cmd->hdr.ctx_id,
                                       (int) (cmd->size / sizeof(uint32_t)));
-        response_type =
-            ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA;
+        if (ret) {
+            response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            break;
+        }
+        if (cmd->hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
+            bool context_fence =
+                (cmd->hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) != 0;
+            uint32_t ring_idx = context_fence ? cmd->hdr.ring_idx : 0;
+
+            if (!vgpu_virgl_submit_fence_internal(
+                    request->token.generation, context_fence, cmd->hdr.ctx_id,
+                    ring_idx, cmd->hdr.fence_id, payload)) {
+                response_type = VIRTIO_GPU_RESP_ERR_UNSPEC;
+                break;
+            }
+            return;
+        }
+
+        response_type = VIRTIO_GPU_RESP_OK_NODATA;
         break;
     }
     default:
@@ -1203,11 +1232,13 @@ static void vgpu_virgl_execute_ctrl_request(
                                      response_size);
 }
 
-bool vgpu_virgl_submit_fence(uint64_t generation,
-                             bool context_fence,
-                             uint32_t ctx_id,
-                             uint32_t ring_idx,
-                             uint64_t guest_fence_id)
+static bool vgpu_virgl_submit_fence_internal(
+    uint64_t generation,
+    bool context_fence,
+    uint32_t ctx_id,
+    uint32_t ring_idx,
+    uint64_t guest_fence_id,
+    const struct vgpu_renderer_ctrl_payload *ctrl_payload)
 {
     uint64_t renderer_fence_id;
     bool recorded;
@@ -1219,15 +1250,14 @@ bool vgpu_virgl_submit_fence(uint64_t generation,
                             : vgpu_virgl_alloc_ctx0_renderer_fence_locked();
     recorded = vgpu_virgl_record_pending_fence(
         generation, context_fence, ctx_id, ring_idx, renderer_fence_id,
-        guest_fence_id);
+        guest_fence_id, ctrl_payload);
     pthread_mutex_unlock(&vgpu_virgl_lock);
     if (!recorded)
         return false;
 
     if (context_fence) {
-        ret = virgl_renderer_context_create_fence(
-            ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE, ring_idx,
-            renderer_fence_id);
+        ret = virgl_renderer_context_create_fence(ctx_id, 0, ring_idx,
+                                                  renderer_fence_id);
     } else {
         ret = virgl_renderer_create_fence((int) renderer_fence_id, 0);
     }
@@ -1242,6 +1272,16 @@ bool vgpu_virgl_submit_fence(uint64_t generation,
     vgpu_virgl_request_poll_locked();
     pthread_mutex_unlock(&vgpu_virgl_lock);
     return true;
+}
+
+bool vgpu_virgl_submit_fence(uint64_t generation,
+                             bool context_fence,
+                             uint32_t ctx_id,
+                             uint32_t ring_idx,
+                             uint64_t guest_fence_id)
+{
+    return vgpu_virgl_submit_fence_internal(generation, context_fence, ctx_id,
+                                            ring_idx, guest_fence_id, NULL);
 }
 
 void vgpu_virgl_execute_renderer_request(

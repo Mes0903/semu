@@ -2468,15 +2468,6 @@ void virtio_gpu_virgl_submit_3d_handler(virtio_gpu_state_t *vgpu,
             virtio_gpu_set_fail(vgpu);
         return;
     }
-
-    if (snapshot.hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
-        *plen = virtio_gpu_write_ctrl_response(
-            vgpu, &snapshot.hdr, response_desc, VIRTIO_GPU_RESP_ERR_UNSPEC);
-        if (!*plen)
-            virtio_gpu_set_fail(vgpu);
-        return;
-    }
-
     if (virtio_gpu_readable_desc_bytes_after(
             vq_desc, sizeof(struct virtio_gpu_cmd_submit)) < snapshot.size) {
         *plen = virtio_gpu_write_ctrl_response(
