@@ -2545,6 +2545,29 @@ static inline bool semu_is_interrupt(emu_state_t *emu)
     return __atomic_load_n(&emu->is_interrupted, __ATOMIC_RELAXED);
 }
 
+static bool semu_debug_config_supported(const emu_state_t *emu)
+{
+    return emu->vm.n_hart == 1;
+}
+
+static bool semu_debug_reject_unsupported_config(emu_state_t *emu)
+{
+    if (semu_debug_config_supported(emu))
+        return false;
+
+    fprintf(stderr,
+            "SMP gdbstub/debug is unsupported until stop-all-harts debug "
+            "semantics exist; use -c 1 with --gdbstub, or run SMP without "
+            "--gdbstub.\n");
+    emu->exit_code = 1;
+    return true;
+}
+
+static bool semu_debug_cpu_id_valid(const emu_state_t *emu, int cpuid)
+{
+    return cpuid >= 0 && (uint32_t) cpuid < emu->vm.n_hart;
+}
+
 static size_t semu_get_reg_bytes(UNUSED int regno)
 {
     return 4;
@@ -2554,10 +2577,11 @@ static int semu_read_reg(void *args, int regno, void *data)
 {
     emu_state_t *emu = (emu_state_t *) args;
 
-    if (regno > 32)
+    if (regno < 0 || regno > 32)
         return EFAULT;
 
-    assert((uint32_t) emu->curr_cpuid < emu->vm.n_hart);
+    if (!semu_debug_cpu_id_valid(emu, emu->curr_cpuid))
+        return EFAULT;
 
     if (regno == 32)
         *(uint32_t *) data = emu->vm.hart[emu->curr_cpuid]->pc;
@@ -2570,6 +2594,10 @@ static int semu_read_reg(void *args, int regno, void *data)
 static int semu_read_mem(void *args, size_t addr, size_t len, void *val)
 {
     emu_state_t *emu = (emu_state_t *) args;
+
+    if (!semu_debug_cpu_id_valid(emu, emu->curr_cpuid))
+        return EFAULT;
+
     hart_t *hart = emu->vm.hart[emu->curr_cpuid];
     mem_load(hart, addr, len, val);
     return 0;
@@ -2631,11 +2659,18 @@ static int semu_get_cpu(void *args)
 static void semu_set_cpu(void *args, int cpuid)
 {
     emu_state_t *emu = (emu_state_t *) args;
+
+    if (!semu_debug_cpu_id_valid(emu, cpuid))
+        return;
+
     emu->curr_cpuid = cpuid;
 }
 
 static void semu_run_debug(emu_state_t *emu)
 {
+    if (semu_debug_reject_unsupported_config(emu))
+        return;
+
     vm_t *vm = &emu->vm;
 
     gdbstub_t gdbstub;
