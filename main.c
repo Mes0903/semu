@@ -2241,6 +2241,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             perror("failed to create emulator wake pipe");
 #if SEMU_HAS(VIRTIOGPU)
             virtio_gpu_destroy(&emu->vgpu);
+            vgpu_display_shutdown_after_producer_stopped();
 #endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
@@ -2261,6 +2262,7 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             emu->wake_fd[0] = emu->wake_fd[1] = -1;
 #if SEMU_HAS(VIRTIOGPU)
             virtio_gpu_destroy(&emu->vgpu);
+            vgpu_display_shutdown_after_producer_stopped();
 #endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
@@ -3054,6 +3056,7 @@ int main(int argc, char **argv)
             semu_close_wake_pipe(&emu);
 #if SEMU_HAS(VIRTIOGPU)
             virtio_gpu_destroy(&emu.vgpu);
+            vgpu_display_shutdown_after_producer_stopped();
 #endif
             g_window.window_cleanup();
             return 1;
@@ -3081,10 +3084,11 @@ int main(int argc, char **argv)
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
     semu_close_wake_pipe(&emu);
 #if SEMU_HAS(VIRTIOGPU)
-    /* The GPU actor/backend may publish display commands; stop it before SDL
-     * state and queued display payloads are drained by window cleanup.
+    /* The GPU actor/backend may publish display commands; stop it before
+     * queued payloads are drained and SDL state is cleaned up.
      */
     virtio_gpu_destroy(&emu.vgpu);
+    vgpu_display_shutdown_after_producer_stopped();
 #endif
     g_window.window_cleanup();
 #endif

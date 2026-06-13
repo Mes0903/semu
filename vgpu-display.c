@@ -198,10 +198,16 @@ bool vgpu_display_pop_cmd(struct vgpu_display_cmd *cmd)
     }
 }
 
-void vgpu_display_set_unavailable(void)
+static void vgpu_display_drain_and_release_cmds(void)
 {
     struct vgpu_display_cmd cmd;
 
+    while (vgpu_display_pop_cmd(&cmd))
+        vgpu_display_release_cmd(&cmd);
+}
+
+void vgpu_display_set_unavailable(void)
+{
     /* This is an init-only fallback path for 'window-sw' initialization
      * failure, before the emulator thread starts publishing display commands.
      * It is not a concurrent shutdown primitive: a producer could otherwise
@@ -212,9 +218,13 @@ void vgpu_display_set_unavailable(void)
      * one-way handoff rule.
      */
     __atomic_store_n(&vgpu_display_unavailable, true, __ATOMIC_RELEASE);
+    vgpu_display_drain_and_release_cmds();
+}
 
-    while (vgpu_display_pop_cmd(&cmd))
-        vgpu_display_release_cmd(&cmd);
+void vgpu_display_shutdown_after_producer_stopped(void)
+{
+    __atomic_store_n(&vgpu_display_unavailable, true, __ATOMIC_RELEASE);
+    vgpu_display_drain_and_release_cmds();
 }
 
 bool vgpu_display_can_publish(void)

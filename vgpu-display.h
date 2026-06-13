@@ -79,6 +79,11 @@ void vgpu_display_publish_cursor_clear(uint32_t scanout_id);
 void vgpu_display_release_cmd(struct vgpu_display_cmd *cmd);
 bool vgpu_display_pop_cmd(struct vgpu_display_cmd *cmd);
 void vgpu_display_set_unavailable(void);
+/* Shutdown-only handoff after the GPU producer/actor has stopped. Marks the
+ * display bridge unavailable, then drains and releases queued payloads before
+ * the window backend tears down its consumer-owned state.
+ */
+void vgpu_display_shutdown_after_producer_stopped(void);
 bool vgpu_display_can_publish(void);
 void vgpu_display_publish_primary_set(uint32_t scanout_id,
                                       struct vgpu_display_payload *payload);
