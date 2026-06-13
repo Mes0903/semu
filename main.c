@@ -2239,6 +2239,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     if (vm->n_hart > 1 && g_window.window_main_loop) {
         if (pipe(emu->wake_fd) < 0) {
             perror("failed to create emulator wake pipe");
+#if SEMU_HAS(VIRTIOGPU)
+            virtio_gpu_destroy(&emu->vgpu);
+#endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
         }
@@ -2256,6 +2259,9 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
             close(emu->wake_fd[0]);
             close(emu->wake_fd[1]);
             emu->wake_fd[0] = emu->wake_fd[1] = -1;
+#if SEMU_HAS(VIRTIOGPU)
+            virtio_gpu_destroy(&emu->vgpu);
+#endif
             g_window.window_cleanup();
             return EXIT_FAILURE;
         }
@@ -3046,6 +3052,9 @@ int main(int argc, char **argv)
         if (pthread_create(&emu_thread, NULL, emu_thread_func, &emu) != 0) {
             fprintf(stderr, "Failed to create emulator thread\n");
             semu_close_wake_pipe(&emu);
+#if SEMU_HAS(VIRTIOGPU)
+            virtio_gpu_destroy(&emu.vgpu);
+#endif
             g_window.window_cleanup();
             return 1;
         }
@@ -3071,6 +3080,12 @@ int main(int argc, char **argv)
 
 #if SEMU_HAS(VIRTIOINPUT) || SEMU_HAS(VIRTIOGPU)
     semu_close_wake_pipe(&emu);
+#if SEMU_HAS(VIRTIOGPU)
+    /* The GPU actor/backend may publish display commands; stop it before SDL
+     * state and queued display payloads are drained by window cleanup.
+     */
+    virtio_gpu_destroy(&emu.vgpu);
+#endif
     g_window.window_cleanup();
 #endif
 

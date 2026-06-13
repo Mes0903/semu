@@ -325,9 +325,13 @@ void virtio_gpu_write(hart_t *vm,
                       uint32_t value);
 
 /* Initializes the process-wide virtio-gpu singleton. semu currently supports
- * one in-process GPU instance; a second call is fatal.
+ * one live GPU instance; call virtio_gpu_destroy() before reinitializing.
  */
 void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu);
+/* Stops the GPU actor before releasing backend/common resources. Call before
+ * tearing down the window/display backend.
+ */
+void virtio_gpu_destroy(virtio_gpu_state_t *vgpu);
 uint32_t virtio_gpu_register_scanout(virtio_gpu_state_t *vgpu,
                                      uint32_t width,
                                      uint32_t height);

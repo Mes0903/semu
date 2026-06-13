@@ -63,6 +63,7 @@
 
 extern const struct virtio_gpu_cmd_backend g_virtio_gpu_backend;
 static virtio_gpu_data_t virtio_gpu_data;
+static bool virtio_gpu_instance_initialized;
 
 void *virtio_gpu_mem_guest_to_host(virtio_gpu_state_t *vgpu,
                                    uint32_t addr,
@@ -1171,10 +1172,9 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
         [VIRTIO_GPU_CONTROLQ] = VIRTIO_GPU_QUEUE_NUM_MAX,
         [VIRTIO_GPU_CURSORQ] = VIRTIO_GPU_QUEUE_NUM_MAX,
     };
-    static bool initialized = false;
     struct virtio_device_common_config config;
 
-    if (initialized) {
+    if (virtio_gpu_instance_initialized) {
         fprintf(stderr,
                 VIRTIO_GPU_LOG_PREFIX
                 "%s(): only one virtio-gpu instance is supported\n",
@@ -1221,7 +1221,30 @@ void virtio_gpu_init(virtio_gpu_state_t *vgpu, emu_state_t *emu)
     }
     vgpu->actor_initialized = true;
 
-    initialized = true;
+    virtio_gpu_instance_initialized = true;
+}
+
+void virtio_gpu_destroy(virtio_gpu_state_t *vgpu)
+{
+    if (!vgpu)
+        return;
+
+    if (vgpu->actor_initialized) {
+        virtio_actor_stop(&vgpu->actor);
+        virtio_actor_destroy(&vgpu->actor);
+        vgpu->actor_initialized = false;
+    }
+
+    if (vgpu->priv == &virtio_gpu_data && g_virtio_gpu_backend.reset)
+        g_virtio_gpu_backend.reset(vgpu);
+
+    virtio_device_common_destroy(&vgpu->common);
+
+    if (vgpu->priv == &virtio_gpu_data) {
+        memset(&virtio_gpu_data, 0, sizeof(virtio_gpu_data));
+        vgpu->priv = NULL;
+        virtio_gpu_instance_initialized = false;
+    }
 }
 
 uint32_t virtio_gpu_register_scanout(virtio_gpu_state_t *vgpu,
