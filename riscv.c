@@ -1399,16 +1399,17 @@ static void op_jump_link(hart_t *vm, uint8_t rd, uint32_t addr)
     }
 }
 
-#define AMO_OP(STORED_EXPR)                                   \
-    do {                                                      \
-        value2 = vm->x_regs[decoded_rs2(decoded)];            \
-        mmu_load(vm, addr, RV_MEM_LW, &value, false);         \
-        if (vm->error)                                        \
-            return;                                           \
-        set_dest_idx(vm, decoded_rd(decoded), value);         \
-        mmu_store(vm, addr, RV_MEM_SW, (STORED_EXPR), false); \
-        if (vm->error)                                        \
-            return;                                           \
+#define AMO_OP(STORED_EXPR)                            \
+    do {                                               \
+        value2 = vm->x_regs[decoded_rs2(decoded)];     \
+        mmu_load(vm, addr, RV_MEM_LW, &value, false);  \
+        if (vm->error)                                 \
+            return;                                    \
+        uint32_t stored = (STORED_EXPR);               \
+        mmu_store(vm, addr, RV_MEM_SW, stored, false); \
+        if (vm->error)                                 \
+            return;                                    \
+        set_dest_idx(vm, decoded_rd(decoded), value);  \
     } while (0)
 
 static void op_amo(hart_t *vm, const decoded_insn_t *decoded)
