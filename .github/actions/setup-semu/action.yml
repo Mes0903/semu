@@ -25,4 +25,34 @@ runs:
         HOMEBREW_NO_AUTO_UPDATE: 1
         HOMEBREW_NO_ANALYTICS: 1
       run: |
-        brew install make dtc expect fakeroot e2fsprogs sdl2
+        brew install make dtc expect fakeroot bash cpio coreutils e2fsprogs sdl2
+        # fakeroot injects Homebrew's libfakeroot into each child process. Keep
+        # the commands that run inside rootfs_ext4.sh's fakeroot child on the
+        # same Homebrew arm64 toolchain instead of mixing in macOS arm64e system
+        # binaries on newer runners.
+        rootfs_fakeroot_shell="$(brew --prefix bash)/bin/bash"
+        cpio_prefix="$(brew --prefix cpio)"
+        coreutils_prefix="$(brew --prefix coreutils)"
+        rootfs_cpio=
+        for candidate in "$cpio_prefix/bin/cpio" "$cpio_prefix/bin/gcpio"; do
+          if [ -x "$candidate" ]; then
+            rootfs_cpio="$candidate"
+            break
+          fi
+        done
+        if [ -z "$rootfs_cpio" ]; then
+          echo "Homebrew cpio formula did not provide a usable cpio binary" >&2
+          exit 1
+        fi
+        rootfs_cp="$coreutils_prefix/bin/gcp"
+        rootfs_chown="$coreutils_prefix/bin/gchown"
+        for tool in "$rootfs_fakeroot_shell" "$rootfs_cpio" "$rootfs_cp" "$rootfs_chown"; do
+          if [ ! -x "$tool" ]; then
+            echo "Missing Homebrew rootfs tool: $tool" >&2
+            exit 1
+          fi
+        done
+        echo "ROOTFS_FAKEROOT_SHELL=$rootfs_fakeroot_shell" >> "$GITHUB_ENV"
+        echo "ROOTFS_CPIO=$rootfs_cpio" >> "$GITHUB_ENV"
+        echo "ROOTFS_CP=$rootfs_cp" >> "$GITHUB_ENV"
+        echo "ROOTFS_CHOWN=$rootfs_chown" >> "$GITHUB_ENV"

@@ -14,19 +14,23 @@ OBJS_EXTRA :=
 
 LDFLAGS :=
 
+# Caller-facing hooks used by scripts/rootfs_ext4.sh when the default host
+# tools are unsuitable for generating ext4.img under fakeroot.
+ROOTFS_CPIO ?= cpio
+ROOTFS_CP ?= cp
+ROOTFS_CHOWN ?= chown
+ROOTFS_FAKEROOT_SHELL ?= /bin/sh
+
 # external rootfs: boot from /dev/vda instead of unpacking initramfs.
 # Implies VIRTIOBLK and pulls the userland from rootfs.cpio into ext4.img.
 # Default-on. If fakeroot is missing or non-functional, fall back to the
-# initramfs path so the build still succeeds without forcing a new
-# dependency on the user. The probe must exec a real binary -- `fakeroot
-# true` looks correct but `true` is a bash builtin, so the wrapper
-# script never actually runs the DYLD_INSERT_LIBRARIES path. On macOS
-# arm64 the brew fakeroot dylib is built for arm64 and refuses to load
-# into arm64e system binaries (cpio, mkfs.ext4); using `/bin/sh -c :`
-# forces an exec so we catch that failure here instead of mid-build.
+# initramfs path so the build still succeeds without forcing a new dependency
+# on the user. The probe exercises the same shell/cp/chown hooks used by the
+# ext4 image path so hosts with partial fakeroot support fail before image
+# generation starts.
 ENABLE_EXTERNAL_ROOT ?= 1
 ifeq ($(call has, EXTERNAL_ROOT), 1)
-    ifneq (0,$(shell fakeroot /bin/sh -c : >/dev/null 2>&1; echo $$?))
+    ifneq (0,$(shell ROOTFS_FAKEROOT_SHELL="$(ROOTFS_FAKEROOT_SHELL)" ROOTFS_CP="$(ROOTFS_CP)" ROOTFS_CHOWN="$(ROOTFS_CHOWN)" scripts/check-rootfs-fakeroot.sh >/dev/null 2>&1; echo $$?))
         $(warning fakeroot not usable; falling back to initramfs boot.)
         $(warning Install a working fakeroot to enable /dev/vda boot.)
         override ENABLE_EXTERNAL_ROOT := 0
@@ -338,7 +342,10 @@ include mk/external.mk
 
 ifeq ($(call has, EXTERNAL_ROOT), 1)
 ext4.img: $(INITRD_DATA) scripts/rootfs_ext4.sh
-	$(Q)MKFS_EXT4="$(MKFS_EXT4)" scripts/rootfs_ext4.sh $(INITRD_DATA) $@
+	$(Q)MKFS_EXT4="$(MKFS_EXT4)" ROOTFS_CPIO="$(ROOTFS_CPIO)" \
+	    ROOTFS_CP="$(ROOTFS_CP)" ROOTFS_CHOWN="$(ROOTFS_CHOWN)" \
+	    ROOTFS_FAKEROOT_SHELL="$(ROOTFS_FAKEROOT_SHELL)" \
+	    scripts/rootfs_ext4.sh $(INITRD_DATA) $@
 else
 ext4.img:
 	$(Q)dd if=/dev/zero of=$@ bs=4k count=600

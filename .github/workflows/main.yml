@@ -166,7 +166,16 @@ jobs:
       shell: bash
       timeout-minutes: 10
     - name: netdev test
-      run: sudo .ci/device-smoke/test-netdev.sh
+      # Preserve the rootfs tool hooks across sudo so Makefile feature detection sees the
+      # same fakeroot-capable environment as the non-sudo build and test steps.
+      run: |
+            sudo -E env \
+              PATH="$PATH" \
+              ROOTFS_FAKEROOT_SHELL="${ROOTFS_FAKEROOT_SHELL:-/bin/sh}" \
+              ROOTFS_CPIO="${ROOTFS_CPIO:-cpio}" \
+              ROOTFS_CP="${ROOTFS_CP:-cp}" \
+              ROOTFS_CHOWN="${ROOTFS_CHOWN:-chown}" \
+              .ci/device-smoke/test-netdev.sh
       shell: bash
       timeout-minutes: 10
     - name: sound test
@@ -252,12 +261,19 @@ jobs:
       shell: bash
       timeout-minutes: 20
     - name: netdev test
-      # NOTE: vmnet requires sudo privileges which may not be available in GitHub Actions
-      # This test is conditional and will be skipped if sudo is not available
+      # NOTE: vmnet requires sudo privileges which may not be available in GitHub Actions.
+      # Preserve the rootfs tool hooks across sudo so Makefile feature detection sees the
+      # same fakeroot-capable environment as the non-sudo build and test steps.
       run: |
             if sudo -n true 2>/dev/null; then
               echo "sudo available, running netdev test"
-              sudo .ci/device-smoke/test-netdev.sh
+              sudo -E env \
+                PATH="$PATH" \
+                ROOTFS_FAKEROOT_SHELL="${ROOTFS_FAKEROOT_SHELL:-/bin/sh}" \
+                ROOTFS_CPIO="${ROOTFS_CPIO:-cpio}" \
+                ROOTFS_CP="${ROOTFS_CP:-cp}" \
+                ROOTFS_CHOWN="${ROOTFS_CHOWN:-chown}" \
+                .ci/device-smoke/test-netdev.sh
             else
               echo "Skipping netdev test: sudo not available in GitHub Actions runner"
               echo "vmnet.framework requires root privileges or com.apple.vm.networking entitlement"
