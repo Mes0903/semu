@@ -293,6 +293,17 @@ jobs:
       shell: bash
       timeout-minutes: 20
 
+  build_system:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+    - name: Check build system scripts
+      run: .ci/test-build-system.sh
+      shell: bash
+      timeout-minutes: 5
+
   coding_style:
     runs-on: ubuntu-24.04
     permissions:
@@ -332,6 +343,7 @@ jobs:
       - semu-linux
       - semu-linux-initramfs
       - semu-macOS
+      - build_system
       - coding_style
     # This gate follows resolver release drift: artifact recipe keys plus any
     # release-contract checks the resolver explicitly enforces.
