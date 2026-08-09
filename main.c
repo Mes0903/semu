@@ -825,7 +825,6 @@ static void handle_options(int argc,
         *dtb_file = "minimal.dtb";
 }
 
-#if SEMU_HAS(EXTERNAL_ROOT)
 static bool uses_default_minimal_dtb(const char *dtb_file)
 {
     const char *name;
@@ -841,7 +840,52 @@ static bool uses_default_minimal_dtb(const char *dtb_file)
 
     return strcmp(name, "minimal.dtb") == 0;
 }
+
+static int validate_default_dtb_boot_options(const char *dtb_file,
+                                             const char *initrd_file,
+                                             const char *disk_file)
+{
+    if (!uses_default_minimal_dtb(dtb_file)) {
+        fprintf(stderr,
+                "note: skipping default minimal.dtb boot option checks "
+                "for custom DTB '%s'.\n",
+                dtb_file ? dtb_file : "(null)");
+        return 0;
+    }
+
+#if SEMU_HAS(EXTERNAL_ROOT)
+    if (initrd_file) {
+        fprintf(stderr,
+                "-i requires a DTB with linux,initrd-start/end. "
+                "Rebuild with ENABLE_EXTERNAL_ROOT=0 or pass -b "
+                "<dtb-with-initrd>.\n");
+        return 2;
+    }
+
+    if (!disk_file) {
+        fprintf(stderr,
+                "warning: EXTERNAL_ROOT build expects -d <disk-image>; "
+                "without it the kernel will hang in rootwait.\n");
+    }
+#else
+    if (!initrd_file) {
+        fprintf(stderr,
+                "This semu build uses legacy initramfs boot "
+                "(ENABLE_EXTERNAL_ROOT=0).\n"
+                "Run with -i rootfs.cpio, use make check, or rebuild "
+                "with ENABLE_EXTERNAL_ROOT=1 for /dev/vda root boot.\n");
+        if (disk_file) {
+            fprintf(stderr,
+                    "-d only attaches a virtio-blk disk; it does not "
+                    "select the root filesystem without root=/dev/vda "
+                    "in DTB bootargs.\n");
+        }
+        return 2;
+    }
 #endif
+
+    return 0;
+}
 
 #define INIT_HART(hart, emu, id)                  \
     do {                                          \
@@ -880,21 +924,10 @@ static int semu_init(emu_state_t *emu, int argc, char **argv)
     (void) headless;
 #endif
 
-#if SEMU_HAS(EXTERNAL_ROOT)
-    if (initrd_file && uses_default_minimal_dtb(dtb_file)) {
-        fprintf(stderr,
-                "-i requires a DTB with linux,initrd-start/end. "
-                "Rebuild with ENABLE_EXTERNAL_ROOT=0 or pass -b "
-                "<dtb-with-initrd>.\n");
-        return 2;
-    }
-
-    if (!disk_file && uses_default_minimal_dtb(dtb_file)) {
-        fprintf(stderr,
-                "warning: EXTERNAL_ROOT build expects -d <disk-image>; "
-                "without it the kernel will hang in rootwait.\n");
-    }
-#endif
+    int boot_option_status =
+        validate_default_dtb_boot_options(dtb_file, initrd_file, disk_file);
+    if (boot_option_status)
+        return boot_option_status;
 
     /* Initialize the emulator */
     memset(emu, 0, sizeof(*emu));

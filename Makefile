@@ -11,24 +11,26 @@ DT_CFLAGS := -D CLOCK_FREQ=$(CLOCK_FREQ)
 CFLAGS += $(DT_CFLAGS)
 
 OBJS_EXTRA :=
-# command line option
-OPTS :=
 
 LDFLAGS :=
+
+# Caller-facing hooks used by scripts/rootfs_ext4.sh when the default host
+# tools are unsuitable for generating ext4.img under fakeroot.
+ROOTFS_CPIO ?= cpio
+ROOTFS_CP ?= cp
+ROOTFS_CHOWN ?= chown
+ROOTFS_FAKEROOT_SHELL ?= /bin/sh
 
 # external rootfs: boot from /dev/vda instead of unpacking initramfs.
 # Implies VIRTIOBLK and pulls the userland from rootfs.cpio into ext4.img.
 # Default-on. If fakeroot is missing or non-functional, fall back to the
-# initramfs path so the build still succeeds without forcing a new
-# dependency on the user. The probe must exec a real binary -- `fakeroot
-# true` looks correct but `true` is a bash builtin, so the wrapper
-# script never actually runs the DYLD_INSERT_LIBRARIES path. On macOS
-# arm64 the brew fakeroot dylib is built for arm64 and refuses to load
-# into arm64e system binaries (cpio, mkfs.ext4); using `/bin/sh -c :`
-# forces an exec so we catch that failure here instead of mid-build.
+# initramfs path so the build still succeeds without forcing a new dependency
+# on the user. The probe exercises the same shell/cp/chown hooks used by the
+# ext4 image path so hosts with partial fakeroot support fail before image
+# generation starts.
 ENABLE_EXTERNAL_ROOT ?= 1
 ifeq ($(call has, EXTERNAL_ROOT), 1)
-    ifneq (0,$(shell fakeroot /bin/sh -c : >/dev/null 2>&1; echo $$?))
+    ifneq (0,$(shell ROOTFS_FAKEROOT_SHELL="$(ROOTFS_FAKEROOT_SHELL)" ROOTFS_CP="$(ROOTFS_CP)" ROOTFS_CHOWN="$(ROOTFS_CHOWN)" scripts/check-rootfs-fakeroot.sh >/dev/null 2>&1; echo $$?))
         $(warning fakeroot not usable; falling back to initramfs boot.)
         $(warning Install a working fakeroot to enable /dev/vda boot.)
         override ENABLE_EXTERNAL_ROOT := 0
@@ -47,7 +49,6 @@ MKFS_EXT4 ?= mkfs.ext4
 ifeq ($(call has, VIRTIOBLK), 1)
     OBJS_EXTRA += virtio-blk.o
     DISKIMG_FILE := ext4.img
-    OPTS += -d $(DISKIMG_FILE)
     MKFS_EXT4 := $(shell which $(MKFS_EXT4))
     ifndef MKFS_EXT4
 	MKFS_EXT4 := $(shell which $$(brew --prefix e2fsprogs)/sbin/mkfs.ext4)
@@ -70,7 +71,6 @@ $(call set-feature, VIRTIOFS)
 SHARED_DIRECTORY ?= ./shared
 ifeq ($(call has, VIRTIOFS), 1)
     OBJS_EXTRA += virtio-fs.o
-    OPTS += -s $(SHARED_DIRECTORY)
 endif
 
 NETDEV ?= tap
@@ -234,6 +234,17 @@ OBJS := \
 	$(OBJS_EXTRA)
 
 deps := $(OBJS:%.o=.%.o.d)
+STAMP_DIR := .stamps
+BUILDROOT_OUTPUT_DIRS := buildroot/output buildroot/output-*
+SOURCE_BUILD_DIRS := \
+	buildroot \
+	linux \
+	DirectFB2 \
+	DirectFB-examples \
+	directfb \
+	extra_packages
+BUILD_CONFIG_STAMP := $(STAMP_DIR)/build-config.stamp
+DTB_CONFIG_STAMP := $(STAMP_DIR)/dtb-config.stamp
 BUILD_CONFIG := CC=$(CC) $(strip $(CFLAGS))
 
 GDBSTUB_LIB := mini-gdbstub/build/libgdbstub.a
@@ -265,13 +276,14 @@ $(BIN): $(OBJS)
 	$(VECHO) "  LD\t$@\n"
 	$(Q)$(CC) -o $@ $^ $(LDFLAGS)
 
-.build-config.stamp: FORCE
+$(BUILD_CONFIG_STAMP): FORCE
+	@mkdir -p $(@D)
 	@if [ ! -f $@ ] || [ "$$(cat $@ 2>/dev/null)" != "$(BUILD_CONFIG)" ]; then \
 	    printf '%s\n' "$(BUILD_CONFIG)" > $@; \
 	    rm -f $(OBJS) $(deps); \
 	fi
 
-%.o: %.c .build-config.stamp
+%.o: %.c $(BUILD_CONFIG_STAMP)
 	$(VECHO) "  CC\t$@\n"
 	$(Q)$(CC) -o $@ $(CFLAGS) -c -MMD -MF .$@.d $<
 
@@ -304,17 +316,18 @@ CFLAGS += -D SEMU_BOOT_TARGET_TIME=10
 SMP ?= 1
 
 # Track DTB inputs so config changes regenerate both the hart DTSI and DTB.
-.dtb-config.stamp: FORCE
+$(DTB_CONFIG_STAMP): FORCE
+	@mkdir -p $(@D)
 	@if [ ! -f $@ ] || [ "$$(cat $@ 2>/dev/null)" != "$(DTB_CONFIG)" ]; then \
 	    printf '%s\n' "$(DTB_CONFIG)" > $@; \
 	    rm -f riscv-harts.dtsi minimal.dtb; \
 	fi
 
 .PHONY: riscv-harts.dtsi
-riscv-harts.dtsi: .dtb-config.stamp
+riscv-harts.dtsi: $(DTB_CONFIG_STAMP)
 	$(Q)python3 scripts/gen-hart-dts.py $@ $(SMP) $(CLOCK_FREQ)
 
-minimal.dtb: minimal.dts riscv-harts.dtsi .dtb-config.stamp
+minimal.dtb: minimal.dts riscv-harts.dtsi $(DTB_CONFIG_STAMP)
 	$(VECHO) " DTC\t$@\n"
 	$(Q)$(RM) $@
 	$(Q)$(CC) -nostdinc -E -P -x assembler-with-cpp -undef \
@@ -329,7 +342,10 @@ include mk/external.mk
 
 ifeq ($(call has, EXTERNAL_ROOT), 1)
 ext4.img: $(INITRD_DATA) scripts/rootfs_ext4.sh
-	$(Q)MKFS_EXT4="$(MKFS_EXT4)" scripts/rootfs_ext4.sh $(INITRD_DATA) $@
+	$(Q)MKFS_EXT4="$(MKFS_EXT4)" ROOTFS_CPIO="$(ROOTFS_CPIO)" \
+	    ROOTFS_CP="$(ROOTFS_CP)" ROOTFS_CHOWN="$(ROOTFS_CHOWN)" \
+	    ROOTFS_FAKEROOT_SHELL="$(ROOTFS_FAKEROOT_SHELL)" \
+	    scripts/rootfs_ext4.sh $(INITRD_DATA) $@
 else
 ext4.img:
 	$(Q)dd if=/dev/zero of=$@ bs=4k count=600
@@ -345,28 +361,39 @@ $(SHARED_DIRECTORY):
 
 ifeq ($(call has, EXTERNAL_ROOT), 1)
 INITRD_DEP :=
-INITRD_OPT :=
 else
 INITRD_DEP := $(INITRD_DATA)
-INITRD_OPT := -i $(INITRD_DATA)
 endif
+
+HEADLESS ?= 1
+KERNEL_OPT := -k $(KERNEL_DATA)
+DTB_OPT := -b minimal.dtb
+HEADLESS_OPT := $(if $(filter 0 false no,$(HEADLESS)),,-H)
+INITRD_OPT := $(if $(INITRD_DEP),-i $(INITRD_DEP))
+DISKIMG_OPT := $(if $(DISKIMG_FILE),-d $(DISKIMG_FILE))
+VIRTIOFS_OPT := $(if $(filter 1,$(call has,VIRTIOFS)),-s $(SHARED_DIRECTORY))
+SMP_OPT := -c $(SMP)
+NETDEV_OPT := $(if $(NETDEV),-n $(NETDEV))
 
 .PHONY: bench-login
 bench-login: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE)
-	$(Q)/usr/bin/time -p expect scripts/bench-login.expect \
-	    ./$(BIN) -k $(KERNEL_DATA) -b minimal.dtb -H $(INITRD_OPT) $(OPTS)
+	$(Q)/usr/bin/time -p expect scripts/bench-login.expect ./$(BIN) $(strip $(KERNEL_OPT) $(DTB_OPT) $(HEADLESS_OPT) $(INITRD_OPT) $(DISKIMG_OPT) $(VIRTIOFS_OPT))
 
 check: $(BIN) minimal.dtb $(KERNEL_DATA) $(INITRD_DEP) $(DISKIMG_FILE) $(SHARED_DIRECTORY)
 	@$(call notice, Ready to launch Linux kernel. Please be patient.)
-	$(Q)./$(BIN) -k $(KERNEL_DATA) -c $(SMP) -b minimal.dtb -H $(INITRD_OPT) $(if $(NETDEV),-n $(NETDEV)) $(OPTS)
+	$(Q)./$(BIN) $(strip $(KERNEL_OPT) $(DTB_OPT) $(HEADLESS_OPT) $(INITRD_OPT) $(DISKIMG_OPT) $(VIRTIOFS_OPT) $(SMP_OPT) $(NETDEV_OPT))
 
-BUILD_IMAGE_ARGS ?= --all
-build-image:
-	scripts/build-image.sh $(BUILD_IMAGE_ARGS)
+ARTIFACTS ?= all
+.PHONY: build-artifacts
+build-artifacts:
+	scripts/build-artifacts.sh $(ARTIFACTS)
 
 clean:
 	$(Q)$(RM) $(BIN) $(OBJS) $(deps)
-	$(Q)$(MAKE) -C mini-gdbstub clean
+	$(Q)$(RM) -r $(BUILDROOT_OUTPUT_DIRS)
+	$(Q)if [ -f mini-gdbstub/Makefile ]; then \
+		$(MAKE) -C mini-gdbstub clean; \
+	fi
 	$(Q)if [ -n "$(MINISLIRP_DIR)" ] && [ -d "$(MINISLIRP_DIR)/src" ]; then \
 		$(MAKE) -C $(MINISLIRP_DIR)/src clean; \
 	fi
@@ -374,9 +401,11 @@ clean:
 distclean: clean
 	$(Q)$(RM) riscv-harts.dtsi
 	$(Q)$(RM) minimal.dtb
-	$(Q)$(RM) .dtb-config.stamp
-	$(Q)$(RM) .build-config.stamp
 	$(Q)$(RM) Image rootfs.cpio prebuilt.sha1
+	$(Q)$(RM) Image.bz2 rootfs.cpio.bz2 test-tools.img.bz2
 	$(Q)$(RM) ext4.img test-tools.img
+	$(Q)$(RM) -r $(SOURCE_BUILD_DIRS)
+	$(Q)$(RM) -r $(STAMP_DIR)
+	$(Q)$(RM) -r .semu-buildroot.lock
 
 -include $(deps)

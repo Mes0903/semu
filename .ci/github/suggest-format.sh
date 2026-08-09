@@ -14,8 +14,8 @@
 
 set -euo pipefail
 
-# Collect all C/C++ sources tracked by git (POSIX-compatible array build
-# for bash 3.2 compatibility on macOS runners).
+# Collect all C/C++ sources tracked by git into a Bash array without
+# word-splitting filenames.
 SOURCES=()
 while IFS= read -r file; do
     SOURCES+=("$file")

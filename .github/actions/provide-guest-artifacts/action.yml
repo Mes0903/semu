@@ -1,0 +1,33 @@
+name: Provide guest artifacts
+description: Provide semu test jobs with guest artifacts from either workflow artifacts or the rolling release.
+inputs:
+  use-workflow-artifacts:
+    description: Whether test jobs should consume guest artifacts produced by this workflow run.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: validate inputs
+      shell: bash
+      env:
+        USE_WORKFLOW_ARTIFACTS: ${{ inputs.use-workflow-artifacts }}
+      run: |
+        case "$USE_WORKFLOW_ARTIFACTS" in
+          true|false) ;;
+          *) echo "::error::use-workflow-artifacts must be true or false, got: $USE_WORKFLOW_ARTIFACTS"; exit 1 ;;
+        esac
+    - name: download workflow-built guest artifacts
+      if: inputs.use-workflow-artifacts == 'true'
+      uses: actions/download-artifact@v7
+      with:
+        name: guest-artifacts-raw
+    - name: materialize release guest artifacts
+      if: inputs.use-workflow-artifacts != 'true'
+      shell: bash
+      env:
+        PREBUILT_BOOTSTRAP_ON_404: ${{ github.repository != 'sysprog21/semu' }}
+      run: |
+        .ci/prebuilt/resolve-artifacts.sh > "$RUNNER_TEMP/prebuilt-plan-test.env"
+        PREBUILT_FORBID_BUILD=1 \
+          PREBUILT_PLAN_FILE="$RUNNER_TEMP/prebuilt-plan-test.env" \
+          .ci/prebuilt/materialize-artifacts.sh >/dev/null

@@ -405,7 +405,7 @@ sudo make check
 Automated tests:
 ```shell
 # Requires sudo on all platforms
-sudo .ci/test-netdev.sh
+sudo .ci/device-smoke/test-netdev.sh
 ```
 
 ## References
